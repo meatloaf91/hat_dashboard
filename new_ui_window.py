@@ -13,7 +13,7 @@ from matplotlib.figure import Figure
 
 _BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, Signal, QTimer
+from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, Signal, QTimer
 from PySide6.QtGui import QColor, QCursor, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -2578,25 +2578,11 @@ class _TscOption1TableDialog(QDialog):
             }
 
             QCheckBox#tscGroupCheck {
-                color: #111F35;
+                color: #333333;
                 font-family: "Segoe UI";
-                font-size: 12px;
-                font-weight: 500;
-                spacing: 6px;
+                font-size: 13px;
+                spacing: 8px;
                 background: transparent;
-            }
-
-            QCheckBox#tscGroupCheck::indicator {
-                width: 15px;
-                height: 15px;
-                border: 1px solid #FFFFFF;
-                border-radius: 4px;
-                background: #FFFFFF;
-            }
-
-            QCheckBox#tscGroupCheck::indicator:checked {
-                background: #111F35;
-                border: 1px solid #111F35;
             }
 
             QLabel#tscCustomValueLabel {
@@ -3005,17 +2991,8 @@ class _TscChartDialog(QDialog):
             }
             QCheckBox#sideCheck {
                 color: #C8D5E4;
-                font-family: "Segoe UI"; font-size: 12px;
+                font-family: "Segoe UI"; font-size: 13px;
                 spacing: 8px;
-            }
-            QCheckBox#sideCheck::indicator {
-                width: 15px; height: 15px;
-                border-radius: 4px;
-                border: 1px solid #7A8BA0;
-                background: transparent;
-            }
-            QCheckBox#sideCheck::indicator:checked {
-                background: #8A244B; border: 1px solid #8A244B;
             }
             QFrame#sideDivider {
                 background: #1E3050; border: none;
@@ -5619,6 +5596,156 @@ class _SettingsDialog(QDialog):
         subprocess.Popen(f'explorer "{folder}"')
 
 
+class _SearchMultiValueDialog(QDialog):
+    """Table-based multi-value input for a single expanded-search field."""
+
+    def __init__(
+        self,
+        field_label: str,
+        initial_values: list[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Multiple Values — {field_label}")
+        self.resize(420, 440)
+        self.setMinimumSize(320, 300)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel(f"Values for: <b>{field_label}</b>")
+        title.setObjectName("searchMvTitle")
+        layout.addWidget(title)
+
+        # Toolbar
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self._btn_add   = QPushButton("+ Add Row")
+        self._btn_del   = QPushButton("Delete")
+        self._btn_reset = QPushButton("Reset")
+        self._btn_paste = QPushButton("Paste")
+        for b in (self._btn_add, self._btn_del, self._btn_reset, self._btn_paste):
+            b.setObjectName("searchMvBtn")
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        # Single-column table
+        self.table = QTableWidget(0, 1)
+        self.table.setObjectName("searchMvTable")
+        self.table.setHorizontalHeaderLabels(["Value"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table)
+
+        # Seed with initial values (always at least one blank row)
+        seeds = [v for v in initial_values if v.strip()] or ["", "", "", "", ""]
+        for v in seeds:
+            self._add_row(v)
+
+        # OK / Cancel
+        ok_row = QHBoxLayout()
+        ok_row.setSpacing(8)
+        self._btn_ok     = QPushButton("OK")
+        self._btn_cancel = QPushButton("Cancel")
+        self._btn_ok.setObjectName("collectorRunBtn")
+        self._btn_cancel.setObjectName("collectorGrayBtn")
+        self._btn_ok.setFixedHeight(38)
+        self._btn_cancel.setFixedHeight(38)
+        self._btn_ok.setMinimumWidth(90)
+        self._btn_cancel.setMinimumWidth(90)
+        ok_row.addStretch(1)
+        ok_row.addWidget(self._btn_cancel)
+        ok_row.addWidget(self._btn_ok)
+        layout.addLayout(ok_row)
+
+        self._btn_add.clicked.connect(self._on_add)
+        self._btn_del.clicked.connect(self._on_delete)
+        self._btn_reset.clicked.connect(self._on_reset)
+        self._btn_paste.clicked.connect(self._on_paste)
+        self._btn_ok.clicked.connect(self.accept)
+        self._btn_cancel.clicked.connect(self.reject)
+
+        self.setStyleSheet("""
+            QDialog { background-color: #F4F4F4; }
+            QLabel#searchMvTitle {
+                color: #111F35;
+                font-family: "Segoe UI"; font-size: 14px; font-weight: 700;
+            }
+            QPushButton#searchMvBtn {
+                background-color: #9EA3AB;
+                color: #000000;
+                border: 1px solid #8B9098;
+                border-radius: 8px;
+                padding: 0 12px;
+                min-height: 30px;
+                font-family: "Segoe UI"; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#searchMvBtn:hover   { background-color: #ACB1B8; }
+            QPushButton#searchMvBtn:pressed { background-color: #111F35; color: #FFFFFF; border: 1px solid #111F35; }
+            QTableWidget#searchMvTable {
+                background-color: #FFFFFF;
+                color: #111111;
+                border: 1px solid #A9A9A9;
+                gridline-color: #D0D0D0;
+                selection-background-color: #DCE6F5;
+                font-family: "Segoe UI"; font-size: 13px;
+            }
+            QTableWidget#searchMvTable QHeaderView::section {
+                background-color: #111F35;
+                color: #FFFFFF;
+                border: 1px solid #7D8694;
+                padding: 4px 8px;
+                font-weight: 700;
+                font-family: "Segoe UI"; font-size: 12px;
+            }
+        """)
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _add_row(self, value: str = "") -> None:
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(value))
+
+    def _on_add(self) -> None:
+        self._add_row()
+        self.table.scrollToBottom()
+        last = self.table.rowCount() - 1
+        self.table.setCurrentCell(last, 0)
+        self.table.editItem(self.table.item(last, 0))
+
+    def _on_delete(self) -> None:
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    def _on_reset(self) -> None:
+        self.table.setRowCount(0)
+        self._add_row()
+
+    def _on_paste(self) -> None:
+        text = QApplication.clipboard().text()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return
+        self.table.setRowCount(0)
+        for ln in lines:
+            self._add_row(ln)
+
+    def get_values(self) -> list[str]:
+        """Return non-empty values entered in the table."""
+        result = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            val = item.text().strip() if item else ""
+            if val:
+                result.append(val)
+        return result
+
+
 class NewUIWindow(QMainWindow):
     """UI-only dashboard shell. No business logic is connected yet."""
 
@@ -5930,6 +6057,8 @@ class NewUIWindow(QMainWindow):
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.empty_page)
         self.content_stack.addWidget(self.active_tools_page)
+        self.search_page = self._build_search_page()
+        self.content_stack.addWidget(self.search_page)
         content_layout.addWidget(self.content_stack, 1)
         content_layout.addWidget(self.section_title, 0, Qt.AlignLeft | Qt.AlignBottom)
 
@@ -5979,6 +6108,7 @@ class NewUIWindow(QMainWindow):
 
     def _set_section_title(self, title: str) -> None:
         self.section_title.setText(title)
+        self.section_title.setVisible(title != "SEARCH")
         if title == "MASTER":
             self.project_selector_row.setVisible(False)
             self._content_layout.setSpacing(0)
@@ -5996,7 +6126,14 @@ class NewUIWindow(QMainWindow):
             self.left_nav_stack.setCurrentWidget(self.project_left)
             self.btn_action_packshot_naming.setChecked(True)
             self._show_packshot_panel()
-        else:  # HOME, SEARCH
+        elif title == "SEARCH":
+            self.project_selector_row.setVisible(False)
+            self._content_layout.setSpacing(0)
+            self._active_page_layout.setContentsMargins(0, 16, 0, 0)
+            self.content_stack.setCurrentWidget(self.search_page)
+            self.left_nav_stack.setCurrentWidget(self.left_nav_blank)
+            self.combined_right_panel.setVisible(False)
+        else:  # HOME
             self.project_selector_row.setVisible(False)
             self._content_layout.setSpacing(16)
             self.content_stack.setCurrentWidget(self.empty_page)
@@ -6131,6 +6268,373 @@ class NewUIWindow(QMainWindow):
         self.mapper_reformat_progress_bar.setValue(0)
         self.mapper_reformat_progress_bar.setVisible(False)
         self.btn_run_process_mapper_reformat.setEnabled(False)
+
+    # ── SEARCH page ────────────────────────────────────────────────────────
+
+    def _build_search_page(self) -> QWidget:
+        """Build and return the full-width SEARCH page panel."""
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 16, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # White card panel
+        panel = QFrame()
+        panel.setObjectName("searchPanel")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(32, 28, 32, 28)
+        panel_layout.setSpacing(16)
+
+        # ── "Expand search" checkbox + "Multiple Selection" in aligned grid ──
+        self.chk_expand_search = QCheckBox("Expand search")
+        self.chk_expand_search.setObjectName("searchExpandCheckbox")
+        self.chk_expand_search.setChecked(False)
+
+        self.combo_search_multi_select = QComboBox()
+        self.combo_search_multi_select.setObjectName("searchDropdownMini")
+        self.combo_search_multi_select.addItems([
+            "No", "IDH", "Basic", "Pack Type", "Pack Size",
+            "Label Size", "Project Name", "Color", "SBU", "Custom",
+        ])
+        self.combo_search_multi_select.setCurrentText("No")
+
+        multi_sel_lbl_top = QLabel("Multiple Selection")
+        multi_sel_lbl_top.setObjectName("searchDropdownLabel")
+        multi_sel_row_top = QHBoxLayout()
+        multi_sel_row_top.setSpacing(8)
+        multi_sel_row_top.setContentsMargins(0, 0, 0, 0)
+        multi_sel_row_top.addWidget(multi_sel_lbl_top, 0, Qt.AlignmentFlag.AlignVCenter)
+        multi_sel_row_top.addWidget(self.combo_search_multi_select, 0, Qt.AlignmentFlag.AlignVCenter)
+        multi_sel_w_top = QWidget()
+        multi_sel_w_top.setLayout(multi_sel_row_top)
+        multi_sel_w_top.setVisible(False)
+        self._search_multi_sel_w = multi_sel_w_top
+
+        # Grid: col0=130px (Source), col1=112px (AssetType), col2=SampleLimit/MultiSel, col3=stretch
+        expand_align_grid = QGridLayout()
+        expand_align_grid.setContentsMargins(0, 0, 0, 0)
+        expand_align_grid.setHorizontalSpacing(16)
+        expand_align_grid.setVerticalSpacing(0)
+        expand_align_grid.setColumnMinimumWidth(0, 130)
+        expand_align_grid.setColumnMinimumWidth(1, 112)
+        expand_align_grid.setColumnStretch(3, 1)
+        expand_align_grid.addWidget(
+            self.chk_expand_search, 0, 0, 1, 2,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+        )
+        expand_align_grid.addWidget(multi_sel_w_top, 0, 2)
+        panel_layout.addLayout(expand_align_grid)
+
+        # ── Compact search bar (pill + icon button) ───────────────────────
+        self.search_bar_compact = QWidget()
+        self.search_bar_compact.setObjectName("searchBarCompact")
+        compact_layout = QHBoxLayout(self.search_bar_compact)
+        compact_layout.setContentsMargins(0, 0, 0, 0)
+        compact_layout.setSpacing(0)
+
+        self.input_search = QLineEdit()
+        self.input_search.setObjectName("searchPillInput")
+        self.input_search.setPlaceholderText("Search…")
+        self.input_search.setClearButtonEnabled(True)
+        compact_layout.addWidget(self.input_search, 1)
+
+        self.btn_search_go = QPushButton()
+        self.btn_search_go.setObjectName("searchIconBtn")
+        self.btn_search_go.setFixedSize(46, 46)
+        self.btn_search_go.setCursor(Qt.CursorShape.PointingHandCursor)
+        # magnifier icon (unicode fallback)
+        self.btn_search_go.setText("⌕")
+        compact_layout.addWidget(self.btn_search_go, 0)
+
+        panel_layout.addWidget(self.search_bar_compact)
+
+        # ── Expanded multi-field search (hidden by default) ───────────────
+        self.search_bar_expanded = QWidget()
+        self.search_bar_expanded.setVisible(False)
+        expanded_layout = QVBoxLayout(self.search_bar_expanded)
+        expanded_layout.setContentsMargins(0, 0, 0, 0)
+        expanded_layout.setSpacing(10)
+
+        # 9 text fields arranged in 2 columns
+        _expand_fields = [
+            ("IDH",          "input_search_idh",          "000000"),
+            ("Basic",        "input_search_basic",        "000000"),
+            ("Pack Type",    "input_search_pack_type",    "bottle"),
+            ("Pack Size",    "input_search_pack_size",    "500ml"),
+            ("Label Size",   "input_search_label_size",   "8 x 12"),
+            ("Project Name", "input_search_project_name", "2025A002"),
+            ("Color",        "input_search_color",        "red"),
+            ("SBU",          "input_search_sbu",          "AQC"),
+            ("Custom",       "input_search_custom",       "Anaerobic, right-angle"),
+        ]
+
+        def _make_field_pill(label_text: str, attr_name: str, placeholder: str) -> QHBoxLayout:
+            pill = QHBoxLayout()
+            pill.setSpacing(0)
+            lbl = QLineEdit()
+            lbl.setObjectName("searchFieldLabel")
+            lbl.setText(label_text)
+            lbl.setReadOnly(True)
+            lbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            lbl.setFixedWidth(115)
+            pill.addWidget(lbl, 0)
+            field = QLineEdit()
+            field.setObjectName("searchFieldInput")
+            field.setPlaceholderText(placeholder)
+            field.setClearButtonEnabled(True)
+            setattr(self, attr_name, field)
+            pill.addWidget(field, 1)
+            return pill
+
+        # Build rows of 2 columns
+        grid_layout = QGridLayout()
+        grid_layout.setHorizontalSpacing(10)
+        grid_layout.setVerticalSpacing(2)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        for i, (label_text, attr_name, placeholder) in enumerate(_expand_fields):
+            col = i % 2
+            row_idx = i // 2
+            pill_widget = QWidget()
+            pill_widget.setLayout(_make_field_pill(label_text, attr_name, placeholder))
+            grid_layout.addWidget(pill_widget, row_idx, col)
+        expanded_layout.addLayout(grid_layout)
+
+        # ── Extra filter controls (columns aligned with expand row above) ─
+        expanded_layout.addSpacing(8)
+
+        controls_grid = QGridLayout()
+        controls_grid.setContentsMargins(0, 0, 0, 0)
+        controls_grid.setHorizontalSpacing(16)
+        controls_grid.setVerticalSpacing(0)
+        controls_grid.setColumnMinimumWidth(0, 130)
+        controls_grid.setColumnMinimumWidth(1, 112)
+        controls_grid.setColumnStretch(4, 1)
+
+        # Source — col 0
+        source_col = QVBoxLayout()
+        source_col.setSpacing(4)
+        source_col.setContentsMargins(0, 0, 0, 0)
+        source_lbl_text = QLabel("Source")
+        source_lbl_text.setObjectName("searchDropdownLabel")
+        source_col.addWidget(source_lbl_text)
+        self.combo_search_source = QComboBox()
+        self.combo_search_source.setObjectName("searchDropdownMini")
+        self.combo_search_source.addItems(["All", "TSC", "RSD (master)", "Library"])
+        self.combo_search_source.setCurrentText("All")
+        source_col.addWidget(self.combo_search_source)
+        source_w = QWidget()
+        source_w.setLayout(source_col)
+        controls_grid.addWidget(source_w, 0, 0)
+
+        # Asset Type — col 1
+        asset_col = QVBoxLayout()
+        asset_col.setSpacing(4)
+        asset_col.setContentsMargins(0, 0, 0, 0)
+        asset_lbl_text = QLabel("Asset Type")
+        asset_lbl_text.setObjectName("searchDropdownLabel")
+        asset_col.addWidget(asset_lbl_text)
+        self.combo_search_asset_type = QComboBox()
+        self.combo_search_asset_type.setObjectName("searchDropdownMini")
+        self.combo_search_asset_type.addItems(["All", "2D", "3D"])
+        self.combo_search_asset_type.setCurrentText("All")
+        asset_col.addWidget(self.combo_search_asset_type)
+        asset_w = QWidget()
+        asset_w.setLayout(asset_col)
+        controls_grid.addWidget(asset_w, 0, 1)
+
+        # Sample Limit — col 2
+        limit_col = QVBoxLayout()
+        limit_col.setSpacing(4)
+        limit_col.setContentsMargins(0, 0, 0, 0)
+        limit_lbl_text = QLabel("Sample Limit")
+        limit_lbl_text.setObjectName("searchDropdownLabel")
+        limit_col.addWidget(limit_lbl_text)
+        self.combo_search_sample_limit = QComboBox()
+        self.combo_search_sample_limit.setObjectName("searchDropdownMini")
+        self.combo_search_sample_limit.addItems(["5", "10", "All"])
+        self.combo_search_sample_limit.setCurrentText("5")
+        limit_col.addWidget(self.combo_search_sample_limit)
+        limit_w = QWidget()
+        limit_w.setLayout(limit_col)
+        controls_grid.addWidget(limit_w, 0, 2)
+
+        # Status — col 3
+        status_col = QVBoxLayout()
+        status_col.setSpacing(4)
+        status_col.setContentsMargins(0, 0, 0, 0)
+        status_lbl_text = QLabel("Status")
+        status_lbl_text.setObjectName("searchDropdownLabel")
+        status_col.addWidget(status_lbl_text)
+        self.combo_search_status = QComboBox()
+        self.combo_search_status.setObjectName("searchDropdownMini")
+        self.combo_search_status.addItems(["Completed", "All"])
+        self.combo_search_status.setCurrentText("Completed")
+        status_col.addWidget(self.combo_search_status)
+        status_w = QWidget()
+        status_w.setLayout(status_col)
+        controls_grid.addWidget(status_w, 0, 3)
+
+        expanded_layout.addLayout(controls_grid)
+
+        # Checkboxes in one row
+        chk_row = QHBoxLayout()
+        chk_row.setContentsMargins(0, 6, 0, 0)
+        chk_row.setSpacing(24)
+        self.chk_search_matching_image = QCheckBox("Only with matching image")
+        self.chk_search_matching_image.setObjectName("searchExpandCheckbox")
+        self.chk_search_matching_image.setChecked(False)
+        chk_row.addWidget(self.chk_search_matching_image, 0)
+        self.chk_search_prioritize_recent = QCheckBox("Prioritize recently completed")
+        self.chk_search_prioritize_recent.setObjectName("searchExpandCheckbox")
+        self.chk_search_prioritize_recent.setChecked(True)
+        chk_row.addWidget(self.chk_search_prioritize_recent, 0)
+        chk_row.addStretch(1)
+        expanded_layout.addLayout(chk_row)
+
+        expanded_layout.addSpacing(6)
+
+        # ── Search button centered below all fields ───────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 8, 0, 0)
+        self.btn_search_go_expanded = QPushButton("Search")
+        self.btn_search_go_expanded.setObjectName("collectorRunBtn")
+        self.btn_search_go_expanded.setFixedHeight(50)
+        self.btn_search_go_expanded.setMinimumWidth(130)
+        self.btn_search_go_expanded.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_search_go_expanded)
+        btn_row.addStretch(1)
+        expanded_layout.addLayout(btn_row)
+
+        panel_layout.addWidget(self.search_bar_expanded)
+
+        panel_layout.addStretch(1)
+
+        outer_layout.addWidget(panel, 1)
+
+        # ── wire controls ────────────────────────────────────────────────
+        self.chk_expand_search.toggled.connect(self._on_expand_search_toggled)
+        self.combo_search_multi_select.currentTextChanged.connect(
+            self._on_search_multi_select_changed
+        )
+        self._search_multi_values: dict[str, list[str]] = {}
+        self._search_multi_active_attr: str | None = None
+
+        return outer
+
+    def _on_expand_search_toggled(self, checked: bool) -> None:
+        self.search_bar_compact.setVisible(not checked)
+        self.search_bar_expanded.setVisible(checked)
+        self._search_multi_sel_w.setVisible(checked)
+
+    # ── "Multiple Selection" multi-value helpers ──────────────────────────
+
+    _MULTI_SELECT_FIELD_MAP: dict[str, str] = {
+        "IDH":          "input_search_idh",
+        "Basic":        "input_search_basic",
+        "Pack Type":    "input_search_pack_type",
+        "Pack Size":    "input_search_pack_size",
+        "Label Size":   "input_search_label_size",
+        "Project Name": "input_search_project_name",
+        "Color":        "input_search_color",
+        "SBU":          "input_search_sbu",
+        "Custom":       "input_search_custom",
+    }
+
+    _MULTI_SELECT_LABEL_MAP: dict[str, str] = {
+        v: k for k, v in _MULTI_SELECT_FIELD_MAP.items()
+    }
+
+    def _on_search_multi_select_changed(self, text: str) -> None:
+        """Activate / deactivate multi-value mode for a search field."""
+        # Restore previous active field
+        prev = self._search_multi_active_attr
+        if prev:
+            field = getattr(self, prev, None)
+            if field:
+                field.removeEventFilter(self)
+                field.setReadOnly(False)
+                field.setClearButtonEnabled(True)
+                field.setCursor(Qt.CursorShape.IBeamCursor)
+                field.setStyleSheet("")
+                vals = self._search_multi_values.get(prev, [])
+                field.setText(", ".join(vals) if vals else "")
+            self._search_multi_active_attr = None
+
+        if text == "No":
+            return
+
+        attr_name = self._MULTI_SELECT_FIELD_MAP.get(text)
+        if not attr_name:
+            return
+
+        self._search_multi_active_attr = attr_name
+        field = getattr(self, attr_name, None)
+        if not field:
+            return
+
+        # Capture any existing plain text as first multi-value if not yet set
+        if attr_name not in self._search_multi_values:
+            existing = field.text().strip()
+            self._search_multi_values[attr_name] = [existing] if existing else []
+
+        field.setReadOnly(True)
+        field.setClearButtonEnabled(False)
+        field.setCursor(Qt.CursorShape.PointingHandCursor)
+        field.setStyleSheet("""
+            QLineEdit {
+                background-color: #E8EEF8;
+                color: #111F35;
+                border: none;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                border-top-right-radius: 10px;
+                border-bottom-right-radius: 10px;
+                min-height: 40px;
+                padding: 0 12px;
+                font-family: "Segoe UI";
+                font-size: 13px;
+                font-style: italic;
+            }
+            QLineEdit:hover { background-color: #D6E2F5; }
+        """)
+        self._refresh_search_multi_field_display(attr_name)
+        field.installEventFilter(self)
+
+    def _refresh_search_multi_field_display(self, attr_name: str) -> None:
+        """Update the read-only display text for the active multi-value field."""
+        field = getattr(self, attr_name, None)
+        if not field:
+            return
+        vals = self._search_multi_values.get(attr_name, [])
+        if vals:
+            count = len(vals)
+            preview = ", ".join(vals[:3])
+            if count > 3:
+                preview += f", … (+{count - 3} more)"
+            field.setText(f"{count} value{'s' if count != 1 else ''}: {preview}")
+        else:
+            field.setText("")
+            field.setPlaceholderText("Click to add values…")
+
+    def _open_search_multi_value_dialog(self, attr_name: str) -> None:
+        """Open the multi-value editor for the given field attribute."""
+        label_text = self._MULTI_SELECT_LABEL_MAP.get(attr_name, attr_name)
+        initial = self._search_multi_values.get(attr_name, [])
+        dlg = _SearchMultiValueDialog(label_text, initial, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._search_multi_values[attr_name] = dlg.get_values()
+            self._refresh_search_multi_field_display(attr_name)
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        attr = getattr(self, "_search_multi_active_attr", None)
+        if attr:
+            field = getattr(self, attr, None)
+            if obj is field and event.type() == QEvent.Type.MouseButtonPress:
+                self._open_search_multi_value_dialog(attr)
+                return True
+        return super().eventFilter(obj, event)
 
     def _build_combined_right_panel(self) -> None:
         panel_layout = QVBoxLayout(self.combined_right_panel)
@@ -7989,6 +8493,222 @@ class NewUIWindow(QMainWindow):
             border-radius: 18px;
         }
 
+        #searchPanel {
+            background-color: #FFFFFF;
+            border: 1px solid #C0C0C0;
+            border-radius: 18px;
+        }
+
+        #searchExpandCheckbox {
+            font-family: "Segoe UI";
+            font-size: 13px;
+            color: #333333;
+            spacing: 8px;
+        }
+
+        /* Pill-shaped compact search input */
+        #searchPillInput {
+            background-color: #EFEFEF;
+            color: #111111;
+            border: none;
+            border-radius: 23px;
+            min-height: 46px;
+            padding: 0 20px 0 20px;
+            font-family: "Segoe UI";
+            font-size: 15px;
+        }
+        #searchPillInput:focus {
+            background-color: #E8E8E8;
+        }
+
+        /* Dark circular search button */
+        #searchIconBtn {
+            background-color: #1A1A1A;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 23px;
+            font-size: 20px;
+            padding: 0;
+            margin-left: 6px;
+        }
+        #searchIconBtn:hover  { background-color: #D02752; }
+        #searchIconBtn:pressed { background-color: #111F35; }
+
+        /* Expanded search – label cell */
+        #searchFieldLabel {
+            background-color: #E0E0E0;
+            color: #111111;
+            border: none;
+            border-top-left-radius: 10px;
+            border-bottom-left-radius: 10px;
+            border-top-right-radius: 0px;
+            border-bottom-right-radius: 0px;
+            min-height: 40px;
+            padding: 0 12px;
+            font-family: "Segoe UI";
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        /* Expanded search – value cell */
+        #searchFieldInput {
+            background-color: #F5F5F5;
+            color: #111111;
+            border: none;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
+            min-height: 40px;
+            padding: 0 12px;
+            font-family: "Segoe UI";
+            font-size: 13px;
+        }
+        #searchFieldInput:focus {
+            background-color: #EAEAEA;
+        }
+
+        /* Expanded search – combo cell */
+        /* Dropdown label text */
+        #searchDropdownLabel {
+            font-family: "Segoe UI";
+            font-size: 12px;
+            color: #555555;
+        }
+
+        /* Standalone rounded-rectangle combo — closed state */
+        QComboBox#searchDropdown {
+            background-color: #FFFFFF;
+            color: #111111;
+            border: 1.5px solid #BBBBBB;
+            border-radius: 10px;
+            min-height: 40px;
+            padding: 0 36px 0 14px;
+            font-family: "Segoe UI";
+            font-size: 13px;
+        }
+        QComboBox#searchDropdown:hover {
+            border: 1.5px solid #111F35;
+        }
+        QComboBox#searchDropdown:on {
+            border: 1.5px solid #111F35;
+        }
+        QComboBox#searchDropdown::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            width: 32px;
+            border: none;
+            background-color: transparent;
+        }
+        QComboBox#searchDropdown::down-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #555555;
+            margin-right: 10px;
+        }
+        QComboBox#searchDropdown::up-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-bottom: 6px solid #111111;
+            margin-right: 10px;
+        }
+        QComboBox#searchDropdown QAbstractItemView {
+            background-color: #FFFFFF;
+            border: 1px solid #CCCCCC;
+            border-radius: 8px;
+            outline: none;
+            padding: 4px;
+            font-family: "Segoe UI";
+            font-size: 13px;
+            color: #111111;
+            selection-background-color: #EEEEEE;
+            selection-color: #111111;
+        }
+        QComboBox#searchDropdown QAbstractItemView::item {
+            padding: 6px 12px;
+            border-radius: 6px;
+            min-height: 28px;
+        }
+        QComboBox#searchDropdown QAbstractItemView::item:selected {
+            background-color: #EEEEEE;
+            font-weight: 700;
+        }
+        QComboBox#searchDropdown QAbstractItemView::item:hover {
+            background-color: #F0F0F0;
+        }
+
+        /* Mini combos — Source, Asset Type, Sample Limit, Multiple Selection */
+        QComboBox#searchDropdownMini {
+            background-color: #FFFFFF;
+            color: #111111;
+            border: 1.5px solid #BBBBBB;
+            border-radius: 6px;
+            min-height: 22px;
+            max-height: 22px;
+            padding: 0 24px 0 8px;
+            font-family: "Segoe UI";
+            font-size: 10px;
+        }
+        QComboBox#searchDropdownMini:hover {
+            border: 1.5px solid #111F35;
+        }
+        QComboBox#searchDropdownMini:on {
+            border: 1.5px solid #111F35;
+        }
+        QComboBox#searchDropdownMini::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            width: 20px;
+            border: none;
+            background-color: transparent;
+        }
+        QComboBox#searchDropdownMini::down-arrow {
+            image: none;
+            width: 0; height: 0;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 5px solid #555555;
+            margin-right: 6px;
+        }
+        QComboBox#searchDropdownMini::up-arrow {
+            image: none;
+            width: 0; height: 0;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-bottom: 5px solid #111111;
+            margin-right: 6px;
+        }
+        QComboBox#searchDropdownMini QAbstractItemView {
+            background-color: #FFFFFF;
+            border: 1px solid #CCCCCC;
+            border-radius: 6px;
+            outline: none;
+            padding: 2px;
+            font-family: "Segoe UI";
+            font-size: 10px;
+            color: #111111;
+            selection-background-color: #EEEEEE;
+            selection-color: #111111;
+        }
+        QComboBox#searchDropdownMini QAbstractItemView::item {
+            padding: 4px 8px;
+            border-radius: 4px;
+            min-height: 22px;
+        }
+        QComboBox#searchDropdownMini QAbstractItemView::item:selected {
+            background-color: #EEEEEE;
+            font-weight: 700;
+        }
+        QComboBox#searchDropdownMini QAbstractItemView::item:hover {
+            background-color: #F0F0F0;
+        }
+
         #headerBand {
             background-color: #000000;
             border: 1px solid #1F1F1F;
@@ -8358,45 +9078,17 @@ class NewUIWindow(QMainWindow):
         }
 
         #collectorCheck {
-            color: #000000;
+            color: #333333;
             font-family: "Segoe UI";
-            font-size: 14px;
-            font-weight: 500;
+            font-size: 13px;
             spacing: 8px;
         }
 
-        #collectorCheck::indicator {
-            width: 18px;
-            height: 18px;
-            border: 1px solid #6F6F6F;
-            border-radius: 6px;
-            background: #D3D3D3;
-        }
-
-        #collectorCheck::indicator:checked {
-            background: #111F35;
-            border: 1px solid #111F35;
-        }
-
         #collectorCheckSmall {
-            color: #000000;
+            color: #333333;
             font-family: "Segoe UI";
-            font-size: 11px;
-            font-weight: 500;
-            spacing: 5px;
-        }
-
-        #collectorCheckSmall::indicator {
-            width: 14px;
-            height: 14px;
-            border: 1px solid #6F6F6F;
-            border-radius: 4px;
-            background: #D3D3D3;
-        }
-
-        #collectorCheckSmall::indicator:checked {
-            background: #111F35;
-            border: 1px solid #111F35;
+            font-size: 13px;
+            spacing: 8px;
         }
 
         #collectorRunBtn {

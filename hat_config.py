@@ -59,6 +59,7 @@ _DEFAULT_SECTIONS: dict[str, dict[str, str]] = {
     "sap_reformat": {"input_folder": "", "output_folder": ""},
     "excel_library":{"folder": ""},
     "sap_compare":  {"rsd_target_folder": "", "rsd_master_folder": "", "tsc_data_folder": ""},
+    "search":       {"rsd_master_folder": "", "tsc_data_folder": "", "library": "", "thumbnails_folder": ""},
 }
 
 
@@ -206,6 +207,24 @@ class HatConfig:
         if override:
             return override
         return self.sap_reformat_input()
+
+    # ── search page folder helpers ──────────────────────────────────────────
+
+    def search_rsd_master_folder(self) -> str:
+        return self._resolve("search", "rsd_master_folder",
+                             "HAT DASHBOARD ROOT/MASTER/SAP Data Reformat")
+
+    def search_tsc_data_folder(self) -> str:
+        return self._resolve("search", "tsc_data_folder",
+                             "HAT DASHBOARD ROOT/MASTER/Tracker Status Collector")
+
+    def search_library(self) -> str:
+        return self._resolve("search", "library",
+                             "HAT DASHBOARD ROOT/MASTER/Excel Library")
+
+    def search_thumbnails_folder(self) -> str:
+        return self._resolve("search", "thumbnails_folder",
+                             "HAT DASHBOARD ROOT/MASTER/Thumbnail Generator")
 
     # ── validation ──────────────────────────────────────────────────────────
 
