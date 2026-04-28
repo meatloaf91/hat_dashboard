@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QStackedWidget,
     QSpacerItem,
     QSizePolicy,
@@ -5746,6 +5747,310 @@ class _SearchMultiValueDialog(QDialog):
         return result
 
 
+class _SearchResultWindow(QDialog):
+    """Non-modal window showing text-data table + image grid from a search."""
+
+    MINIMAL_COLS: list[str] = [
+        "IDH", "Pack Name", "Pack Type", "Pack Size", "Basic", "Project Name",
+    ]
+    ALL_COLS: list[str] = [
+        "IDH", "Pack Name", "Pack Type", "Pack Size", "Basic", "Project Name",
+        "SBU", "Label Size", "Color",
+    ]
+
+    _ACTIVE_HEADER_BG   = "#F63049"
+    _ACTIVE_HEADER_FG   = "#000000"
+    _INACTIVE_HEADER_BG = "#555555"
+    _INACTIVE_HEADER_FG = "#AAAAAA"
+
+    def __init__(self, result_data: dict, cfg: "HatConfig", parent=None) -> None:
+        super().__init__(parent)
+        self._result_data = result_data
+        self._cfg = cfg
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("Search Results")
+        self.setMinimumSize(860, 600)
+        self.resize(1080, 720)
+
+        # Pre-load matching images
+        from search import find_matching_images
+        idh_set = {v.strip() for v in result_data.get("idh_list", []) if v.strip()}
+        thumb_folder = cfg.search_thumbnails_folder()
+        self._images: list[dict] = (
+            find_matching_images(idh_set, thumb_folder) if idh_set else []
+        )
+
+        self._build_ui()
+
+    # ── UI construction ──────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 12, 16, 12)
+        root.setSpacing(10)
+
+        # Header bar
+        hdr = QHBoxLayout()
+        hdr.setSpacing(12)
+
+        details_lbl = QLabel("Details:")
+        details_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
+        hdr.addWidget(details_lbl)
+
+        self._radio_minimal = QRadioButton("Minimal")
+        self._radio_all     = QRadioButton("All")
+        self._radio_minimal.setChecked(True)
+        grp = QButtonGroup(self)
+        grp.addButton(self._radio_minimal)
+        grp.addButton(self._radio_all)
+        hdr.addWidget(self._radio_minimal)
+        hdr.addWidget(self._radio_all)
+        hdr.addStretch(1)
+
+        export_btn = QPushButton("Export search results")
+        export_btn.setObjectName("collectorRunBtn")
+        export_btn.setFixedHeight(36)
+        export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr.addWidget(export_btn)
+        root.addLayout(hdr)
+
+        # Scrollable body
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        root.addWidget(self._scroll)
+
+        # Signals
+        self._radio_minimal.toggled.connect(
+            lambda checked: self._refresh_body(minimal=checked)
+        )
+        export_btn.clicked.connect(self._export_pdf)
+
+        self._refresh_body(minimal=True)
+
+    def _refresh_body(self, minimal: bool) -> None:
+        """Rebuild the scrollable content for the chosen detail level."""
+        from search import DISPLAY_COLUMN_FIELD
+
+        # Replace old scroll widget cleanly
+        old = self._scroll.takeWidget()
+        if old:
+            old.deleteLater()
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 4, 8, 8)
+        layout.setSpacing(16)
+
+        rows   = self._result_data.get("rows", [])
+        active = self._result_data.get("active_filters", set())
+        cols   = self.MINIMAL_COLS if minimal else self.ALL_COLS
+
+        # ── Text data ────────────────────────────────────────────────────
+        txt_lbl = QLabel("Text Data")
+        txt_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        layout.addWidget(txt_lbl)
+
+        if not rows:
+            no_res = QLabel("No results found.")
+            no_res.setStyleSheet("color: #888888; font-size: 13px; padding: 4px 0;")
+            layout.addWidget(no_res)
+        else:
+            # Use row 0 as a fake coloured header row; hide the real QHeaderView
+            table = QTableWidget(len(rows) + 1, len(cols))
+            table.horizontalHeader().setVisible(False)
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            table.setRowHeight(0, 36)
+
+            # Header row (row 0)
+            for col_idx, col_name in enumerate(cols):
+                field_key = DISPLAY_COLUMN_FIELD.get(col_name)
+                hitem = QTableWidgetItem(col_name)
+                hitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                hitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                bold = QFont()
+                bold.setBold(True)
+                hitem.setFont(bold)
+                if field_key and field_key in active:
+                    hitem.setBackground(QColor(self._ACTIVE_HEADER_BG))
+                    hitem.setForeground(QColor(self._ACTIVE_HEADER_FG))
+                else:
+                    hitem.setBackground(QColor(self._INACTIVE_HEADER_BG))
+                    hitem.setForeground(QColor(self._INACTIVE_HEADER_FG))
+                table.setItem(0, col_idx, hitem)
+
+            # Data rows
+            for row_idx, record in enumerate(rows):
+                for col_idx, col_name in enumerate(cols):
+                    cell = QTableWidgetItem(record.get(col_name, ""))
+                    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    table.setItem(row_idx + 1, col_idx, cell)
+
+            # Size table to content
+            row_h = 30
+            table.verticalHeader().setDefaultSectionSize(row_h)
+            content_h = 36 + len(rows) * row_h + 4
+            table.setMinimumHeight(content_h)
+            table.setMaximumHeight(content_h)
+            layout.addWidget(table)
+
+        # ── Image data ───────────────────────────────────────────────────
+        img_sec_lbl = QLabel("Image Data")
+        img_sec_lbl.setStyleSheet(
+            "font-size: 14px; font-weight: 700; margin-top: 4px;"
+        )
+        layout.addWidget(img_sec_lbl)
+
+        if not self._images:
+            no_img = QLabel("No matching images found.")
+            no_img.setStyleSheet("color: #888888; font-size: 13px; padding: 4px 0;")
+            layout.addWidget(no_img)
+        else:
+            grid = QGridLayout()
+            grid.setSpacing(20)
+            grid.setContentsMargins(0, 0, 0, 0)
+            for i, info in enumerate(self._images):
+                cell_w = QWidget()
+                cell_v = QVBoxLayout(cell_w)
+                cell_v.setSpacing(4)
+                cell_v.setContentsMargins(0, 0, 0, 0)
+
+                img_lbl = QLabel()
+                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lbl.setFixedSize(240, 240)
+                px = QPixmap(info["path"])
+                if not px.isNull():
+                    px = px.scaled(
+                        236, 236,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    img_lbl.setPixmap(px)
+                else:
+                    img_lbl.setText("[Image unavailable]")
+
+                name_lbl = QLabel(f"<b>Image Name:</b> {info['name']}")
+                name_lbl.setWordWrap(True)
+                name_lbl.setStyleSheet("font-size: 11px;")
+                folder_lbl = QLabel(f"<b>Folder:</b> {info['folder']}")
+                folder_lbl.setWordWrap(True)
+                folder_lbl.setStyleSheet("font-size: 11px; color: #AAAAAA;")
+
+                cell_v.addWidget(img_lbl)
+                cell_v.addWidget(name_lbl)
+                cell_v.addWidget(folder_lbl)
+                cell_v.addStretch(1)
+
+                grid.addWidget(cell_w, i // 2, i % 2)
+
+            img_container = QWidget()
+            img_container.setLayout(grid)
+            layout.addWidget(img_container)
+
+        layout.addStretch(1)
+        self._scroll.setWidget(container)
+
+    # ── PDF export ───────────────────────────────────────────────────────
+
+    def _build_pdf_html(self, minimal: bool) -> str:
+        from search import DISPLAY_COLUMN_FIELD
+        import base64
+
+        rows   = self._result_data.get("rows", [])
+        active = self._result_data.get("active_filters", set())
+        cols   = self.MINIMAL_COLS if minimal else self.ALL_COLS
+
+        p: list[str] = [
+            "<html><body style='font-family:Segoe UI,Arial,sans-serif;font-size:11px;'>"
+            "<h2 style='margin-bottom:8px;'>Search Results</h2>"
+            "<h3 style='margin-bottom:4px;'>Text Data</h3>"
+            "<table border='1' cellpadding='5' cellspacing='0' "
+            "style='border-collapse:collapse;width:100%;'>"
+            "<tr>"
+        ]
+        for col in cols:
+            fk = DISPLAY_COLUMN_FIELD.get(col)
+            if fk and fk in active:
+                s = (f"background:{self._ACTIVE_HEADER_BG};"
+                     f"color:{self._ACTIVE_HEADER_FG};font-weight:bold;")
+            else:
+                s = "background:#555;color:#aaa;font-weight:bold;"
+            p.append(f"<th style='{s}'>{col}</th>")
+        p.append("</tr>")
+
+        for i, record in enumerate(rows):
+            bg = "#f8f8f8" if i % 2 == 0 else "#ffffff"
+            p.append(f"<tr style='background:{bg};'>")
+            for col in cols:
+                p.append(f"<td>{record.get(col, '')}</td>")
+            p.append("</tr>")
+        p.append("</table>")
+
+        if self._images:
+            p.append("<h3 style='margin-top:16px;'>Image Data</h3>")
+            p.append("<table cellpadding='8' cellspacing='4'>")
+            for i in range(0, len(self._images), 2):
+                p.append("<tr>")
+                for j in range(2):
+                    idx = i + j
+                    if idx < len(self._images):
+                        info = self._images[idx]
+                        try:
+                            ext = Path(info["path"]).suffix.lower().lstrip(".")
+                            if ext == "jpg":
+                                ext = "jpeg"
+                            with open(info["path"], "rb") as fh:
+                                b64 = __import__("base64").b64encode(fh.read()).decode()
+                            img_tag = (
+                                f"<img src='data:image/{ext};base64,{b64}' "
+                                f"width='220' style='display:block;'/>"
+                            )
+                        except Exception:
+                            img_tag = "[unavailable]"
+                        p.append(
+                            f"<td style='vertical-align:top;'>{img_tag}"
+                            f"<br/><b>Image Name:</b> {info['name']}"
+                            f"<br/><span style='color:#666;'>"
+                            f"<b>Folder:</b> {info['folder']}</span></td>"
+                        )
+                    else:
+                        p.append("<td></td>")
+                p.append("</tr>")
+            p.append("</table>")
+
+        p.append("</body></html>")
+        return "".join(p)
+
+    def _export_pdf(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Search Results", "", "PDF Files (*.pdf)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+
+        minimal = self._radio_minimal.isChecked()
+        html = self._build_pdf_html(minimal)
+
+        try:
+            from PySide6.QtPrintSupport import QPrinter
+            from PySide6.QtGui import QTextDocument
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(path)
+            printer.setPageSize(QPrinter.PageSize.A4)
+            doc = QTextDocument()
+            doc.setHtml(html)
+            doc.print_(printer)
+            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+
+
 class NewUIWindow(QMainWindow):
     """UI-only dashboard shell. No business logic is connected yet."""
 
@@ -6294,7 +6599,7 @@ class NewUIWindow(QMainWindow):
         self.combo_search_multi_select = QComboBox()
         self.combo_search_multi_select.setObjectName("searchDropdownMini")
         self.combo_search_multi_select.addItems([
-            "No", "IDH", "Basic", "Pack Type", "Pack Size",
+            "No", "IDH", "Pack Name", "Basic", "Pack Type", "Pack Size",
             "Label Size", "Project Name", "Color", "SBU", "Custom",
         ])
         self.combo_search_multi_select.setCurrentText("No")
@@ -6359,6 +6664,7 @@ class NewUIWindow(QMainWindow):
         # 9 text fields arranged in 2 columns
         _expand_fields = [
             ("IDH",          "input_search_idh",          "000000"),
+            ("Pack Name",    "input_search_pack_name",    "loctite 401, Teroson MS 949 FR"),
             ("Basic",        "input_search_basic",        "000000"),
             ("Pack Type",    "input_search_pack_type",    "bottle"),
             ("Pack Size",    "input_search_pack_size",    "500ml"),
@@ -6420,8 +6726,8 @@ class NewUIWindow(QMainWindow):
         source_col.addWidget(source_lbl_text)
         self.combo_search_source = QComboBox()
         self.combo_search_source.setObjectName("searchDropdownMini")
-        self.combo_search_source.addItems(["All", "TSC", "RSD (master)", "Library"])
-        self.combo_search_source.setCurrentText("All")
+        self.combo_search_source.addItems(["TSC", "RSD (master)", "Library"])
+        self.combo_search_source.setCurrentText("TSC")
         source_col.addWidget(self.combo_search_source)
         source_w = QWidget()
         source_w.setLayout(source_col)
@@ -6515,9 +6821,14 @@ class NewUIWindow(QMainWindow):
 
         # ── wire controls ────────────────────────────────────────────────
         self.chk_expand_search.toggled.connect(self._on_expand_search_toggled)
+        self.combo_search_source.currentTextChanged.connect(self._on_search_source_changed)
         self.combo_search_multi_select.currentTextChanged.connect(
             self._on_search_multi_select_changed
         )
+        self.input_search_custom.textChanged.connect(self._on_search_custom_changed)
+        self.input_search_custom.installEventFilter(self)
+        self.btn_search_go.clicked.connect(self._on_search_go_clicked)
+        self.btn_search_go_expanded.clicked.connect(self._on_search_go_clicked)
         self._search_multi_values: dict[str, list[str]] = {}
         self._search_multi_active_attr: str | None = None
 
@@ -6528,10 +6839,112 @@ class NewUIWindow(QMainWindow):
         self.search_bar_expanded.setVisible(checked)
         self._search_multi_sel_w.setVisible(checked)
 
+    def _on_search_source_changed(self, source: str) -> None:
+        """Lock/unlock Asset Type and Status dropdowns based on Source selection."""
+        is_library = source == "Library"
+        # Asset Type: freeze to "3D" when Library is selected
+        self.combo_search_asset_type.setCurrentText("3D" if is_library else "All")
+        self.combo_search_asset_type.setEnabled(not is_library)
+        # Status: freeze to "Completed" when Library is selected
+        self.combo_search_status.setCurrentText("Completed")
+        self.combo_search_status.setEnabled(not is_library)
+
+    # Fields that Custom freezes (all expanded fields except Custom itself)
+    _CUSTOM_FREEZES: tuple[str, ...] = (
+        "input_search_idh",
+        "input_search_pack_name",
+        "input_search_basic",
+        "input_search_pack_type",
+        "input_search_pack_size",
+        "input_search_label_size",
+        "input_search_project_name",
+        "input_search_color",
+        "input_search_sbu",
+    )
+
+    def _on_search_custom_changed(self, text: str) -> None:
+        """Freeze/unfreeze other search fields based on whether Custom has a value."""
+        self._set_custom_freeze_state(bool(text.strip()))
+
+    def _set_custom_freeze_state(self, freeze: bool) -> None:
+        """Enable or disable all non-Custom search input fields."""
+        for attr in self._CUSTOM_FREEZES:
+            field = getattr(self, attr, None)
+            if field is None:
+                continue
+            field.setReadOnly(freeze)
+            field.setEnabled(not freeze)
+
+    # ── Search execution ─────────────────────────────────────────────────
+
+    #  Maps field_key → attr name on self
+    _FIELD_ATTRS: dict[str, str] = {
+        "idh":          "input_search_idh",
+        "pack_name":    "input_search_pack_name",
+        "basic":        "input_search_basic",
+        "pack_type":    "input_search_pack_type",
+        "pack_size":    "input_search_pack_size",
+        "label_size":   "input_search_label_size",
+        "project_name": "input_search_project_name",
+        "color":        "input_search_color",
+        "sbu":          "input_search_sbu",
+        "custom":       "input_search_custom",
+    }
+
+    def _on_search_go_clicked(self) -> None:
+        """Collect inputs, run search, open the Search Result window."""
+        from search import run_search
+
+        is_expanded = self.chk_expand_search.isChecked()
+
+        # Collect field values
+        field_values: dict[str, str] = {}
+        if is_expanded:
+            for field_key, attr in self._FIELD_ATTRS.items():
+                w = getattr(self, attr, None)
+                field_values[field_key] = w.text() if w else ""
+        else:
+            # Compact mode: single input treated as custom
+            field_values["custom"] = self.input_search.text()
+
+        # Convert multi-select values (attr_name → field_key)
+        _attr_to_field = {v: k for k, v in self._FIELD_ATTRS.items()}
+        multi_values: dict[str, list[str]] = {
+            _attr_to_field[attr]: vals
+            for attr, vals in self._search_multi_values.items()
+            if attr in _attr_to_field and vals
+        }
+
+        # Dropdown values
+        source     = self.combo_search_source.currentText()
+        asset_type = self.combo_search_asset_type.currentText()
+        status     = self.combo_search_status.currentText()
+        limit_txt  = self.combo_search_sample_limit.currentText()
+        sample_limit: int | None = None if limit_txt == "All" else int(limit_txt)
+
+        result = run_search(
+            field_values=field_values,
+            multi_values=multi_values,
+            source=source,
+            asset_type=asset_type,
+            status=status,
+            sample_limit=sample_limit,
+            cfg=self._config,
+        )
+
+        if result["error"]:
+            QMessageBox.warning(self, "Search Error", result["error"])
+            return
+
+        dlg = _SearchResultWindow(result, self._config, parent=self)
+        dlg.setModal(False)
+        dlg.show()
+
     # ── "Multiple Selection" multi-value helpers ──────────────────────────
 
     _MULTI_SELECT_FIELD_MAP: dict[str, str] = {
         "IDH":          "input_search_idh",
+        "Pack Name":    "input_search_pack_name",
         "Basic":        "input_search_basic",
         "Pack Type":    "input_search_pack_type",
         "Pack Size":    "input_search_pack_size",
@@ -6545,6 +6958,24 @@ class NewUIWindow(QMainWindow):
     _MULTI_SELECT_LABEL_MAP: dict[str, str] = {
         v: k for k, v in _MULTI_SELECT_FIELD_MAP.items()
     }
+
+    def _freeze_non_multi_fields(self, active_attr: str | None) -> None:
+        """Disable all search inputs except the active multi-select field.
+
+        Pass *None* to unfreeze everything.
+        """
+        for attr in self._MULTI_SELECT_FIELD_MAP.values():
+            if attr == active_attr:
+                continue
+            field = getattr(self, attr, None)
+            if field is None:
+                continue
+            if active_attr is None:
+                field.setReadOnly(False)
+                field.setEnabled(True)
+            else:
+                field.setReadOnly(True)
+                field.setEnabled(False)
 
     def _on_search_multi_select_changed(self, text: str) -> None:
         """Activate / deactivate multi-value mode for a search field."""
@@ -6563,6 +6994,7 @@ class NewUIWindow(QMainWindow):
             self._search_multi_active_attr = None
 
         if text == "No":
+            self._freeze_non_multi_fields(None)
             return
 
         attr_name = self._MULTI_SELECT_FIELD_MAP.get(text)
@@ -6570,6 +7002,7 @@ class NewUIWindow(QMainWindow):
             return
 
         self._search_multi_active_attr = attr_name
+        self._freeze_non_multi_fields(attr_name)
         field = getattr(self, attr_name, None)
         if not field:
             return
@@ -6628,6 +7061,15 @@ class NewUIWindow(QMainWindow):
             self._refresh_search_multi_field_display(attr_name)
 
     def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        # Custom field: gray others on focus-in; revert on focus-out if empty
+        custom = getattr(self, "input_search_custom", None)
+        if custom is not None and obj is custom:
+            if event.type() == QEvent.Type.FocusIn:
+                self._set_custom_freeze_state(True)
+            elif event.type() == QEvent.Type.FocusOut:
+                if not custom.text().strip():
+                    self._set_custom_freeze_state(False)
+
         attr = getattr(self, "_search_multi_active_attr", None)
         if attr:
             field = getattr(self, attr, None)
@@ -8566,6 +9008,12 @@ class NewUIWindow(QMainWindow):
         }
         #searchFieldInput:focus {
             background-color: #EAEAEA;
+            border: 2px solid rgba(208, 39, 82, 128);
+        }
+
+        #searchFieldInput:disabled {
+            background-color: #E8E8E8;
+            color: #AAAAAA;
         }
 
         /* Expanded search – combo cell */
