@@ -177,6 +177,25 @@ class SapTableReformatter:
         "bulk",
     )
 
+    CLEANUP_1_RESTRICTED_TERMS = (
+        "sal",
+        "pal",
+        "accl",
+        "film",
+        "ship",
+        "wgl",
+        "sheet",
+        "shee",
+        "pl",
+        "t-secur",
+        "saco",
+        "rbosac",
+        "acco_pe",
+        "tear",
+        "bulk",
+        "flex",
+    )
+
     def reformat_from_table(self, table, cleanup_mode: int) -> tuple[list[list[str]], int]:
         rows = self._extract_rows(table)
         self._validate_row_completeness(rows)
@@ -292,29 +311,24 @@ class SapTableReformatter:
                 )
                 continue
 
-            eligible_smu_rows = self._apply_cleanup_mode(smu_rows, cleanup_mode)
+            if cleanup_mode == 1:
+                eligible_smu_rows = self._apply_cleanup1_filter(smu_rows)
+            else:
+                eligible_smu_rows = self._apply_cleanup_mode(smu_rows, cleanup_mode)
+
             if not eligible_smu_rows:
-                # All SMU rows were in the b2r group.  As a fallback, retain the
-                # first row whose Basic Name starts with "flex" (if one exists).
-                flex_fallback = next(
-                    (row for row in smu_rows if row[self.INDEX_BASIC_NAME].strip().lower().startswith("flex")),
-                    None,
+                out_rows.append(
+                    [
+                        head_bom_mat,
+                        "NO",
+                        "",
+                        self._join_unique([row[self.INDEX_COMPONENT_DESC] for row in smu_rows], separator=", "),
+                        "",
+                        "",
+                        "comb 0",
+                    ]
                 )
-                if flex_fallback is not None:
-                    eligible_smu_rows = [flex_fallback]
-                else:
-                    out_rows.append(
-                        [
-                            head_bom_mat,
-                            "NO",
-                            "",
-                            self._join_unique([row[self.INDEX_COMPONENT_DESC] for row in smu_rows], separator=", "),
-                            "",
-                            "",
-                            "comb 0",
-                        ]
-                    )
-                    continue
+                continue
 
             eligible_with_basic_number = [
                 row
@@ -323,6 +337,9 @@ class SapTableReformatter:
             ]
 
             if not eligible_with_basic_number:
+                eligible_basic_names_text = self._join_unique(
+                    [row[self.INDEX_BASIC_NAME] for row in eligible_smu_rows], separator=", "
+                )
                 out_rows.append(
                     [
                         head_bom_mat,
@@ -330,7 +347,7 @@ class SapTableReformatter:
                         self._join_unique([row[self.INDEX_BOM_COMPONENT] for row in eligible_smu_rows], separator=", "),
                         self._join_unique([row[self.INDEX_COMPONENT_DESC] for row in eligible_smu_rows], separator=", "),
                         "",
-                        "",
+                        eligible_basic_names_text,
                         "comb 0",
                     ]
                 )
@@ -353,6 +370,65 @@ class SapTableReformatter:
             )
 
         return out_rows
+
+    def _apply_cleanup1_filter(self, rows: list[list[str]]) -> list[list[str]]:
+        if not rows:
+            return rows
+
+        exempt_indices: set[int] = set()
+        row_count = len(rows)
+
+        # Exemption A/C: only one remaining row and it is materially filled,
+        # or it is a single FLEX row.
+        if row_count == 1:
+            basic_number = self._strip_leading_zeros(rows[0][self.INDEX_BASIC_NUMBER])
+            basic_name = (rows[0][self.INDEX_BASIC_NAME] or "").strip()
+            if (basic_number != "" and basic_name != "") or self._contains_term(basic_name, "flex"):
+                exempt_indices.add(0)
+
+        # Exemption B: all rows are FLEX-only (no other restricted terms).
+        flex_only_group = True
+        for row in rows:
+            basic_name = (row[self.INDEX_BASIC_NAME] or "").strip()
+            if not basic_name:
+                flex_only_group = False
+                break
+            if not self._contains_term(basic_name, "flex"):
+                flex_only_group = False
+                break
+            if self._contains_any_cleanup1_restricted_term(basic_name, exclude_flex=True):
+                flex_only_group = False
+                break
+
+        if flex_only_group:
+            exempt_indices.update(range(row_count))
+
+        filtered: list[list[str]] = []
+        for idx, row in enumerate(rows):
+            basic_name = row[self.INDEX_BASIC_NAME]
+            should_delete = self._contains_any_cleanup1_restricted_term(basic_name, exclude_flex=False)
+            if idx in exempt_indices or not should_delete:
+                filtered.append(row)
+
+        return filtered
+
+    def _contains_any_cleanup1_restricted_term(self, value: str, exclude_flex: bool) -> bool:
+        text = (value or "").strip().lower()
+        terms = (
+            term
+            for term in self.CLEANUP_1_RESTRICTED_TERMS
+            if (not exclude_flex or term != "flex")
+        )
+        return any(self._contains_term(text, term) for term in terms)
+
+    def _contains_term(self, value: str, term: str) -> bool:
+        text = (value or "").strip().lower()
+        normalized = text.replace("_", " ").replace("-", "")
+
+        if term == "acco_pe":
+            return "acco_pe" in text or "acco pe" in text or "accope" in normalized
+
+        return text.startswith(term)
 
     def _build_basic_number_and_name_strings(
         self,

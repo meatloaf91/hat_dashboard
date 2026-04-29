@@ -5669,6 +5669,22 @@ class _SearchMultiValueDialog(QDialog):
         self._btn_ok.clicked.connect(self.accept)
         self._btn_cancel.clicked.connect(self.reject)
 
+        # Allow Ctrl+V directly on the table
+        orig_key_press = self.table.keyPressEvent
+        def _table_key_press(event, _orig=orig_key_press):
+            if event.matches(QKeySequence.StandardKey.Paste):
+                self._on_paste()
+            elif event.matches(QKeySequence.StandardKey.Copy):
+                selected = self.table.selectedIndexes()
+                lines = []
+                for idx in sorted(selected, key=lambda i: i.row()):
+                    item = self.table.item(idx.row(), 0)
+                    lines.append(item.text() if item else "")
+                QApplication.clipboard().setText("\n".join(lines))
+            else:
+                _orig(event)
+        self.table.keyPressEvent = _table_key_press
+
         self.setStyleSheet("""
             QDialog { background-color: #F4F4F4; }
             QLabel#searchMvTitle {
@@ -5728,13 +5744,47 @@ class _SearchMultiValueDialog(QDialog):
         self._add_row()
 
     def _on_paste(self) -> None:
-        text = QApplication.clipboard().text()
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
+        """Paste clipboard text into the table.
+
+        Handles all common Excel/spreadsheet copy formats:
+        - Single or multi-column Excel paste → one value per *row* (first column only)
+        - Each Excel row is kept intact as a single value (commas within a cell are preserved)
+        - Plain newline-separated text       → one value per line
+        - Blank lines are discarded
+        """
+        text = QApplication.clipboard().text().strip()
+        if not text:
             return
-        self.table.setRowCount(0)
-        for ln in lines:
-            self._add_row(ln)
+
+        values: list[str] = []
+        for line in text.splitlines():
+            # For Excel multi-column pastes the columns are tab-separated;
+            # only take the first column but keep any commas/text within that cell.
+            if "\t" in line:
+                cell = line.split("\t")[0].strip()
+            else:
+                cell = line.strip()
+            if cell:
+                values.append(cell)
+
+        if not values:
+            return
+
+        # If there is currently a selected cell, insert at that position;
+        # otherwise replace all rows
+        selected_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        if selected_rows and len(values) > 0:
+            insert_at = selected_rows[0]
+            # Remove selected rows first, then insert new values starting there
+            for r in sorted(selected_rows, reverse=True):
+                self.table.removeRow(r)
+            for offset, val in enumerate(values):
+                self.table.insertRow(insert_at + offset)
+                self.table.setItem(insert_at + offset, 0, QTableWidgetItem(val))
+        else:
+            self.table.setRowCount(0)
+            for val in values:
+                self._add_row(val)
 
     def get_values(self) -> list[str]:
         """Return non-empty values entered in the table."""
@@ -5748,7 +5798,7 @@ class _SearchMultiValueDialog(QDialog):
 
 
 class _SearchResultWindow(QDialog):
-    """Non-modal window showing text-data table + image grid from a search."""
+    """Non-modal window showing search results as tiles or table."""
 
     MINIMAL_COLS: list[str] = [
         "IDH", "Pack Name", "Pack Type", "Pack Size", "Basic", "Project Name",
@@ -5758,10 +5808,19 @@ class _SearchResultWindow(QDialog):
         "SBU", "Label Size", "Color",
     ]
 
+    # Detail fields for tile descriptions
+    MINIMAL_TILE_FIELDS: list[str] = ["IDH", "Pack Name", "Basic", "Image Name", "Build Type"]
+    ALL_TILE_FIELDS: list[str] = [
+        "IDH", "Pack Name", "Basic", "Image Name", "Build Type", "SBU",
+        "Pack Type", "Pack Size", "Label Size", "Project Name",
+    ]
+
     _ACTIVE_HEADER_BG   = "#F63049"
     _ACTIVE_HEADER_FG   = "#000000"
     _INACTIVE_HEADER_BG = "#555555"
     _INACTIVE_HEADER_FG = "#AAAAAA"
+
+    _HIGHLIGHT_COLOR = "#E8151B"   # red used to highlight matched search values
 
     def __init__(self, result_data: dict, cfg: "HatConfig", parent=None) -> None:
         super().__init__(parent)
@@ -5769,16 +5828,23 @@ class _SearchResultWindow(QDialog):
         self._cfg = cfg
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("Search Results")
-        self.setMinimumSize(860, 600)
-        self.resize(1080, 720)
+        self.setMinimumSize(900, 640)
+        self.resize(1160, 760)
 
-        # Pre-load matching images
+        # Gather thumbnail folders: try all known thumbnail locations as fallbacks
         from search import find_matching_images
         idh_set = {v.strip() for v in result_data.get("idh_list", []) if v.strip()}
         thumb_folder = cfg.search_thumbnails_folder()
+        fallbacks = [cfg.thumbnail_output(), cfg.thumbnail_input()]
         self._images: list[dict] = (
-            find_matching_images(idh_set, thumb_folder) if idh_set else []
+            find_matching_images(idh_set, thumb_folder, fallback_folders=fallbacks)
+            if idh_set else []
         )
+
+        # Map idh → image info for quick tile lookup
+        self._image_by_idh: dict[str, dict] = {
+            info["idh"]: info for info in self._images if info.get("idh")
+        }
 
         self._build_ui()
 
@@ -5787,12 +5853,13 @@ class _SearchResultWindow(QDialog):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(10)
+        root.setSpacing(8)
 
-        # Header bar
+        # ── Header bar ───────────────────────────────────────────────────
         hdr = QHBoxLayout()
-        hdr.setSpacing(12)
+        hdr.setSpacing(16)
 
+        # Details radio group
         details_lbl = QLabel("Details:")
         details_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
         hdr.addWidget(details_lbl)
@@ -5800,11 +5867,32 @@ class _SearchResultWindow(QDialog):
         self._radio_minimal = QRadioButton("Minimal")
         self._radio_all     = QRadioButton("All")
         self._radio_minimal.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self._radio_minimal)
-        grp.addButton(self._radio_all)
+        grp_details = QButtonGroup(self)
+        grp_details.addButton(self._radio_minimal)
+        grp_details.addButton(self._radio_all)
         hdr.addWidget(self._radio_minimal)
         hdr.addWidget(self._radio_all)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        hdr.addWidget(sep)
+
+        # Format radio group
+        fmt_lbl = QLabel("Format:")
+        fmt_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
+        hdr.addWidget(fmt_lbl)
+
+        self._radio_tiles = QRadioButton("Tiles")
+        self._radio_table = QRadioButton("Table")
+        self._radio_tiles.setChecked(True)
+        grp_fmt = QButtonGroup(self)
+        grp_fmt.addButton(self._radio_tiles)
+        grp_fmt.addButton(self._radio_table)
+        hdr.addWidget(self._radio_tiles)
+        hdr.addWidget(self._radio_table)
+
         hdr.addStretch(1)
 
         export_btn = QPushButton("Export search results")
@@ -5814,25 +5902,36 @@ class _SearchResultWindow(QDialog):
         hdr.addWidget(export_btn)
         root.addLayout(hdr)
 
-        # Scrollable body
+        # ── "Search results for:" label ──────────────────────────────────
+        summary = self._result_data.get("search_summary", "")
+        if summary:
+            summary_lbl = QLabel(f"<b>Search results for:</b> {summary}")
+            summary_lbl.setStyleSheet(
+                "font-size: 12px; color: #333333; padding: 2px 0 6px 0;"
+            )
+            summary_lbl.setWordWrap(True)
+            root.addWidget(summary_lbl)
+
+        # ── Scrollable body ──────────────────────────────────────────────
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         root.addWidget(self._scroll)
 
-        # Signals
-        self._radio_minimal.toggled.connect(
-            lambda checked: self._refresh_body(minimal=checked)
-        )
+        # ── Wire signals ─────────────────────────────────────────────────
+        self._radio_minimal.toggled.connect(self._on_options_changed)
+        self._radio_tiles.toggled.connect(self._on_options_changed)
         export_btn.clicked.connect(self._export_pdf)
 
-        self._refresh_body(minimal=True)
+        self._refresh_body()
 
-    def _refresh_body(self, minimal: bool) -> None:
-        """Rebuild the scrollable content for the chosen detail level."""
+    def _on_options_changed(self) -> None:
+        self._refresh_body()
+
+    def _refresh_body(self) -> None:
+        """Rebuild the scrollable content based on current Detail + Format."""
         from search import DISPLAY_COLUMN_FIELD
 
-        # Replace old scroll widget cleanly
         old = self._scroll.takeWidget()
         if old:
             old.deleteLater()
@@ -5842,116 +5941,405 @@ class _SearchResultWindow(QDialog):
         layout.setContentsMargins(0, 4, 8, 8)
         layout.setSpacing(16)
 
+        minimal = self._radio_minimal.isChecked()
+        tiles   = self._radio_tiles.isChecked()
+
         rows   = self._result_data.get("rows", [])
         active = self._result_data.get("active_filters", set())
-        cols   = self.MINIMAL_COLS if minimal else self.ALL_COLS
-
-        # ── Text data ────────────────────────────────────────────────────
-        txt_lbl = QLabel("Text Data")
-        txt_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
-        layout.addWidget(txt_lbl)
+        source = self._result_data.get("source", "")
+        is_rsd = source == "RSD (master)"
+        groups = self._result_data.get("groups")        # list[dict] or None
 
         if not rows:
             no_res = QLabel("No results found.")
             no_res.setStyleSheet("color: #888888; font-size: 13px; padding: 4px 0;")
             layout.addWidget(no_res)
+        elif groups:
+            # Grouped display: one section per search-cell-value
+            data_cols = [c for c in (self.MINIMAL_COLS if minimal else self.ALL_COLS)
+                         if not (is_rsd and c == "Pack Size")]
+            if tiles:
+                self._build_grouped_tiles_view(layout, groups, minimal, active, is_rsd)
+            else:
+                self._build_grouped_table_view(layout, groups, data_cols, active)
+        elif tiles:
+            self._build_tiles_view(layout, rows, minimal, active, is_rsd)
         else:
-            # Use row 0 as a fake coloured header row; hide the real QHeaderView
-            table = QTableWidget(len(rows) + 1, len(cols))
-            table.horizontalHeader().setVisible(False)
-            table.verticalHeader().setVisible(False)
-            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            table.setRowHeight(0, 36)
+            cols = [c for c in (self.MINIMAL_COLS if minimal else self.ALL_COLS)
+                    if not (is_rsd and c == "Pack Size")]
+            self._build_table_view(layout, rows, cols, active)
 
-            # Header row (row 0)
-            for col_idx, col_name in enumerate(cols):
-                field_key = DISPLAY_COLUMN_FIELD.get(col_name)
-                hitem = QTableWidgetItem(col_name)
-                hitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                hitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                bold = QFont()
-                bold.setBold(True)
-                hitem.setFont(bold)
-                if field_key and field_key in active:
-                    hitem.setBackground(QColor(self._ACTIVE_HEADER_BG))
-                    hitem.setForeground(QColor(self._ACTIVE_HEADER_FG))
-                else:
-                    hitem.setBackground(QColor(self._INACTIVE_HEADER_BG))
-                    hitem.setForeground(QColor(self._INACTIVE_HEADER_FG))
-                table.setItem(0, col_idx, hitem)
+        layout.addStretch(1)
+        self._scroll.setWidget(container)
 
-            # Data rows
-            for row_idx, record in enumerate(rows):
-                for col_idx, col_name in enumerate(cols):
-                    cell = QTableWidgetItem(record.get(col_name, ""))
-                    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    table.setItem(row_idx + 1, col_idx, cell)
+    # ── Tiles view ───────────────────────────────────────────────────────
 
-            # Size table to content
-            row_h = 30
-            table.verticalHeader().setDefaultSectionSize(row_h)
-            content_h = 36 + len(rows) * row_h + 4
-            table.setMinimumHeight(content_h)
-            table.setMaximumHeight(content_h)
-            layout.addWidget(table)
+    def _build_tiles_view(
+        self,
+        layout: QVBoxLayout,
+        rows: list[dict],
+        minimal: bool,
+        active: set,
+        is_rsd: bool = False,
+    ) -> None:
+        base_fields = self.MINIMAL_TILE_FIELDS if minimal else self.ALL_TILE_FIELDS
+        tile_fields = [f for f in base_fields if not (is_rsd and f == "Pack Size")]
+        active_values: list[str] = self._collect_active_values(active)
 
-        # ── Image data ───────────────────────────────────────────────────
-        img_sec_lbl = QLabel("Image Data")
-        img_sec_lbl.setStyleSheet(
-            "font-size: 14px; font-weight: 700; margin-top: 4px;"
-        )
-        layout.addWidget(img_sec_lbl)
+        TILE_W, IMG_H = 260, 240
+        COLS = 4
 
-        if not self._images:
-            no_img = QLabel("No matching images found.")
-            no_img.setStyleSheet("color: #888888; font-size: 13px; padding: 4px 0;")
-            layout.addWidget(no_img)
-        else:
-            grid = QGridLayout()
-            grid.setSpacing(20)
-            grid.setContentsMargins(0, 0, 0, 0)
-            for i, info in enumerate(self._images):
-                cell_w = QWidget()
-                cell_v = QVBoxLayout(cell_w)
-                cell_v.setSpacing(4)
-                cell_v.setContentsMargins(0, 0, 0, 0)
+        grid = QGridLayout()
+        grid.setSpacing(20)
+        grid.setContentsMargins(0, 0, 0, 0)
 
-                img_lbl = QLabel()
-                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                img_lbl.setFixedSize(240, 240)
-                px = QPixmap(info["path"])
+        for i, record in enumerate(rows):
+            idh = record.get("IDH", "").strip()
+            img_info = self._image_by_idh.get(idh)
+            has_image = img_info and img_info.get("path")
+
+            cell_w = QWidget()
+            cell_w.setFixedWidth(TILE_W)
+            cell_v = QVBoxLayout(cell_w)
+            cell_v.setSpacing(4)
+            cell_v.setContentsMargins(0, 0, 0, 0)
+
+            # Image area
+            img_lbl = QLabel()
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img_lbl.setFixedSize(TILE_W, IMG_H)
+
+            if has_image:
+                px = QPixmap(img_info["path"])
                 if not px.isNull():
                     px = px.scaled(
-                        236, 236,
+                        TILE_W - 4, IMG_H - 4,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
                     img_lbl.setPixmap(px)
                 else:
-                    img_lbl.setText("[Image unavailable]")
+                    img_lbl.setText("Image unavailable")
+                    img_lbl.setStyleSheet(
+                        "background:#E0E0E0; color:#888; font-size:11px; border:1px solid #CCC;"
+                    )
+            else:
+                img_lbl.setText("No image found")
+                img_lbl.setStyleSheet(
+                    "background:#D8D8D8; color:#777; font-size:12px; border:1px solid #BBBBBB;"
+                )
 
-                name_lbl = QLabel(f"<b>Image Name:</b> {info['name']}")
-                name_lbl.setWordWrap(True)
-                name_lbl.setStyleSheet("font-size: 11px;")
-                folder_lbl = QLabel(f"<b>Folder:</b> {info['folder']}")
-                folder_lbl.setWordWrap(True)
-                folder_lbl.setStyleSheet("font-size: 11px; color: #AAAAAA;")
+            cell_v.addWidget(img_lbl)
 
-                cell_v.addWidget(img_lbl)
-                cell_v.addWidget(name_lbl)
-                cell_v.addWidget(folder_lbl)
-                cell_v.addStretch(1)
+            # Text description below image
+            for field_name in tile_fields:
+                # "Image Name" is a virtual field — resolved from the matched image path
+                if field_name == "Image Name":
+                    value = Path(img_info["path"]).name if has_image else ""
+                else:
+                    value = record.get(field_name, "").strip()
+                desc_lbl = QLabel()
+                desc_lbl.setWordWrap(True)
+                desc_lbl.setStyleSheet("font-size: 11px;")
+                display_val = value if value else "—"
+                if value and active_values:
+                    highlighted = self._highlight_substrings(display_val, active_values)
+                    desc_lbl.setText(f"<b>{field_name}:</b> {highlighted}")
+                else:
+                    desc_lbl.setText(f"<b>{field_name}:</b> {display_val}")
+                cell_v.addWidget(desc_lbl)
 
-                grid.addWidget(cell_w, i // 2, i % 2)
+            cell_v.addStretch(1)
+            grid.addWidget(cell_w, i // COLS, i % COLS)
 
-            img_container = QWidget()
-            img_container.setLayout(grid)
-            layout.addWidget(img_container)
+        wrapper = QWidget()
+        wrapper.setLayout(grid)
+        layout.addWidget(wrapper)
 
-        layout.addStretch(1)
-        self._scroll.setWidget(container)
+    # ── Grouped tiles view ───────────────────────────────────────────────
+
+    def _build_grouped_tiles_view(
+        self,
+        layout: QVBoxLayout,
+        groups: list[dict],
+        minimal: bool,
+        active: set,
+        is_rsd: bool = False,
+    ) -> None:
+        """Render tiles grouped by query-cell value, with a section label per group."""
+        for grp in groups:
+            query_val = grp.get("query_value", "")
+            rows = grp.get("rows", [])
+
+            # Section header label
+            hdr = QLabel(query_val)
+            hdr.setWordWrap(True)
+            hdr.setStyleSheet(
+                "font-family: 'Segoe UI'; font-size: 13px; font-weight: 700;"
+                " color: #111F35; background: #E4E8EE;"
+                " border-left: 4px solid #111F35;"
+                " padding: 6px 10px; margin-top: 4px;"
+            )
+            layout.addWidget(hdr)
+
+            if rows:
+                self._build_tiles_view(layout, rows, minimal, active, is_rsd)
+            else:
+                empty_lbl = QLabel("No results for this value.")
+                empty_lbl.setStyleSheet("color: #888888; font-size: 12px; padding: 4px 12px;")
+                layout.addWidget(empty_lbl)
+
+            # Divider between groups
+            div = QFrame()
+            div.setFrameShape(QFrame.Shape.HLine)
+            div.setFrameShadow(QFrame.Shadow.Sunken)
+            div.setStyleSheet("color: #CCCCCC; margin: 8px 0;")
+            layout.addWidget(div)
+
+    # ── Grouped table view ───────────────────────────────────────────────
+
+    def _build_grouped_table_view(
+        self,
+        layout: QVBoxLayout,
+        groups: list[dict],
+        cols: list[str],
+        active: set,
+    ) -> None:
+        """Render a single table with a leading 'Search Value' column."""
+        from search import DISPLAY_COLUMN_FIELD
+
+        # Combine all rows, tagging each with its query_value
+        all_rows: list[dict] = []
+        for grp in groups:
+            qv = grp.get("query_value", "")
+            for rec in grp.get("rows", []):
+                all_rows.append({**rec, "__query__": qv})
+
+        full_cols = ["Search Value"] + list(cols)
+        active_values = self._collect_active_values(active)
+
+        table = QTableWidget(len(all_rows), len(full_cols))
+        table.horizontalHeader().setVisible(True)
+        table.verticalHeader().setVisible(True)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table: self._show_table_context_menu(pos, t)
+        )
+        table.keyPressEvent = lambda event, t=table: self._table_key_press(event, t)
+        table.setStyleSheet(
+            "QHeaderView::section { padding: 4px 8px; font-weight: 700;"
+            " font-family: 'Segoe UI'; font-size: 12px; border: 1px solid #7D8694; }"
+        )
+
+        # Header items — "Search Value" always active-style, others normal
+        for ci, col_name in enumerate(full_cols):
+            field_key = DISPLAY_COLUMN_FIELD.get(col_name)
+            hitem = QTableWidgetItem(col_name)
+            hitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            bold = QFont()
+            bold.setBold(True)
+            hitem.setFont(bold)
+            if ci == 0:                              # Search Value column
+                hitem.setBackground(QColor(self._ACTIVE_HEADER_BG))
+                hitem.setForeground(QColor(self._ACTIVE_HEADER_FG))
+            elif field_key and field_key in active:
+                hitem.setBackground(QColor(self._ACTIVE_HEADER_BG))
+                hitem.setForeground(QColor(self._ACTIVE_HEADER_FG))
+            else:
+                hitem.setBackground(QColor(self._INACTIVE_HEADER_BG))
+                hitem.setForeground(QColor(self._INACTIVE_HEADER_FG))
+            table.setHorizontalHeaderItem(ci, hitem)
+
+        # Data rows — alternate background per group for visual separation
+        _GROUP_BG = ["#FFFFFF", "#EFF3FA"]   # alternating group backgrounds
+        current_query = None
+        group_idx = -1
+        for row_idx, rec in enumerate(all_rows):
+            qv = rec.get("__query__", "")
+            if qv != current_query:
+                current_query = qv
+                group_idx += 1
+            bg = QColor(_GROUP_BG[group_idx % len(_GROUP_BG)])
+
+            for ci, col_name in enumerate(full_cols):
+                if col_name == "Search Value":
+                    val = qv
+                else:
+                    val = rec.get(col_name, "")
+                cell = QTableWidgetItem(val)
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                cell.setBackground(bg)
+                if ci > 0 and active_values and val.strip() and any(
+                    t in val.strip().lower() for t in active_values
+                ):
+                    cell.setForeground(QColor(self._HIGHLIGHT_COLOR))
+                    f = QFont()
+                    f.setBold(True)
+                    cell.setFont(f)
+                table.setItem(row_idx, ci, cell)
+
+        row_h = 30
+        table.verticalHeader().setDefaultSectionSize(row_h)
+        content_h = 30 + len(all_rows) * row_h + 4
+        table.setMinimumHeight(min(content_h, 500))
+        layout.addWidget(table)
+
+    def _collect_active_values(self, active_filter_keys: set) -> list[str]:
+        """Return list of lowercase search terms the user entered (longest first for replacement order)."""
+        field_values: dict = self._result_data.get("field_values", {})
+        multi_values: dict = self._result_data.get("multi_values", {})
+        values: set[str] = set()
+        for k in active_filter_keys:
+            if k in multi_values:
+                for v in multi_values[k]:
+                    if v.strip():
+                        values.add(v.strip().lower())
+            elif k in field_values:
+                v = field_values[k].strip()
+                if v:
+                    values.add(v.lower())
+        # Also include ALL field_values and multi_values — so compact-mode values highlight too
+        for v in field_values.values():
+            if isinstance(v, str) and v.strip():
+                values.add(v.strip().lower())
+        for vlist in multi_values.values():
+            for v in vlist:
+                if v.strip():
+                    values.add(v.strip().lower())
+        # Longest terms first so shorter terms don't break already-replaced spans
+        return sorted(values, key=len, reverse=True)
+
+    def _highlight_substrings(self, text: str, terms: list[str]) -> str:
+        """Return HTML string with each search term highlighted in red (case-insensitive)."""
+        import html as _html
+        escaped = _html.escape(text)
+        for term in terms:
+            if not term:
+                continue
+            escaped_term = _html.escape(term)
+            # Replace case-insensitively using regex, wrapping matched text in a red span
+            escaped = re.sub(
+                re.escape(escaped_term),
+                lambda m: f"<span style='color:{self._HIGHLIGHT_COLOR};font-weight:bold;'>{m.group(0)}</span>",
+                escaped,
+                flags=re.IGNORECASE,
+            )
+        return escaped
+
+    # ── Table view ───────────────────────────────────────────────────────
+
+    def _build_table_view(
+        self,
+        layout: QVBoxLayout,
+        rows: list[dict],
+        cols: list[str],
+        active: set,
+    ) -> None:
+        from search import DISPLAY_COLUMN_FIELD
+
+        table = QTableWidget(len(rows), len(cols))
+        table.horizontalHeader().setVisible(True)
+        table.verticalHeader().setVisible(True)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table: self._show_table_context_menu(pos, t)
+        )
+        table.keyPressEvent = lambda event, t=table: self._table_key_press(event, t)
+
+        # Style the header via stylesheet so active columns show in red
+        # Individual header items carry background/foreground for per-column color
+        table.setStyleSheet(
+            "QHeaderView::section { padding: 4px 8px; font-weight: 700;"
+            " font-family: 'Segoe UI'; font-size: 12px; border: 1px solid #7D8694; }"
+        )
+
+        # Real header row — coloured per active-filter state
+        for col_idx, col_name in enumerate(cols):
+            field_key = DISPLAY_COLUMN_FIELD.get(col_name)
+            hitem = QTableWidgetItem(col_name)
+            hitem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            bold = QFont()
+            bold.setBold(True)
+            hitem.setFont(bold)
+            if field_key and field_key in active:
+                hitem.setBackground(QColor(self._ACTIVE_HEADER_BG))
+                hitem.setForeground(QColor(self._ACTIVE_HEADER_FG))
+            else:
+                hitem.setBackground(QColor(self._INACTIVE_HEADER_BG))
+                hitem.setForeground(QColor(self._INACTIVE_HEADER_FG))
+            table.setHorizontalHeaderItem(col_idx, hitem)
+
+        # Data rows
+        active_values = self._collect_active_values(active)
+        for row_idx, record in enumerate(rows):
+            for col_idx, col_name in enumerate(cols):
+                val = record.get(col_name, "")
+                cell = QTableWidgetItem(val)
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # Highlight if any search term is a substring of the cell value
+                if active_values and val.strip() and any(
+                    t in val.strip().lower() for t in active_values
+                ):
+                    cell.setForeground(QColor(self._HIGHLIGHT_COLOR))
+                    f = QFont()
+                    f.setBold(True)
+                    cell.setFont(f)
+                table.setItem(row_idx, col_idx, cell)
+
+        row_h = 30
+        table.verticalHeader().setDefaultSectionSize(row_h)
+        content_h = 30 + len(rows) * row_h + 4
+        table.setMinimumHeight(min(content_h, 400))
+        layout.addWidget(table)
+
+    # ── Table copy helpers ───────────────────────────────────────────────
+
+    def _copy_table_selection(self, table: QTableWidget) -> None:
+        """Copy selected cells to clipboard as tab-separated text."""
+        selected = table.selectedIndexes()
+        if not selected:
+            return
+        rows = sorted({idx.row() for idx in selected})
+        cols = sorted({idx.column() for idx in selected})
+        lines: list[str] = []
+        for r in rows:
+            cells: list[str] = []
+            for c in cols:
+                item = table.item(r, c)
+                cells.append(item.text() if item else "")
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _show_table_context_menu(self, pos, table: QTableWidget) -> None:
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        copy_action.setShortcut("Ctrl+C")
+        action = menu.exec(table.viewport().mapToGlobal(pos))
+        if action == copy_action:
+            self._copy_table_selection(table)
+
+    def _table_key_press(self, event, table: QTableWidget) -> None:
+        if event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self._copy_table_selection(table)
+        else:
+            QTableWidget.keyPressEvent(table, event)
 
     # ── PDF export ───────────────────────────────────────────────────────
 
@@ -6591,66 +6979,87 @@ class NewUIWindow(QMainWindow):
         panel_layout.setContentsMargins(32, 28, 32, 28)
         panel_layout.setSpacing(16)
 
-        # ── "Expand search" checkbox + "Multiple Selection" in aligned grid ──
+        # ── "Expand search" checkbox ──────────────────────────────────────
         self.chk_expand_search = QCheckBox("Expand search")
         self.chk_expand_search.setObjectName("searchExpandCheckbox")
         self.chk_expand_search.setChecked(False)
+        panel_layout.addWidget(self.chk_expand_search, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self.combo_search_multi_select = QComboBox()
-        self.combo_search_multi_select.setObjectName("searchDropdownMini")
-        self.combo_search_multi_select.addItems([
-            "No", "IDH", "Pack Name", "Basic", "Pack Type", "Pack Size",
-            "Label Size", "Project Name", "Color", "SBU", "Custom",
-        ])
-        self.combo_search_multi_select.setCurrentText("No")
-
-        multi_sel_lbl_top = QLabel("Multiple Selection")
-        multi_sel_lbl_top.setObjectName("searchDropdownLabel")
-        multi_sel_row_top = QHBoxLayout()
-        multi_sel_row_top.setSpacing(8)
-        multi_sel_row_top.setContentsMargins(0, 0, 0, 0)
-        multi_sel_row_top.addWidget(multi_sel_lbl_top, 0, Qt.AlignmentFlag.AlignVCenter)
-        multi_sel_row_top.addWidget(self.combo_search_multi_select, 0, Qt.AlignmentFlag.AlignVCenter)
-        multi_sel_w_top = QWidget()
-        multi_sel_w_top.setLayout(multi_sel_row_top)
-        multi_sel_w_top.setVisible(False)
-        self._search_multi_sel_w = multi_sel_w_top
-
-        # Grid: col0=130px (Source), col1=112px (AssetType), col2=SampleLimit/MultiSel, col3=stretch
-        expand_align_grid = QGridLayout()
-        expand_align_grid.setContentsMargins(0, 0, 0, 0)
-        expand_align_grid.setHorizontalSpacing(16)
-        expand_align_grid.setVerticalSpacing(0)
-        expand_align_grid.setColumnMinimumWidth(0, 130)
-        expand_align_grid.setColumnMinimumWidth(1, 112)
-        expand_align_grid.setColumnStretch(3, 1)
-        expand_align_grid.addWidget(
-            self.chk_expand_search, 0, 0, 1, 2,
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-        )
-        expand_align_grid.addWidget(multi_sel_w_top, 0, 2)
-        panel_layout.addLayout(expand_align_grid)
-
-        # ── Compact search bar (pill + icon button) ───────────────────────
+        # ── Compact search bar: [FieldDropdown][Input][MultiBtn][SearchBtn] ─
         self.search_bar_compact = QWidget()
         self.search_bar_compact.setObjectName("searchBarCompact")
         compact_layout = QHBoxLayout(self.search_bar_compact)
         compact_layout.setContentsMargins(0, 0, 0, 0)
         compact_layout.setSpacing(0)
 
+        # Field-selector label (dropdown styled as pill label)
+        self.combo_search_field = QComboBox()
+        self.combo_search_field.setObjectName("searchFieldLabel")
+        self.combo_search_field.addItems([
+            "IDH", "Basic", "Pack Name", "Pack Type", "Pack Size",
+            "Project Name", "Label Size", "SBU", "Custom",
+        ])
+        self.combo_search_field.setCurrentText("IDH")
+        self.combo_search_field.setFixedWidth(120)
+        compact_layout.addWidget(self.combo_search_field, 0)
+
+        # Text input
         self.input_search = QLineEdit()
-        self.input_search.setObjectName("searchPillInput")
+        self.input_search.setObjectName("searchFieldInput")
         self.input_search.setPlaceholderText("Search…")
         self.input_search.setClearButtonEnabled(True)
         compact_layout.addWidget(self.input_search, 1)
 
-        self.btn_search_go = QPushButton()
+        # Multi-value add button (SAP-style, inline at end of input)
+        self.btn_compact_multi = QPushButton("⊞")
+        self.btn_compact_multi.setObjectName("searchMultiAddBtn")
+        self.btn_compact_multi.setFixedSize(36, 40)
+        self.btn_compact_multi.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_compact_multi.setToolTip("Add multiple values for this field")
+        compact_layout.addWidget(self.btn_compact_multi, 0)
+
+        # Search button (magnifier)
+        self.btn_search_go = QPushButton("⌕")
         self.btn_search_go.setObjectName("searchIconBtn")
-        self.btn_search_go.setFixedSize(46, 46)
+        self.btn_search_go.setFixedSize(46, 40)
         self.btn_search_go.setCursor(Qt.CursorShape.PointingHandCursor)
-        # magnifier icon (unicode fallback)
-        self.btn_search_go.setText("⌕")
         compact_layout.addWidget(self.btn_search_go, 0)
+
+        # ── Shared filter row: Source / Asset Type / Sample Limit ────────
+        # Always visible regardless of compact vs expanded state, placed at top
+        shared_filters = QWidget()
+        shared_filters_layout = QHBoxLayout(shared_filters)
+        shared_filters_layout.setContentsMargins(0, 0, 0, 8)
+        shared_filters_layout.setSpacing(16)
+
+        def _make_mini_combo(label: str, items: list, default: str, attr: str) -> QWidget:
+            col = QVBoxLayout()
+            col.setSpacing(3)
+            col.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(label)
+            lbl.setObjectName("searchDropdownLabel")
+            col.addWidget(lbl)
+            cb = QComboBox()
+            cb.setObjectName("searchDropdownMini")
+            cb.addItems(items)
+            cb.setCurrentText(default)
+            setattr(self, attr, cb)
+            col.addWidget(cb)
+            w = QWidget()
+            w.setLayout(col)
+            return w
+
+        shared_filters_layout.addWidget(
+            _make_mini_combo("Source", ["TSC", "RSD (master)", "Library"], "TSC",
+                             "combo_search_source"))
+        shared_filters_layout.addWidget(
+            _make_mini_combo("Asset Type", ["All", "2D", "3D"], "All",
+                             "combo_search_asset_type"))
+        shared_filters_layout.addWidget(
+            _make_mini_combo("Sample Limit", ["5", "10", "All"], "5",
+                             "combo_search_sample_limit"))
+        shared_filters_layout.addStretch(1)
+        panel_layout.addWidget(shared_filters)
 
         panel_layout.addWidget(self.search_bar_compact)
 
@@ -6661,7 +7070,7 @@ class NewUIWindow(QMainWindow):
         expanded_layout.setContentsMargins(0, 0, 0, 0)
         expanded_layout.setSpacing(10)
 
-        # 9 text fields arranged in 2 columns
+        # 7 text fields arranged in 2 columns
         _expand_fields = [
             ("IDH",          "input_search_idh",          "000000"),
             ("Pack Name",    "input_search_pack_name",    "loctite 401, Teroson MS 949 FR"),
@@ -6670,8 +7079,6 @@ class NewUIWindow(QMainWindow):
             ("Pack Size",    "input_search_pack_size",    "500ml"),
             ("Label Size",   "input_search_label_size",   "8 x 12"),
             ("Project Name", "input_search_project_name", "2025A002"),
-            ("Color",        "input_search_color",        "red"),
-            ("SBU",          "input_search_sbu",          "AQC"),
             ("Custom",       "input_search_custom",       "Anaerobic, right-angle"),
         ]
 
@@ -6705,83 +7112,6 @@ class NewUIWindow(QMainWindow):
             pill_widget.setLayout(_make_field_pill(label_text, attr_name, placeholder))
             grid_layout.addWidget(pill_widget, row_idx, col)
         expanded_layout.addLayout(grid_layout)
-
-        # ── Extra filter controls (columns aligned with expand row above) ─
-        expanded_layout.addSpacing(8)
-
-        controls_grid = QGridLayout()
-        controls_grid.setContentsMargins(0, 0, 0, 0)
-        controls_grid.setHorizontalSpacing(16)
-        controls_grid.setVerticalSpacing(0)
-        controls_grid.setColumnMinimumWidth(0, 130)
-        controls_grid.setColumnMinimumWidth(1, 112)
-        controls_grid.setColumnStretch(4, 1)
-
-        # Source — col 0
-        source_col = QVBoxLayout()
-        source_col.setSpacing(4)
-        source_col.setContentsMargins(0, 0, 0, 0)
-        source_lbl_text = QLabel("Source")
-        source_lbl_text.setObjectName("searchDropdownLabel")
-        source_col.addWidget(source_lbl_text)
-        self.combo_search_source = QComboBox()
-        self.combo_search_source.setObjectName("searchDropdownMini")
-        self.combo_search_source.addItems(["TSC", "RSD (master)", "Library"])
-        self.combo_search_source.setCurrentText("TSC")
-        source_col.addWidget(self.combo_search_source)
-        source_w = QWidget()
-        source_w.setLayout(source_col)
-        controls_grid.addWidget(source_w, 0, 0)
-
-        # Asset Type — col 1
-        asset_col = QVBoxLayout()
-        asset_col.setSpacing(4)
-        asset_col.setContentsMargins(0, 0, 0, 0)
-        asset_lbl_text = QLabel("Asset Type")
-        asset_lbl_text.setObjectName("searchDropdownLabel")
-        asset_col.addWidget(asset_lbl_text)
-        self.combo_search_asset_type = QComboBox()
-        self.combo_search_asset_type.setObjectName("searchDropdownMini")
-        self.combo_search_asset_type.addItems(["All", "2D", "3D"])
-        self.combo_search_asset_type.setCurrentText("All")
-        asset_col.addWidget(self.combo_search_asset_type)
-        asset_w = QWidget()
-        asset_w.setLayout(asset_col)
-        controls_grid.addWidget(asset_w, 0, 1)
-
-        # Sample Limit — col 2
-        limit_col = QVBoxLayout()
-        limit_col.setSpacing(4)
-        limit_col.setContentsMargins(0, 0, 0, 0)
-        limit_lbl_text = QLabel("Sample Limit")
-        limit_lbl_text.setObjectName("searchDropdownLabel")
-        limit_col.addWidget(limit_lbl_text)
-        self.combo_search_sample_limit = QComboBox()
-        self.combo_search_sample_limit.setObjectName("searchDropdownMini")
-        self.combo_search_sample_limit.addItems(["5", "10", "All"])
-        self.combo_search_sample_limit.setCurrentText("5")
-        limit_col.addWidget(self.combo_search_sample_limit)
-        limit_w = QWidget()
-        limit_w.setLayout(limit_col)
-        controls_grid.addWidget(limit_w, 0, 2)
-
-        # Status — col 3
-        status_col = QVBoxLayout()
-        status_col.setSpacing(4)
-        status_col.setContentsMargins(0, 0, 0, 0)
-        status_lbl_text = QLabel("Status")
-        status_lbl_text.setObjectName("searchDropdownLabel")
-        status_col.addWidget(status_lbl_text)
-        self.combo_search_status = QComboBox()
-        self.combo_search_status.setObjectName("searchDropdownMini")
-        self.combo_search_status.addItems(["Completed", "All"])
-        self.combo_search_status.setCurrentText("Completed")
-        status_col.addWidget(self.combo_search_status)
-        status_w = QWidget()
-        status_w.setLayout(status_col)
-        controls_grid.addWidget(status_w, 0, 3)
-
-        expanded_layout.addLayout(controls_grid)
 
         # Checkboxes in one row
         chk_row = QHBoxLayout()
@@ -6822,32 +7152,74 @@ class NewUIWindow(QMainWindow):
         # ── wire controls ────────────────────────────────────────────────
         self.chk_expand_search.toggled.connect(self._on_expand_search_toggled)
         self.combo_search_source.currentTextChanged.connect(self._on_search_source_changed)
-        self.combo_search_multi_select.currentTextChanged.connect(
-            self._on_search_multi_select_changed
-        )
+        self.combo_search_field.currentTextChanged.connect(self._on_compact_field_changed)
+        self.btn_compact_multi.clicked.connect(self._on_compact_multi_clicked)
         self.input_search_custom.textChanged.connect(self._on_search_custom_changed)
         self.input_search_custom.installEventFilter(self)
         self.btn_search_go.clicked.connect(self._on_search_go_clicked)
         self.btn_search_go_expanded.clicked.connect(self._on_search_go_clicked)
         self._search_multi_values: dict[str, list[str]] = {}
         self._search_multi_active_attr: str | None = None
+        self._search_compact_multi_values: dict[str, list[str]] = {}
 
         return outer
 
     def _on_expand_search_toggled(self, checked: bool) -> None:
         self.search_bar_compact.setVisible(not checked)
         self.search_bar_expanded.setVisible(checked)
-        self._search_multi_sel_w.setVisible(checked)
+
+    # Maps compact dropdown label → field key used by run_search
+    _COMPACT_FIELD_MAP: dict[str, str] = {
+        "IDH":          "idh",
+        "Basic":        "basic",
+        "Pack Name":    "pack_name",
+        "Pack Type":    "pack_type",
+        "Pack Size":    "pack_size",
+        "Project Name": "project_name",
+        "Label Size":   "label_size",
+        "SBU":          "sbu",
+        "Custom":       "custom",
+    }
+
+    def _on_compact_field_changed(self, label: str) -> None:
+        """Called when the compact field dropdown changes — reset display."""
+        self._refresh_compact_input_display()
+
+    def _on_compact_multi_clicked(self) -> None:
+        """Open multi-value editor for the currently selected compact field."""
+        label = self.combo_search_field.currentText()
+        initial = self._search_compact_multi_values.get(label, [])
+        dlg = _SearchMultiValueDialog(label, initial, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._search_compact_multi_values[label] = dlg.get_values()
+            self._refresh_compact_input_display()
+
+    def _refresh_compact_input_display(self) -> None:
+        """Update the compact input to show multi-value summary or be editable."""
+        label = self.combo_search_field.currentText()
+        vals = self._search_compact_multi_values.get(label, [])
+        if vals:
+            count = len(vals)
+            preview = ", ".join(vals[:3])
+            if count > 3:
+                preview += f", … (+{count - 3} more)"
+            self.input_search.setText(
+                f"{count} value{'s' if count != 1 else ''}: {preview}"
+            )
+            self.input_search.setReadOnly(True)
+            self.input_search.setClearButtonEnabled(False)
+        else:
+            self.input_search.clear()
+            self.input_search.setReadOnly(False)
+            self.input_search.setClearButtonEnabled(True)
+            self.input_search.setPlaceholderText("Search…")
 
     def _on_search_source_changed(self, source: str) -> None:
-        """Lock/unlock Asset Type and Status dropdowns based on Source selection."""
+        """Lock/unlock Asset Type dropdown based on Source selection."""
         is_library = source == "Library"
         # Asset Type: freeze to "3D" when Library is selected
         self.combo_search_asset_type.setCurrentText("3D" if is_library else "All")
         self.combo_search_asset_type.setEnabled(not is_library)
-        # Status: freeze to "Completed" when Library is selected
-        self.combo_search_status.setCurrentText("Completed")
-        self.combo_search_status.setEnabled(not is_library)
 
     # Fields that Custom freezes (all expanded fields except Custom itself)
     _CUSTOM_FREEZES: tuple[str, ...] = (
@@ -6858,8 +7230,6 @@ class NewUIWindow(QMainWindow):
         "input_search_pack_size",
         "input_search_label_size",
         "input_search_project_name",
-        "input_search_color",
-        "input_search_sbu",
     )
 
     def _on_search_custom_changed(self, text: str) -> None:
@@ -6886,8 +7256,6 @@ class NewUIWindow(QMainWindow):
         "pack_size":    "input_search_pack_size",
         "label_size":   "input_search_label_size",
         "project_name": "input_search_project_name",
-        "color":        "input_search_color",
-        "sbu":          "input_search_sbu",
         "custom":       "input_search_custom",
     }
 
@@ -6904,10 +7272,14 @@ class NewUIWindow(QMainWindow):
                 w = getattr(self, attr, None)
                 field_values[field_key] = w.text() if w else ""
         else:
-            # Compact mode: single input treated as custom
-            field_values["custom"] = self.input_search.text()
+            # Compact mode: use the selected field from the dropdown
+            label = self.combo_search_field.currentText()
+            field_key = self._COMPACT_FIELD_MAP.get(label, "custom")
+            compact_vals = self._search_compact_multi_values.get(label, [])
+            if not compact_vals:
+                field_values[field_key] = self.input_search.text()
 
-        # Convert multi-select values (attr_name → field_key)
+        # Convert multi-select values (attr_name → field_key) for expanded mode
         _attr_to_field = {v: k for k, v in self._FIELD_ATTRS.items()}
         multi_values: dict[str, list[str]] = {
             _attr_to_field[attr]: vals
@@ -6915,27 +7287,126 @@ class NewUIWindow(QMainWindow):
             if attr in _attr_to_field and vals
         }
 
+        # For compact mode, inject compact multi-values if set
+        if not is_expanded:
+            label = self.combo_search_field.currentText()
+            compact_vals = self._search_compact_multi_values.get(label, [])
+            if compact_vals:
+                field_key = self._COMPACT_FIELD_MAP.get(label, "custom")
+                multi_values[field_key] = compact_vals
+
         # Dropdown values
         source     = self.combo_search_source.currentText()
         asset_type = self.combo_search_asset_type.currentText()
-        status     = self.combo_search_status.currentText()
         limit_txt  = self.combo_search_sample_limit.currentText()
         sample_limit: int | None = None if limit_txt == "All" else int(limit_txt)
 
-        result = run_search(
-            field_values=field_values,
-            multi_values=multi_values,
-            source=source,
-            asset_type=asset_type,
-            status=status,
-            sample_limit=sample_limit,
-            cfg=self._config,
-        )
+        # Build human-readable query summary for display in results window
+        search_summary_parts: list[str] = []
+        if is_expanded:
+            for field_key, attr in self._FIELD_ATTRS.items():
+                label = field_key.replace("_", " ").title()
+                multi = self._search_multi_values.get(attr, [])
+                if multi:
+                    search_summary_parts.append(f"{label}: {', '.join(multi)}")
+                else:
+                    w = getattr(self, attr, None)
+                    val = w.text().strip() if w else ""
+                    if val:
+                        search_summary_parts.append(f"{label}: {val}")
+        else:
+            label = self.combo_search_field.currentText()
+            compact_vals = self._search_compact_multi_values.get(label, [])
+            if compact_vals:
+                search_summary_parts.append(f"{label}: {', '.join(compact_vals)}")
+            else:
+                val = self.input_search.text().strip()
+                if val:
+                    search_summary_parts.append(f"{label}: {val}")
+        search_summary = "  |  ".join(search_summary_parts) if search_summary_parts else "(no filter)"
 
-        if result["error"]:
-            QMessageBox.warning(self, "Search Error", result["error"])
-            return
+        # ── Determine if a grouped (per-cell-value) search is needed ─────
+        # A grouped search runs one query per cell value whenever any single
+        # field has more than one multi-value entry.  Each cell value is kept
+        # intact (no splitting); results are tagged with their originating
+        # query value for grouped display in the results window.
+        grouped_field: str | None = None
+        grouped_vals: list[str] = []
+        for fk, vals in multi_values.items():
+            if len(vals) > 1:
+                grouped_field = fk
+                grouped_vals = vals
+                break
 
+        if grouped_field:
+            # Build summary: field label + cell values separated by " | "
+            if is_expanded:
+                field_label = grouped_field.replace("_", " ").title()
+            else:
+                field_label = self.combo_search_field.currentText()
+            search_summary = field_label + ":  " + "  |  ".join(grouped_vals)
+
+            base_mv = {k: v for k, v in multi_values.items() if k != grouped_field}
+            all_rows: list[dict] = []
+            all_idh: list[str] = []
+            groups: list[dict] = []
+            first_error: str | None = None
+            first_source_key = "tsc"
+
+            for cell_val in grouped_vals:
+                g_result = run_search(
+                    field_values=field_values,
+                    multi_values={**base_mv, grouped_field: [cell_val]},
+                    source=source,
+                    asset_type=asset_type,
+                    status="All",
+                    sample_limit=sample_limit,
+                    cfg=self._config,
+                )
+                if g_result["error"] and not first_error:
+                    first_error = g_result["error"]
+                    continue
+                first_source_key = g_result["source_key"]
+                all_rows.extend(g_result["rows"])
+                all_idh.extend(g_result["idh_list"])
+                groups.append({
+                    "query_value":   cell_val,
+                    "rows":          g_result["rows"],
+                    "idh_list":      g_result["idh_list"],
+                    "active_filters": g_result["active_filters"],
+                })
+
+            if first_error and not groups:
+                QMessageBox.warning(self, "Search Error", first_error)
+                return
+
+            result = {
+                "rows":           all_rows,
+                "active_filters": groups[0]["active_filters"] if groups else set(),
+                "source_key":     first_source_key,
+                "idh_list":       list(dict.fromkeys(all_idh)),
+                "error":          None,
+                "groups":         groups,
+            }
+        else:
+            result = run_search(
+                field_values=field_values,
+                multi_values=multi_values,
+                source=source,
+                asset_type=asset_type,
+                status="All",
+                sample_limit=sample_limit,
+                cfg=self._config,
+            )
+
+            if result["error"]:
+                QMessageBox.warning(self, "Search Error", result["error"])
+                return
+
+        result["search_summary"] = search_summary
+        result["field_values"]   = field_values
+        result["multi_values"]   = multi_values
+        result["source"]         = source
         dlg = _SearchResultWindow(result, self._config, parent=self)
         dlg.setModal(False)
         dlg.show()
@@ -6950,8 +7421,6 @@ class NewUIWindow(QMainWindow):
         "Pack Size":    "input_search_pack_size",
         "Label Size":   "input_search_label_size",
         "Project Name": "input_search_project_name",
-        "Color":        "input_search_color",
-        "SBU":          "input_search_sbu",
         "Custom":       "input_search_custom",
     }
 
@@ -8968,16 +9437,19 @@ class NewUIWindow(QMainWindow):
             background-color: #1A1A1A;
             color: #FFFFFF;
             border: none;
-            border-radius: 23px;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
             font-size: 20px;
             padding: 0;
-            margin-left: 6px;
+            margin-left: 0px;
         }
         #searchIconBtn:hover  { background-color: #D02752; }
         #searchIconBtn:pressed { background-color: #111F35; }
 
-        /* Expanded search – label cell */
-        #searchFieldLabel {
+        /* Expanded search – label cell (QLineEdit) and compact field dropdown (QComboBox) */
+        #searchFieldLabel, QComboBox#searchFieldLabel {
             background-color: #E0E0E0;
             color: #111111;
             border: none;
@@ -8986,11 +9458,50 @@ class NewUIWindow(QMainWindow):
             border-top-right-radius: 0px;
             border-bottom-right-radius: 0px;
             min-height: 40px;
-            padding: 0 12px;
+            padding: 0 8px 0 12px;
             font-family: "Segoe UI";
             font-size: 13px;
             font-weight: 600;
         }
+        QComboBox#searchFieldLabel::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            width: 20px;
+            border: none;
+            background-color: transparent;
+        }
+        QComboBox#searchFieldLabel::down-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 5px solid #555555;
+            margin-right: 6px;
+        }
+        QComboBox#searchFieldLabel:hover { background-color: #D4D4D4; }
+        QComboBox#searchFieldLabel QAbstractItemView {
+            background-color: #FFFFFF;
+            color: #111111;
+            selection-background-color: #E8EEF8;
+            selection-color: #111F35;
+            border: 1px solid #BBBBBB;
+        }
+
+        /* Compact multi-value add button (SAP-style, inline) */
+        #searchMultiAddBtn {
+            background-color: #D8D8D8;
+            color: #333333;
+            border: none;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            border-top-right-radius: 0px;
+            border-bottom-right-radius: 0px;
+            font-size: 14px;
+            padding: 0;
+        }
+        #searchMultiAddBtn:hover  { background-color: #C0C8D8; color: #111F35; }
+        #searchMultiAddBtn:pressed { background-color: #A8B4C8; }
 
         /* Expanded search – value cell */
         #searchFieldInput {

@@ -211,6 +211,11 @@ FIELD_COLUMNS: dict[str, dict[str, str | None]] = {
         "rsd":     None,
         "library": "SBU",
     },
+    "build_type": {
+        "tsc":     "Build Type",
+        "rsd":     None,
+        "library": None,
+    },
     # "custom" searches all columns — handled separately
 }
 
@@ -326,6 +331,7 @@ DISPLAY_COLUMN_FIELD: dict[str, str] = {
     "SBU":          "sbu",
     "Label Size":   "label_size",
     "Color":        "color",
+    "Build Type":   "build_type",
 }
 
 # ---------------------------------------------------------------------------
@@ -345,28 +351,70 @@ def extract_idh_from_filename(name: str) -> str | None:
 def find_matching_images(
     idh_set: set[str],
     thumbnails_folder: str,
+    fallback_folders: list[str] | None = None,
 ) -> list[dict]:
-    """Scan *thumbnails_folder* recursively for images whose filename
-    contains one of the IDH numbers in *idh_set*.
+    """Scan *thumbnails_folder* (and any *fallback_folders*) recursively for
+    images whose filename contains one of the IDH numbers in *idh_set*.
 
-    Returns a list of dicts: ``{"path": str, "name": str, "folder": str}``.
+    For each IDH in *idh_set*, exactly one image is returned (the most-recently
+    modified match). When no image is found for an IDH, a placeholder entry is
+    returned with ``"path": None``.
+
+    Returns a list of dicts:
+    ``{"idh": str, "path": str | None, "name": str, "folder": str}``.
     """
-    if not idh_set or not thumbnails_folder:
+    if not idh_set:
         return []
-    folder_p = Path(thumbnails_folder)
-    if not folder_p.is_dir():
-        return []
-    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+
+    search_roots: list[Path] = []
+    for folder in ([thumbnails_folder] + (fallback_folders or [])):
+        if folder:
+            p = Path(folder)
+            if p.is_dir():
+                search_roots.append(p)
+
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+    # idh → (best_path, best_mtime)
+    best: dict[str, tuple[str, float]] = {}
+
+    for root in search_roots:
+        for f in root.rglob("*"):
+            if f.suffix.lower() not in IMAGE_EXTS:
+                continue
+            # Check ALL digit sequences in the filename (not just the first).
+            # Filenames often have multiple numeric parts; we want the one that
+            # matches an IDH in idh_set rather than the first 5-8 digit run.
+            idh: str | None = None
+            for candidate in _IDH_PATTERN.findall(f.stem):
+                if candidate in idh_set:
+                    idh = candidate
+                    break
+            if idh and idh in idh_set:
+                try:
+                    mtime = f.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                if idh not in best or mtime > best[idh][1]:
+                    best[idh] = (str(f), mtime)
+
     results: list[dict] = []
-    for f in sorted(folder_p.rglob("*")):
-        if f.suffix.lower() not in IMAGE_EXTS:
-            continue
-        idh = extract_idh_from_filename(f.stem)
-        if idh and idh in idh_set:
+    for idh in sorted(idh_set):
+        if idh in best:
+            path = best[idh][0]
+            f = Path(path)
             results.append({
-                "path":   str(f),
+                "idh":    idh,
+                "path":   path,
                 "name":   f.name,
                 "folder": f.parent.name,
+            })
+        else:
+            results.append({
+                "idh":    idh,
+                "path":   None,
+                "name":   "",
+                "folder": "",
             })
     return results
 
@@ -512,6 +560,12 @@ def run_search(
             display_col: _get_val(row, fk)
             for display_col, fk in DISPLAY_COLUMN_FIELD.items()
         }
+        # Resolve Build Type based on source
+        if source_key == "library":
+            record["Build Type"] = "3D"
+        elif source_key == "rsd":
+            record["Build Type"] = "NA"
+        # TSC: value already extracted via FIELD_COLUMNS above
         rows.append(record)
 
     # Collect IDH values for image matching

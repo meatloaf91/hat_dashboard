@@ -97,7 +97,7 @@ class StatusCollector:
             "sbu": self.name_variations_sbu,
             #---new addition:
             "packaging_type": self.name_variations_packaging_type,
-            "packaging_size":self.name_variations_label_size,
+            "packaging_size":self.name_variations_packaging_size,
             "label_size":self.name_variations_label_size,
             "is_deployment": self.name_variations_is_deployment,
             "basic_number": self.name_variations_basic_number
