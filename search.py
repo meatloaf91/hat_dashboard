@@ -85,7 +85,7 @@ _2D_VARIANTS: frozenset[str] = frozenset({
 })
 
 _3D_VARIANTS: frozenset[str] = frozenset({
-    "clone", "master",
+    "clone", "master", "na",
 })
 
 

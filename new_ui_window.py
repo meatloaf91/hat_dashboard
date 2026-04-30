@@ -5962,12 +5962,16 @@ class _SearchResultWindow(QDialog):
                 self._build_grouped_tiles_view(layout, groups, minimal, active, is_rsd)
             else:
                 self._build_grouped_table_view(layout, groups, data_cols, active)
+                self._scroll.setWidget(container)
+                return
         elif tiles:
             self._build_tiles_view(layout, rows, minimal, active, is_rsd)
         else:
             cols = [c for c in (self.MINIMAL_COLS if minimal else self.ALL_COLS)
                     if not (is_rsd and c == "Pack Size")]
             self._build_table_view(layout, rows, cols, active)
+            self._scroll.setWidget(container)
+            return
 
         layout.addStretch(1)
         self._scroll.setWidget(container)
@@ -6041,6 +6045,10 @@ class _SearchResultWindow(QDialog):
                 desc_lbl = QLabel()
                 desc_lbl.setWordWrap(True)
                 desc_lbl.setStyleSheet("font-size: 11px;")
+                desc_lbl.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                    | Qt.TextInteractionFlag.TextSelectableByKeyboard
+                )
                 display_val = value if value else "—"
                 if value and active_values:
                     highlighted = self._highlight_substrings(display_val, active_values)
@@ -6188,9 +6196,8 @@ class _SearchResultWindow(QDialog):
 
         row_h = 30
         table.verticalHeader().setDefaultSectionSize(row_h)
-        content_h = 30 + len(all_rows) * row_h + 4
-        table.setMinimumHeight(min(content_h, 500))
-        layout.addWidget(table)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(table, 1)
 
     def _collect_active_values(self, active_filter_keys: set) -> list[str]:
         """Return list of lowercase search terms the user entered (longest first for replacement order)."""
@@ -6304,9 +6311,8 @@ class _SearchResultWindow(QDialog):
 
         row_h = 30
         table.verticalHeader().setDefaultSectionSize(row_h)
-        content_h = 30 + len(rows) * row_h + 4
-        table.setMinimumHeight(min(content_h, 400))
-        layout.addWidget(table)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(table, 1)
 
     # ── Table copy helpers ───────────────────────────────────────────────
 
@@ -7058,6 +7064,22 @@ class NewUIWindow(QMainWindow):
         shared_filters_layout.addWidget(
             _make_mini_combo("Sample Limit", ["5", "10", "All"], "5",
                              "combo_search_sample_limit"))
+
+        # "Only with matching image" checkbox — always visible, aligned with dropdowns
+        chk_col = QVBoxLayout()
+        chk_col.setSpacing(3)
+        chk_col.setContentsMargins(12, 0, 0, 0)
+        _chk_spacer_lbl = QLabel("")
+        _chk_spacer_lbl.setObjectName("searchDropdownLabel")
+        chk_col.addWidget(_chk_spacer_lbl)
+        self.chk_search_matching_image = QCheckBox("Only with matching image")
+        self.chk_search_matching_image.setObjectName("searchExpandCheckbox")
+        self.chk_search_matching_image.setChecked(False)
+        chk_col.addWidget(self.chk_search_matching_image)
+        chk_w = QWidget()
+        chk_w.setLayout(chk_col)
+        shared_filters_layout.addWidget(chk_w)
+
         shared_filters_layout.addStretch(1)
         panel_layout.addWidget(shared_filters)
 
@@ -7113,21 +7135,6 @@ class NewUIWindow(QMainWindow):
             grid_layout.addWidget(pill_widget, row_idx, col)
         expanded_layout.addLayout(grid_layout)
 
-        # Checkboxes in one row
-        chk_row = QHBoxLayout()
-        chk_row.setContentsMargins(0, 6, 0, 0)
-        chk_row.setSpacing(24)
-        self.chk_search_matching_image = QCheckBox("Only with matching image")
-        self.chk_search_matching_image.setObjectName("searchExpandCheckbox")
-        self.chk_search_matching_image.setChecked(False)
-        chk_row.addWidget(self.chk_search_matching_image, 0)
-        self.chk_search_prioritize_recent = QCheckBox("Prioritize recently completed")
-        self.chk_search_prioritize_recent.setObjectName("searchExpandCheckbox")
-        self.chk_search_prioritize_recent.setChecked(True)
-        chk_row.addWidget(self.chk_search_prioritize_recent, 0)
-        chk_row.addStretch(1)
-        expanded_layout.addLayout(chk_row)
-
         expanded_layout.addSpacing(6)
 
         # ── Search button centered below all fields ───────────────────────
@@ -7162,11 +7169,39 @@ class NewUIWindow(QMainWindow):
         self._search_multi_active_attr: str | None = None
         self._search_compact_multi_values: dict[str, list[str]] = {}
 
+        # Wire all text inputs to the button state validator
+        self.input_search.textChanged.connect(self._update_search_button_state)
+        for attr in self._FIELD_ATTRS.values():
+            w = getattr(self, attr, None)
+            if w:
+                w.textChanged.connect(self._update_search_button_state)
+        self.chk_expand_search.toggled.connect(self._update_search_button_state)
+        self._update_search_button_state()
+
         return outer
 
     def _on_expand_search_toggled(self, checked: bool) -> None:
         self.search_bar_compact.setVisible(not checked)
         self.search_bar_expanded.setVisible(checked)
+
+    def _update_search_button_state(self, *_) -> None:
+        """Enable/disable search buttons depending on whether any input has a value."""
+        is_expanded = self.chk_expand_search.isChecked()
+        if is_expanded:
+            has_value = False
+            for attr in self._FIELD_ATTRS.values():
+                w = getattr(self, attr, None)
+                if w and w.text().strip():
+                    has_value = True
+                    break
+            if not has_value:
+                has_value = any(bool(v) for v in self._search_multi_values.values())
+        else:
+            label = self.combo_search_field.currentText()
+            compact_vals = self._search_compact_multi_values.get(label, [])
+            has_value = bool(compact_vals) or bool(self.input_search.text().strip())
+        self.btn_search_go.setEnabled(has_value)
+        self.btn_search_go_expanded.setEnabled(has_value)
 
     # Maps compact dropdown label → field key used by run_search
     _COMPACT_FIELD_MAP: dict[str, str] = {
@@ -7184,6 +7219,7 @@ class NewUIWindow(QMainWindow):
     def _on_compact_field_changed(self, label: str) -> None:
         """Called when the compact field dropdown changes — reset display."""
         self._refresh_compact_input_display()
+        self._update_search_button_state()
 
     def _on_compact_multi_clicked(self) -> None:
         """Open multi-value editor for the currently selected compact field."""
@@ -7193,6 +7229,7 @@ class NewUIWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._search_compact_multi_values[label] = dlg.get_values()
             self._refresh_compact_input_display()
+            self._update_search_button_state()
 
     def _refresh_compact_input_display(self) -> None:
         """Update the compact input to show multi-value summary or be editable."""
@@ -7217,9 +7254,16 @@ class NewUIWindow(QMainWindow):
     def _on_search_source_changed(self, source: str) -> None:
         """Lock/unlock Asset Type dropdown based on Source selection."""
         is_library = source == "Library"
-        # Asset Type: freeze to "3D" when Library is selected
-        self.combo_search_asset_type.setCurrentText("3D" if is_library else "All")
-        self.combo_search_asset_type.setEnabled(not is_library)
+        is_rsd = source == "RSD (master)"
+        # Library → lock to "3D"; RSD → lock to "All"; otherwise free
+        if is_library:
+            self.combo_search_asset_type.setCurrentText("3D")
+            self.combo_search_asset_type.setEnabled(False)
+        elif is_rsd:
+            self.combo_search_asset_type.setCurrentText("All")
+            self.combo_search_asset_type.setEnabled(False)
+        else:
+            self.combo_search_asset_type.setEnabled(True)
 
     # Fields that Custom freezes (all expanded fields except Custom itself)
     _CUSTOM_FREEZES: tuple[str, ...] = (
@@ -7407,6 +7451,22 @@ class NewUIWindow(QMainWindow):
         result["field_values"]   = field_values
         result["multi_values"]   = multi_values
         result["source"]         = source
+
+        # Filter to only rows that have a matching image if checkbox is ticked
+        if self.chk_search_matching_image.isChecked():
+            from search import find_matching_images
+            thumb_folder = self._config.search_thumbnails_folder()
+            fallbacks = [self._config.thumbnail_output(), self._config.thumbnail_input()]
+            idh_set = {v.strip() for v in result["idh_list"] if v.strip()}
+            matched = find_matching_images(idh_set, thumb_folder, fallback_folders=fallbacks)
+            matched_idhs = {info["idh"] for info in matched if info.get("path")}
+            result["rows"] = [r for r in result["rows"] if r.get("IDH", "").strip() in matched_idhs]
+            result["idh_list"] = [idh for idh in result["idh_list"] if idh.strip() in matched_idhs]
+            if result.get("groups"):
+                for grp in result["groups"]:
+                    grp["rows"] = [r for r in grp["rows"] if r.get("IDH", "").strip() in matched_idhs]
+                    grp["idh_list"] = [idh for idh in grp.get("idh_list", []) if idh.strip() in matched_idhs]
+
         dlg = _SearchResultWindow(result, self._config, parent=self)
         dlg.setModal(False)
         dlg.show()
@@ -7528,6 +7588,7 @@ class NewUIWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._search_multi_values[attr_name] = dlg.get_values()
             self._refresh_search_multi_field_display(attr_name)
+            self._update_search_button_state()
 
     def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
         # Custom field: gray others on focus-in; revert on focus-out if empty
