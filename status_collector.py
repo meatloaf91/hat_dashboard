@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QStyle,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 import os
 from datetime import datetime
 import re
@@ -27,6 +27,47 @@ from datetime import datetime
 
 
 import stylesheet as ss
+
+# ---------------------------------------------------------------------------
+# Background worker – keeps the UI thread free during heavy Excel I/O
+# ---------------------------------------------------------------------------
+class _TscWorker(QThread):
+    """Runs the heavy I/O phases of TSC processing off the main thread.
+
+    Phase 'check'   → calls check_if_columns_needed_exist().
+    Phase 'collect' → calls get_all_inputs_according_to_status_chatgpt_version_2().
+    Results come back via signals so only the main thread touches the UI.
+    """
+
+    check_done   = Signal(int, str)   # (warnings_count, general_report)
+    collect_done = Signal(str, str)   # (status_missing_on_some_sheets, general_report)
+    error_raised = Signal(str)        # error message string
+
+    def __init__(self, collector, statuses, phase, parent=None):
+        super().__init__(parent)
+        self._collector = collector
+        self._statuses  = statuses
+        self._phase     = phase
+
+    def run(self) -> None:
+        try:
+            if self._phase == "check":
+                self._collector.check_if_columns_needed_exist()
+                self.check_done.emit(
+                    self._collector.trackers_warnings_count,
+                    self._collector.general_report,
+                )
+            elif self._phase == "collect":
+                self._collector.get_all_inputs_according_to_status_chatgpt_version_2(
+                    self._statuses
+                )
+                self.collect_done.emit(
+                    self._collector.status_missing_on_some_sheets,
+                    self._collector.general_report,
+                )
+        except Exception as exc:
+            self.error_raised.emit(str(exc))
+
 
 #IN PROGRESS: SBU Column
 class StatusCollector:
@@ -46,7 +87,13 @@ class StatusCollector:
         "Basic Number":   ["basic number", "basic num", "basic no.", "basic no", "basic", "basic #"],
         "Label Size":     ["label size", "label size mm(h x w)", "label size mm (h x w)",
                            "label size mm (hxw)", "label size mm(hxw)", "label"],
+        "Actual Hand-In Date": ["actual hand-in date", "actual hand in date", "actual handin date",
+                                "actual hand-in", "actual hand in", "handin date", "hand-in date"],
+        "Total Cost":          ["total cost", "cost", "total"],
         "Is Deployment":  ["is deployment", "deployment", "is_deployment", "isdeployment"],
+        "Packshot Naming":     ["packshot naming", "packshot name", "packshot"],
+        "Working Files":       ["working files location (designers only)", "working files location",
+                                "working files", "working file location", "working file"],
     }
 
     def __init__(self, ui):
@@ -85,6 +132,20 @@ class StatusCollector:
         self.name_variations_label_size = ["label size", "label size mm(h x w)", "label size mm (h x w)", "label size mm (hxw)", "label size mm(hxw)"]
         self.name_variations_is_deployment = ["is deployment", "deployment", "is_deployment", "isdeployment"]
         self.name_variations_basic_number = ["basic number", "basic num", "basic no.", "basic no", "basic"]
+        self.name_variations_actual_handin_date = [
+            "actual hand-in date", "actual hand in date", "actual handin date",
+            "actual hand-in", "actual hand in", "handin date", "hand-in date",
+        ]
+        self.name_variations_packshot_naming = [
+            "packshot naming", "packshot name", "packshot",
+        ]
+        self.name_variations_working_files = [
+            "working files location (designers only)", "working files location",
+            "working files", "working file location", "working file",
+        ]
+        self.name_variations_total_cost = [
+            "total cost", "cost", "total",
+        ]
 
 
         #column naming variation can be edited above
@@ -100,7 +161,11 @@ class StatusCollector:
             "packaging_size":self.name_variations_packaging_size,
             "label_size":self.name_variations_label_size,
             "is_deployment": self.name_variations_is_deployment,
-            "basic_number": self.name_variations_basic_number
+            "basic_number": self.name_variations_basic_number,
+            "actual_handin_date": self.name_variations_actual_handin_date,
+            "packshot_naming":    self.name_variations_packshot_naming,
+            "working_files":      self.name_variations_working_files,
+            "total_cost":         self.name_variations_total_cost,
         }
         #---------------------------------------------------------------------------------------------------
 
@@ -275,7 +340,7 @@ class StatusCollector:
             sheet_warning_count = 0
             has_sheet_with_tracker_naming = False
 
-            current_tracker = pd.ExcelFile(tracker)#getting 1 tracker at a time
+            current_tracker = pd.ExcelFile(tracker, engine="calamine")#getting 1 tracker at a time
             current_tracker_name = os.path.basename(tracker) #getting tracker name only
 
             for sheet in current_tracker.sheet_names:
@@ -291,7 +356,7 @@ class StatusCollector:
                     header=None,
                     dtype=str,
                     na_filter=False,     # skip parsing for NaN-like strings
-                    engine="openpyxl",
+                    engine="calamine",
                 )
                 has_sheet_with_tracker_naming = True
 
@@ -352,6 +417,8 @@ class StatusCollector:
                         missing_cols.append("Is Deployment")
                     if not any(var in col_names for var in basicnum_variations):
                         missing_cols.append("Basic Number")
+                    # Note: Actual Hand-In Date, Packshot Naming, Working Files are optional —
+                    # we collect them when present but do not warn when absent.
 
                     #if there is missing columns, add to sheet_warnings dict
                     if missing_cols:
@@ -378,6 +445,10 @@ class StatusCollector:
                     actual_labelsize        = pick(col_names, self.name_variations_label_size)
                     actual_is_deployment    = pick(col_names, self.name_variations_is_deployment)
                     actual_basicnum         = pick(col_names, self.name_variations_basic_number)
+                    actual_handin_date      = pick(col_names, self.name_variations_actual_handin_date)
+                    actual_packshot_naming  = pick(col_names, self.name_variations_packshot_naming)
+                    actual_working_files    = pick(col_names, self.name_variations_working_files)
+                    actual_total_cost       = pick(col_names, self.name_variations_total_cost)
 
                     # Skip sheets where Status column could not be found – nothing to filter on
                     if actual_status_col is not None:
@@ -397,6 +468,10 @@ class StatusCollector:
                                 "label_size":       actual_labelsize,
                                 "is_deployment":    actual_is_deployment,
                                 "basic_number":     actual_basicnum,
+                                "actual_handin_date": actual_handin_date,
+                                "packshot_naming":    actual_packshot_naming,
+                                "working_files":      actual_working_files,
+                                "total_cost":         actual_total_cost,
                             }
                         })
 
@@ -422,6 +497,89 @@ class StatusCollector:
 
         if self.trackers_warnings_count > 0:              
             self.general_report  = f"{formatted_message}\nKindly correct all errors inorder to proceed.\nIf a sheet is not relevant, remove 'tracker' from the name so that it will not be evaluated."
+
+    # ── Value normalisation helpers ───────────────────────────────────────
+
+    _MONTH_ABBR = {
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+        "may": "05", "jun": "06", "jul": "07", "aug": "08",
+        "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "june": "06", "july": "07", "august": "08", "september": "09",
+        "october": "10", "november": "11", "december": "12",
+    }
+
+    @staticmethod
+    def _normalise_date(raw: str) -> str:
+        """Convert various date strings to YYYY-MM-DD.
+
+        Supported input formats:
+          19.11.2024          → 2024-11-19
+          2024-11-14 00:00:00 → 2024-11-14
+          2026-02-16 00:00:00 → 2026-02-16
+          26_Sep              → 0000-09-26
+          Sep_26              → 0000-09-26
+          May 28th            → 0000-05-28
+          January 1st         → 0000-01-01
+        Unrecognised values are returned unchanged.
+        """
+        _MONTH_ABBR = {
+            "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+            "may": "05", "jun": "06", "jul": "07", "aug": "08",
+            "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "june": "06", "july": "07", "august": "08", "september": "09",
+            "october": "10", "november": "11", "december": "12",
+        }
+        val = str(raw).strip()
+        if not val or val.lower() in {"", "nan", "none", "nat"}:
+            return ""
+
+        # Already ISO-ish: 2024-11-14 (optional time suffix)
+        m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s.*)?$', val)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+        # DD.MM.YYYY
+        m = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$', val)
+        if m:
+            return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+        # "May 28th", "January 1st", "March 2nd"  (full or abbr month name + ordinal day, no year)
+        m = re.match(r'^([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$', val)
+        if m:
+            mon = _MONTH_ABBR.get(m.group(1).lower())
+            if mon:
+                return f"0000-{mon}-{int(m.group(2)):02d}"
+
+        # DD_Mon or Mon_DD  (e.g. 26_Sep, Sep_26)
+        m = re.match(r'^(\d{1,2})[_\-\s]([A-Za-z]{3})$', val)
+        if m:
+            mon = _MONTH_ABBR.get(m.group(2).lower())
+            if mon:
+                return f"0000-{mon}-{int(m.group(1)):02d}"
+
+        m = re.match(r'^([A-Za-z]{3})[_\-\s](\d{1,2})$', val)
+        if m:
+            mon = _MONTH_ABBR.get(m.group(1).lower())
+            if mon:
+                return f"0000-{mon}-{int(m.group(2)):02d}"
+
+        return val  # unrecognised — return as-is
+
+    @staticmethod
+    def _normalise_cost(raw: str) -> str:
+        """Round numeric cost strings to 2 decimal places.
+
+        Non-numeric values are returned unchanged.
+        """
+        val = str(raw).strip()
+        if not val or val.lower() in {"", "nan", "none"}:
+            return ""
+        try:
+            return f"{float(val):.2f}"
+        except ValueError:
+            return val
 
     def find_col(self, df: pd.DataFrame, candidates: list[str]) -> str | None:
         """Return the actual df column whose normalized name matches any candidate (case-insensitive)."""
@@ -466,7 +624,7 @@ class StatusCollector:
                 header=sheet_header,
                 dtype=str,
                 na_filter=False,
-                engine="openpyxl",
+                engine="calamine",
             )
 
             # Resolve columns once
@@ -482,6 +640,10 @@ class StatusCollector:
             label_size = self.find_col(df, self.column_name_variations["label_size"])
             is_deployment = self.find_col(df, self.column_name_variations.get("is_deployment", []))
             basic_number = self.find_col(df, self.column_name_variations["basic_number"])
+            actual_handin_date     = self.find_col(df, self.column_name_variations["actual_handin_date"])
+            packshot_naming        = self.find_col(df, self.column_name_variations["packshot_naming"])
+            working_files          = self.find_col(df, self.column_name_variations["working_files"])
+            total_cost             = self.find_col(df, self.column_name_variations["total_cost"])
 
 
             # Keep only relevant cols (order matches TRACKER_WINDOW_COLUMN_VARIATIONS)
@@ -489,11 +651,24 @@ class StatusCollector:
             display_names = list(self.TRACKER_WINDOW_COLUMN_VARIATIONS.keys())
             col_sources = [sbu, product_name, idh, build_type, status_col,
                            packaging_type, packaging_size, project_name,
-                           basic_number, label_size, is_deployment]
+                           basic_number, label_size,
+                           actual_handin_date, total_cost,
+                           is_deployment, packshot_naming, working_files]
             df_selected = pd.DataFrame(index=df.index)
             for dname, src in zip(display_names, col_sources):
                 df_selected[dname] = df[src].astype(str) if src is not None else ""
             df = df_selected
+
+            # ── Post-process optional columns ────────────────────────────
+            # Standardise Actual Hand-In Date → YYYY-MM-DD (0000-MM-DD if no year)
+            if "Actual Hand-In Date" in df.columns:
+                df["Actual Hand-In Date"] = df["Actual Hand-In Date"].apply(
+                    self._normalise_date
+                )
+            # Round Total Cost to 2 decimal places
+            if "Total Cost" in df.columns:
+                df["Total Cost"] = df["Total Cost"].apply(self._normalise_cost)
+            # ─────────────────────────────────────────────────────────────
 
             # If Apply Cleanup is checked, run cleanup on ALL rows NOW – before status
             # filtering – so that remapped statuses (e.g. "uploaded"→"completed",
@@ -536,18 +711,25 @@ class StatusCollector:
                 self.status_error_count += 1
                 continue
 
-            # Exclude rows where IDH is blank, or IDH/Build Type is "admin" (case-insensitive)
-            idh_norm = subset["IDH Number"].map(lambda v: v.strip().lower() if isinstance(v, str) else "")
+            # Exclude rows where IDH is blank or the IDH value itself is "admin" (header/meta rows)
+            # Exception: rows where Build Type or Product Name is "admin" are kept even with blank IDH
+            idh_norm        = subset["IDH Number"].map(lambda v: v.strip().lower() if isinstance(v, str) else "")
             build_type_norm = subset["Build Type"].map(lambda v: v.strip().lower() if isinstance(v, str) else "")
-            valid_rows = (idh_norm != "") & (idh_norm != "admin") & (build_type_norm != "admin")
+            prod_name_norm  = subset["Product Name"].map(lambda v: v.strip().lower() if isinstance(v, str) else "")
+            is_admin_row    = (build_type_norm == "admin") | (prod_name_norm == "admin")
+            valid_rows = ((idh_norm != "") & (idh_norm != "admin")) | is_admin_row
             subset = subset.loc[valid_rows].copy()
 
-            # When Apply Cleanup is active: also exclude rows whose IDH Number is not purely numeric
+            # When Apply Cleanup is active: also exclude rows whose IDH Number is not purely numeric.
+            # Admin rows (Build Type or Product Name == "admin") are exempt from this filter.
             if apply_cleanup:
+                bt_admin_mask = subset["Build Type"].map(lambda v: v.strip().lower() if isinstance(v, str) else "") == "admin"
+                pn_admin_mask = subset["Product Name"].map(lambda v: v.strip().lower() if isinstance(v, str) else "") == "admin"
+                admin_exempt  = bt_admin_mask | pn_admin_mask
                 idh_digits_mask = subset["IDH Number"].map(
                     lambda v: bool(re.match(r'^\d+$', v.strip())) if isinstance(v, str) and v.strip() else False
                 )
-                subset = subset.loc[idh_digits_mask].copy()
+                subset = subset.loc[idh_digits_mask | admin_exempt].copy()
 
             if subset.empty:
                 continue
@@ -555,57 +737,36 @@ class StatusCollector:
             # Cleanup already applied above; columns are already display names
             all_data.append(subset)
 
-        try:
-            #if all is well
-            if all_data:
-                ts = datetime.now().strftime("%Y_%m_%d_%H_%M")
-                output_name = f"{self.output_location}/tsc_data_{ts}.xlsx"
-                out = pd.concat(all_data, ignore_index=True)
-                with pd.ExcelWriter(output_name, engine="openpyxl") as writer:
-                    out.to_excel(writer, index=False, sheet_name="Tracker Data")
-                    self._style_cpd_sheet(writer.book["Tracker Data"], out)
+        # ValueError (e.g. sheet too large) propagates to the worker which emits error_raised.
+        if all_data:
+            ts = datetime.now().strftime("%Y_%m_%d_%H_%M")
+            output_name = f"{self.output_location}/tsc_data_{ts}.xlsx"
+            out = pd.concat(all_data, ignore_index=True)
+            with pd.ExcelWriter(output_name, engine="openpyxl") as writer:
+                out.to_excel(writer, index=False, sheet_name="Tracker Data")
+                self._style_cpd_sheet(writer.book["Tracker Data"], out)
 
-                self.successful_run = True
-                info_message = "✅ Excel file saved successfully."
+            self.successful_run = True
+            info_message = "✅ Excel file saved successfully."
 
-                if status_errors_dict:
-                    info_message = "✅ CPD report saved successfully but with below warnings:\n\n"
-                    lines = ["⚠️ Below trackers contain sheet(s) with missing status(es):"]
-                    for file, missing_stat in status_errors_dict.items():
-                        lines.append(f"\n{file}:")
-                        for stat in missing_stat:
-                            lines.append(f"{stat}")
-                    info_message += "\n".join(lines) 
+            if status_errors_dict:
+                info_message = "✅ CPD report saved successfully but with below warnings:\n\n"
+                lines = ["⚠️ Below trackers contain sheet(s) with missing status(es):"]
+                for file, missing_stat in status_errors_dict.items():
+                    lines.append(f"\n{file}:")
+                    for stat in missing_stat:
+                        lines.append(f"{stat}")
+                info_message += "\n".join(lines)
 
-                self.general_report  = info_message
-                return out
-            else:
-                info_message = "⚠️ No matching status(es) found on tracker(s)."
-                self.status_missing_on_some_sheets = "total"
-                self.status_error_count += 1
+            self.general_report = info_message
+            return out
+        else:
+            info_message = "⚠️ No matching status(es) found on tracker(s)."
+            self.status_missing_on_some_sheets = "total"
+            self.status_error_count += 1
 
-                self.general_report  = info_message
-                return None
-        except ValueError as e:
-            #if file is too large, example scenario: if user highlighted a column and automaticall filled all
-            if "sheet is too large" in str(e).lower():
-                self.show_alert(
-                    "The generated report is too large for Excel (over 1,048,576 rows).\n"
-                    "Please refine your filters.",
-                    alert_type="error",
-                    first_line_col="#FF5555"
-                )
-            else:
-                # Handle other ValueError types gracefully
-                self.show_alert(
-                    (
-                        "An unknown error occurred while exporting the Excel file.\n"
-                        "Please contact the tool creator to check the issue."
-                    ),
-                    alert_type="error",
-                    first_line_col="#FF5555"
-                )
-                raise  # re-raise so you can debug if needed
+            self.general_report = info_message
+            return None
 
     def _style_cpd_sheet(self, ws, out_df: pd.DataFrame) -> None:
         """Apply a modern, readable style to the CPD worksheet."""
@@ -954,81 +1115,77 @@ class StatusCollector:
 
 
     def process_steps(self) -> None:
-        alert_args = None
-        should_clear_fields = False
+        # Reset run-specific state to avoid carrying data across repeated runs.
+        self.can_proceed = False
+        self.successful_run = False
+        self.general_report = ""
+        self.statuses = []
+        self.target_final_info = []
+        self.trackers_warnings_count = 0
+        self.status_error_count = 0
+        self.status_missing_on_some_sheets = "none"
 
+        self.statuses_selected()
+        self.check_fields()
+
+        if not self.can_proceed:
+            self.show_alert(message=self.general_report, alert_type="error")
+            return
+
+        # Heavy I/O runs on a background thread so the UI stays responsive.
         self._set_processing_state(True)
-        try:
-            # Reset run-specific state to avoid carrying data across repeated runs.
-            self.can_proceed = False
-            self.successful_run = False
-            self.general_report = ""
-            self.statuses = []
-            self.target_final_info = []
-            self.trackers_warnings_count = 0
-            self.status_error_count = 0
-            self.status_missing_on_some_sheets = "none"
+        self._worker = _TscWorker(self, self.statuses, "check")
+        self._worker.check_done.connect(self._on_check_phase_done)
+        self._worker.error_raised.connect(self._on_worker_error)
+        self._worker.start()
 
-            self.statuses_selected()
-            self.check_fields()
+    def _on_check_phase_done(self, warnings_count: int, general_report: str) -> None:
+        """Called on the main thread when the column-check phase finishes."""
+        if warnings_count == 0:
+            self._start_collect_phase()
+            return
 
-            if not self.can_proceed:
-                alert_args = {"message": self.general_report, "alert_type": "error"}
-            else:
-                #if fields are all filled, proceed to check for tracker errors:
-                #all the 5 necessary column names (idh number, product name, status, build type or if master/clone/resizing, project name)
-                #check if excel file have "tracker" named sheet(s), if none, will also generate an error
-                self.check_if_columns_needed_exist()
-
-                if self.trackers_warnings_count == 0:
-                    #collects data according to status specified by user
-                    #check if status specified exists in all or some of the trackers
-                    self.get_all_inputs_according_to_status_chatgpt_version_2(self.statuses)
-
-                    if self.status_missing_on_some_sheets == "none":
-                        alert_args = {
-                            "message": self.general_report,
-                            "alert_type": "info",
-                            "first_line_col": "#1bab02",
-                        }
-                    else:
-                        alert_args = {
-                            "message": self.general_report,
-                            "alert_type": "warning",
-                            "first_line_col": "#1bab02",
-                        }
-
-                    should_clear_fields = True
-                else:
-                    # Show the 3-button error dialog (same as Tracker Window Import Trackers)
-                    dlg_result = self._show_tracker_import_error_dialog(self.general_report)
-                    if dlg_result == 1:   # Export error details
-                        self.export_txt_report(self.general_report)
-                    if dlg_result in (0, 1):  # Close or Export → abort run
-                        should_clear_fields = True
-                    else:  # result == 2 → Ignore errors, run with available data
-                        self.get_all_inputs_according_to_status_chatgpt_version_2(self.statuses)
-                        if self.status_missing_on_some_sheets == "none":
-                            alert_args = {
-                                "message": self.general_report,
-                                "alert_type": "info",
-                                "first_line_col": "#1bab02",
-                            }
-                        else:
-                            alert_args = {
-                                "message": self.general_report,
-                                "alert_type": "warning",
-                                "first_line_col": "#1bab02",
-                            }
-                        should_clear_fields = True
-        finally:
+        # Show error dialog on main thread, then decide whether to proceed.
+        dlg_result = self._show_tracker_import_error_dialog(general_report)
+        if dlg_result == 1:   # Export error details
+            self.export_txt_report(general_report)
+        if dlg_result in (0, 1):  # Close or Export → abort
             self._set_processing_state(False)
-
-        if alert_args:
-            self.show_alert(**alert_args)
-        if should_clear_fields:
-            #clear fields after first run. In case user runs the app continuously for another batch
             self.clear_all_fields()
+        else:  # Ignore errors → proceed with available data
+            self._start_collect_phase()
+
+    def _start_collect_phase(self) -> None:
+        """Launch the data-collection worker phase."""
+        self._worker = _TscWorker(self, self.statuses, "collect")
+        self._worker.collect_done.connect(self._on_collect_phase_done)
+        self._worker.error_raised.connect(self._on_worker_error)
+        self._worker.start()
+
+    def _on_collect_phase_done(self, status_missing: str, general_report: str) -> None:
+        """Called on the main thread when the data-collection phase finishes."""
+        self._set_processing_state(False)
+        alert_type = "info" if status_missing == "none" else "warning"
+        self.show_alert(general_report, alert_type=alert_type, first_line_col="#1bab02")
+        self.clear_all_fields()
+
+    def _on_worker_error(self, error_msg: str) -> None:
+        """Called on the main thread when a worker phase raises an exception."""
+        self._set_processing_state(False)
+        if "sheet is too large" in error_msg.lower():
+            self.show_alert(
+                "The generated report is too large for Excel (over 1,048,576 rows).\n"
+                "Please refine your filters.",
+                alert_type="error",
+                first_line_col="#FF5555",
+            )
+        else:
+            self.show_alert(
+                "An unknown error occurred while processing.\n"
+                "Please contact the tool creator to check the issue.",
+                alert_type="error",
+                first_line_col="#FF5555",
+            )
                 
 
     # -----------------------------------------------------------------------
@@ -1097,6 +1254,12 @@ class StatusCollector:
                     val = "cancelled"
                 elif val_l == "cannot proceed":
                     val = "on hold"
+
+            elif name == "Actual Hand-In Date":
+                val = StatusCollector._normalise_date(val)
+
+            elif name == "Total Cost":
+                val = StatusCollector._normalise_cost(val)
 
             result[i] = val
         return result
@@ -1238,6 +1401,7 @@ class StatusCollector:
             status_idx = col_display_names.index("Status")
         except ValueError:
             return
+        pn_idx = col_display_names.index("Product Name") if "Product Name" in col_display_names else None
 
         _digits_only = re.compile(r'^\d+$')  # IDH must be purely numeric to be kept
 
@@ -1252,7 +1416,14 @@ class StatusCollector:
                 bt_val      = bt_item.text().strip()     if bt_item     else ""
                 status_val  = status_item.text().strip() if status_item else ""
 
-                if (not idh_val
+                # Admin-marked rows are always kept regardless of IDH/status
+                pn_val = ""
+                if pn_idx is not None:
+                    pn_item = table.item(r, pn_idx)
+                    pn_val = pn_item.text().strip().lower() if pn_item else ""
+                is_admin = (bt_val.lower() == "admin") or (pn_val == "admin")
+
+                if not is_admin and (not idh_val
                         or not _digits_only.match(idh_val)
                         or not bt_val
                         or not status_val):
@@ -1320,7 +1491,7 @@ class StatusCollector:
                 file_errors: list[str] = []
 
                 try:
-                    xl = pd.ExcelFile(file_path, engine="openpyxl")
+                    xl = pd.ExcelFile(file_path, engine="calamine")
                 except Exception as exc:
                     errors[file_name] = [f"Failed to open file: {exc}"]
                     continue
@@ -1350,7 +1521,7 @@ class StatusCollector:
                             header=None,
                             dtype=str,
                             na_filter=False,
-                            engine="openpyxl",
+                            engine="calamine",
                         )
                     except Exception:
                         file_errors.append(f"sheet '{sheet}': could not be read")
@@ -1402,7 +1573,7 @@ class StatusCollector:
                             header=header_row_idx,
                             dtype=str,
                             na_filter=False,
-                            engine="openpyxl",
+                            engine="calamine",
                         )
                     except Exception:
                         file_errors.append(f"sheet \'{sheet}\': failed to read data")
@@ -1439,13 +1610,9 @@ class StatusCollector:
 
                     for _, row in df_data.iterrows():
                         idh_val = str(row.get(idh_col, "")).strip() if idh_col else ""
-                        # Always skip admin header/meta rows
+                        # Skip rows where the IDH Number itself is "admin" (header/meta rows)
                         if idh_val.lower() == "admin":
                             continue
-                        if build_type_col:
-                            bt_val = str(row.get(build_type_col, "")).strip().lower()
-                            if bt_val == "admin":
-                                continue
                         row_data = [
                             str(row.get(col_map[name], "")).strip() if col_map[name] else ""
                             for name in col_display_names
@@ -1671,7 +1838,7 @@ class StatusCollector:
                 file_name = os.path.basename(file_path)
 
                 try:
-                    xl = pd.ExcelFile(file_path, engine="openpyxl")
+                    xl = pd.ExcelFile(file_path, engine="calamine")
                 except Exception:
                     continue  # unreadable file – skip silently
 
@@ -1688,7 +1855,7 @@ class StatusCollector:
                             header=None,
                             dtype=str,
                             na_filter=False,
-                            engine="openpyxl",
+                            engine="calamine",
                         )
                     except Exception:
                         continue
@@ -1717,7 +1884,7 @@ class StatusCollector:
                             header=header_row_idx,
                             dtype=str,
                             na_filter=False,
-                            engine="openpyxl",
+                            engine="calamine",
                         )
                     except Exception:
                         continue
@@ -1750,13 +1917,9 @@ class StatusCollector:
 
                     for _, row in df_data.iterrows():
                         idh_val = str(row.get(idh_col, "")).strip() if idh_col else ""
-                        # Always skip admin header/meta rows
+                        # Skip rows where the IDH Number itself is "admin" (header/meta rows)
                         if idh_val.lower() == "admin":
                             continue
-                        if build_type_col:
-                            bt_val = str(row.get(build_type_col, "")).strip().lower()
-                            if bt_val == "admin":
-                                continue
                         row_data = [
                             str(row.get(col_map[name], "")).strip() if col_map[name] else ""
                             for name in col_display_names

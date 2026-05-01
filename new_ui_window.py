@@ -2090,7 +2090,11 @@ class _TscOption1TableDialog(QDialog):
         "Project Name",
         "Basic Number",
         "Label Size",
+        "Actual Hand-In Date",
+        "Total Cost",
         "Is Deployment",
+        "Packshot Naming",
+        "Working Files",
     ]
 
     class _FilterPopup(QDialog):
@@ -2892,17 +2896,39 @@ class _TscChartDialog(QDialog):
     _PALETTE_2 = ["#5c0000","#760c25","#8b2047","#9b376d","#a45193","#a66cba","#9f88de","#90a4ff"]
     _PALETTE_3 = ["#4348b9","#9745af","#ca4a9e","#eb5c8b","#ff797b","#ff9b73","#ffbd76","#ffde88"]
 
-    _VARIABLES = [
+    _COUNT_VARIABLES = [
         "SBU",
         "Build Type",
         "Status",
-        "Project Name",
         "Packaging Type",
         "Packaging Size",
-        "Label Size",
-        "Basic Number",
-        "Is Deployment",
+        "Year",
     ]
+
+    _COMBO_VARIABLES = [
+        "SBU",
+        "Build Type",
+        "Status",
+        "Packaging Type",
+        "Packaging Size",
+        "Year",
+    ]
+
+    _COMBO_SEG_BASE = [
+        "SBU",
+        "Build Type",
+        "Status",
+        "Packaging Type",
+        "Packaging Size",
+        "Year",
+    ]
+
+    _TOTAL_COST_ALLOWED_VARS = {"SBU", "Build Type", "Status", "Year"}
+
+    _COL_ALIAS: dict[str, str] = {"Year": "Actual Hand-In Date"}
+
+    # Keep for backward compatibility
+    _VARIABLES = _COMBO_VARIABLES
 
     _COUNT_CHART_TYPES = [
         "Pie Chart",
@@ -3114,7 +3140,7 @@ class _TscChartDialog(QDialog):
         sb.addWidget(var_lbl)
         self._var_combo = QComboBox()
         self._var_combo.setObjectName("sideCombo")
-        self._var_combo.addItems(self._VARIABLES)
+        self._var_combo.addItems(self._COUNT_VARIABLES)  # Count mode is default
         sb.addSpacing(4)
         sb.addWidget(self._var_combo)
 
@@ -3125,7 +3151,7 @@ class _TscChartDialog(QDialog):
         sb.addWidget(self._seg_lbl)
         self._seg_combo = QComboBox()
         self._seg_combo.setObjectName("sideCombo")
-        self._seg_combo.addItems(self._VARIABLES)
+        self._seg_combo.addItems(self._COMBO_SEG_BASE)  # Total Cost added dynamically
         self._seg_combo.setCurrentIndex(2)   # default: Status
         sb.addSpacing(4)
         sb.addWidget(self._seg_combo)
@@ -3246,14 +3272,22 @@ class _TscChartDialog(QDialog):
         title_row.addWidget(self._subtitle_lbl)
         right_layout.addLayout(title_row)
 
-        # Matplotlib canvas – tight_layout disabled so figure never auto-resizes on redraws
+        # Matplotlib canvas – wrapped in QScrollArea so tall charts are scrollable
         self._figure = Figure(facecolor="#FFFFFF")
         self._canvas = FigureCanvasQTAgg(self._figure)
-        self._canvas.setMinimumHeight(400)
-        self._canvas.setStyleSheet(
-            "background:#FFFFFF; border:1px solid #D0D6DF; border-radius:8px;"
+        self._canvas.setMinimumHeight(450)
+        self._chart_scroll = QScrollArea()
+        self._chart_scroll.setWidgetResizable(True)
+        self._chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._chart_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._chart_scroll.setWidget(self._canvas)
+        self._chart_scroll.setStyleSheet(
+            "QScrollArea { background:#FFFFFF; border:1px solid #D0D6DF; border-radius:8px; }"
+            "QScrollBar:vertical { background:#E8E8E8; width:8px; margin:0; border-radius:4px; }"
+            "QScrollBar::handle:vertical { background:#BBBBBB; border-radius:4px; min-height:24px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0px; }"
         )
-        right_layout.addWidget(self._canvas, 1)
+        right_layout.addWidget(self._chart_scroll, 1)
 
         # ── Bottom dynamic panel (color pickers / palette radios) ─────────
         self._bottom_panel = QWidget()
@@ -3323,7 +3357,7 @@ class _TscChartDialog(QDialog):
 
         # ── Wire up signals ───────────────────────────────────────────────
         self._radio_count.toggled.connect(self._on_mode_changed)
-        self._var_combo.currentIndexChanged.connect(self._refresh_chart)
+        self._var_combo.currentIndexChanged.connect(self._on_var_changed)
         self._seg_combo.currentIndexChanged.connect(self._refresh_chart)
         self._chart_type_combo.currentIndexChanged.connect(self._refresh_chart)
         self._include_blanks_cb.stateChanged.connect(self._refresh_chart)
@@ -3345,11 +3379,65 @@ class _TscChartDialog(QDialog):
 
     # ---------------------------------------------------------------- slots --
 
+    def _update_seg_combo(self) -> None:
+        """Rebuild Segment-by items based on current Variable — adds Total Cost only when allowed."""
+        var = self._var_combo.currentText()
+        current_seg = self._seg_combo.currentText()
+        new_items = list(self._COMBO_SEG_BASE)
+        if var in self._TOTAL_COST_ALLOWED_VARS:
+            new_items.append("Total Cost")
+        self._seg_combo.blockSignals(True)
+        self._seg_combo.clear()
+        self._seg_combo.addItems(new_items)
+        idx = self._seg_combo.findText(current_seg)
+        if idx >= 0:
+            self._seg_combo.setCurrentIndex(idx)
+        self._seg_combo.blockSignals(False)
+
+    def _on_var_changed(self) -> None:
+        """Called when Variable combo changes — updates Segment-by list then refreshes chart."""
+        if not self._radio_count.isChecked():
+            self._update_seg_combo()
+        self._refresh_chart()
+
+    def _resolve_header(self, col_name: str) -> str:
+        """Resolve a chart variable display name to its actual table header."""
+        return self._COL_ALIAS.get(col_name, col_name)
+
+    def _apply_col_transform(self, col_name: str, val: str) -> str:
+        """Apply column-specific display transform (date → year for Actual Hand-In Date)."""
+        actual = self._COL_ALIAS.get(col_name, col_name)
+        if actual == "Actual Hand-In Date" and val and len(val) >= 4:
+            return val[:4]
+        return val
+
+    def _resize_canvas(self, n_items: int = 0, px_per_item: int = 34, min_px: int = 450) -> None:
+        """Resize canvas height so a vertical scrollbar appears when many items are charted."""
+        h_px = max(min_px, n_items * px_per_item + 130) if n_items > 0 else min_px
+        self._canvas.setMinimumHeight(h_px)
+        # Update figure's stored inch-size so sizeHint() reflects the new height
+        # (FigureCanvasQTAgg.sizeHint returns figure.bbox in pixels)
+        dpi = self._figure.dpi
+        self._figure.set_size_inches(self._figure.get_figwidth(), h_px / dpi)
+        self._canvas.updateGeometry()
+
     def _on_mode_changed(self) -> None:
         is_count = self._radio_count.isChecked()
+        # Swap variable list – Count mode excludes Total Cost
+        current_var = self._var_combo.currentText()
+        self._var_combo.blockSignals(True)
+        self._var_combo.clear()
+        self._var_combo.addItems(self._COUNT_VARIABLES if is_count else self._COMBO_VARIABLES)
+        idx = self._var_combo.findText(current_var)
+        if idx >= 0:
+            self._var_combo.setCurrentIndex(idx)
+        self._var_combo.blockSignals(False)
         # Show/hide segment-by controls
         self._seg_lbl.setVisible(not is_count)
         self._seg_combo.setVisible(not is_count)
+        # Rebuild segment-by items for new mode
+        if not is_count:
+            self._update_seg_combo()
         # Swap chart-type list
         self._chart_type_combo.blockSignals(True)
         self._chart_type_combo.clear()
@@ -3389,25 +3477,35 @@ class _TscChartDialog(QDialog):
             elif ctype == "Histogram":
                 self._draw_histogram(var, blanks)
         else:
-            self._title_lbl.setText(f"{seg} by {var}  —  {ctype}")
-            if "(h)" in ctype:
-                self._draw_stacked(var, seg, blanks, horizontal=True,
-                                   grouped="Grouped" in ctype)
+            seg = self._seg_combo.currentText()
+            if seg == "Total Cost":
+                self._title_lbl.setText(f"Sum of Total Cost by {var}  —  {ctype}")
+                if "(h)" in ctype:
+                    self._draw_sum_bar(var, seg, blanks, horizontal=True)
+                else:
+                    self._draw_sum_bar(var, seg, blanks, horizontal=False)
             else:
-                self._draw_stacked(var, seg, blanks, horizontal=False,
-                                   grouped="Grouped" in ctype)
+                self._title_lbl.setText(f"{seg} by {var}  —  {ctype}")
+                if "(h)" in ctype:
+                    self._draw_stacked(var, seg, blanks, horizontal=True,
+                                       grouped="Grouped" in ctype)
+                else:
+                    self._draw_stacked(var, seg, blanks, horizontal=False,
+                                       grouped="Grouped" in ctype)
 
         self._canvas.draw()
 
     # -------------------------------------------------------- helpers --------
 
     def _col_values(self, col_name: str, include_blanks: bool = False) -> list[str]:
-        if col_name not in self._headers:
+        actual = self._resolve_header(col_name)
+        if actual not in self._headers:
             return []
-        idx = self._headers.index(col_name)
+        idx = self._headers.index(actual)
         values = []
         for row in self._data:
             v = row[idx].strip() if idx < len(row) else ""
+            v = self._apply_col_transform(col_name, v)
             if v or include_blanks:
                 values.append(v if v else "(blank)")
         return values
@@ -3488,6 +3586,7 @@ class _TscChartDialog(QDialog):
     # -------------------------------------------------------- chart renderers
 
     def _draw_pie(self, col: str, blanks: bool, donut: bool = False) -> None:
+        self._resize_canvas(0)
         counts = self._value_counts(col, blanks)
         if not counts:
             self._no_data()
@@ -3579,6 +3678,7 @@ class _TscChartDialog(QDialog):
         items = sorted(counts.items(), key=lambda x: -x[1])[:max_items]
         labels = [k for k, _ in items]
         values = [v for _, v in items]
+        self._resize_canvas(len(labels) if horizontal else 0)
         colors = self._colors(len(labels))
         ax = self._figure.add_subplot(111)
         if horizontal:
@@ -3611,6 +3711,7 @@ class _TscChartDialog(QDialog):
 
     def _draw_histogram(self, col: str, blanks: bool) -> None:
         """Numeric histogram – falls back to bar chart if values are non-numeric."""
+        self._resize_canvas(0)
         raw = self._col_values(col, blanks)
         if not raw:
             self._no_data()
@@ -3644,13 +3745,81 @@ class _TscChartDialog(QDialog):
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
+    def _draw_sum_bar(self, x_col: str, sum_col: str, blanks: bool, horizontal: bool) -> None:
+        """Draw a bar chart where bar height = sum of sum_col values per x_col category."""
+        _ax = self._resolve_header(x_col)
+        _as = self._resolve_header(sum_col)
+        xi = self._headers.index(_ax) if _ax in self._headers else -1
+        si = self._headers.index(_as) if _as in self._headers else -1
+        if xi < 0 or si < 0 or not self._data:
+            self._no_data()
+            return
+
+        sums: dict[str, float] = defaultdict(float)
+        for row in self._data:
+            xv = row[xi].strip() if xi < len(row) else ""
+            xv = self._apply_col_transform(x_col, xv)
+            sv = row[si].strip() if si < len(row) else ""
+            if not blanks and not xv:
+                continue
+            xv = xv or "(blank)"
+            try:
+                sums[xv] += float(sv)
+            except (ValueError, TypeError):
+                sums[xv] += 0.0  # keep group even if value is non-numeric
+
+        if not sums:
+            self._no_data()
+            return
+
+        items = sorted(sums.items(), key=lambda x: -x[1])
+        labels = [k for k, _ in items]
+        values = [v for _, v in items]
+        max_val = max(values) if values else 1
+
+        self._resize_canvas(len(labels) if horizontal else 0)
+        colors = self._colors(len(labels))
+        ax = self._figure.add_subplot(111)
+
+        if horizontal:
+            y_pos = list(range(len(labels)))
+            ax.barh(y_pos, values[::-1], color=colors[::-1],
+                    edgecolor="#FFFFFF", linewidth=0.5, height=0.65)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels[::-1], fontsize=9)
+            for i, val in enumerate(values[::-1]):
+                ax.text(val + max_val * 0.01, i, f"{val:,.2f}",
+                        va="center", ha="left", fontsize=9, color="#333333")
+            ax.set_xlabel(f"Total {sum_col}", fontsize=10)
+            ax.set_xlim(0, max_val * 1.22)
+            ax.tick_params(axis="y", length=0)
+        else:
+            x_pos = list(range(len(labels)))
+            ax.bar(x_pos, values, color=colors,
+                   edgecolor="#FFFFFF", linewidth=0.5, width=0.65)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+            for i, val in enumerate(values):
+                ax.text(i, val + max_val * 0.01, f"{val:,.2f}",
+                        ha="center", va="bottom", fontsize=9, color="#333333")
+            ax.set_ylabel(f"Total {sum_col}", fontsize=10)
+            ax.set_ylim(0, max_val * 1.18)
+            ax.tick_params(axis="x", length=0)
+
+        ax.set_title(f"Sum of {sum_col} by {x_col}  (total {sum(values):,.2f})",
+                     fontsize=13, fontweight="bold", pad=14)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
     def _draw_stacked(
         self, x_col: str, seg_col: str, blanks: bool,
         horizontal: bool = False, grouped: bool = False,
         max_x: int = 18,
     ) -> None:
-        xi = self._headers.index(x_col)  if x_col  in self._headers else -1
-        si = self._headers.index(seg_col) if seg_col in self._headers else -1
+        _ax = self._resolve_header(x_col)
+        _as = self._resolve_header(seg_col)
+        xi = self._headers.index(_ax) if _ax in self._headers else -1
+        si = self._headers.index(_as) if _as in self._headers else -1
         if xi < 0 or si < 0 or not self._data:
             self._no_data()
             return
@@ -3658,7 +3827,9 @@ class _TscChartDialog(QDialog):
         matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for row in self._data:
             xv = row[xi].strip() if xi < len(row) else ""
+            xv = self._apply_col_transform(x_col, xv)
             sv = row[si].strip() if si < len(row) else ""
+            sv = self._apply_col_transform(seg_col, sv)
             if not blanks and (not xv or not sv):
                 continue
             xv = xv or "(blank)"
@@ -3671,6 +3842,7 @@ class _TscChartDialog(QDialog):
 
         x_labels = sorted(matrix.keys(), key=lambda k: -sum(matrix[k].values()))[:max_x]
         all_segs = sorted({s for m in matrix.values() for s in m})
+        self._resize_canvas(len(x_labels) if horizontal else 0)
         colors = self._colors(len(all_segs))
         ax = self._figure.add_subplot(111)
 
@@ -5822,10 +5994,11 @@ class _SearchResultWindow(QDialog):
 
     _HIGHLIGHT_COLOR = "#E8151B"   # red used to highlight matched search values
 
-    def __init__(self, result_data: dict, cfg: "HatConfig", parent=None) -> None:
+    def __init__(self, result_data: dict, cfg: "HatConfig", use_root_folders: bool = False, parent=None) -> None:
         super().__init__(parent)
         self._result_data = result_data
         self._cfg = cfg
+        self._use_root_folders = use_root_folders
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("Search Results")
         self.setMinimumSize(900, 640)
@@ -5893,6 +6066,16 @@ class _SearchResultWindow(QDialog):
         hdr.addWidget(self._radio_tiles)
         hdr.addWidget(self._radio_table)
 
+        # Item count label (shown only when sample limit is "All")
+        self._item_count_lbl = QLabel()
+        self._item_count_lbl.setStyleSheet(
+            "font-weight: 700; font-size: 12px; color: #1A5276;"
+            " background: #D6EAF8; border-radius: 4px; padding: 2px 8px;"
+        )
+        show_count = self._result_data.get("show_item_count", False)
+        self._item_count_lbl.setVisible(show_count)
+        hdr.addWidget(self._item_count_lbl)
+
         hdr.addStretch(1)
 
         export_btn = QPushButton("Export search results")
@@ -5921,7 +6104,7 @@ class _SearchResultWindow(QDialog):
         # ── Wire signals ─────────────────────────────────────────────────
         self._radio_minimal.toggled.connect(self._on_options_changed)
         self._radio_tiles.toggled.connect(self._on_options_changed)
-        export_btn.clicked.connect(self._export_pdf)
+        export_btn.clicked.connect(self._export)
 
         self._refresh_body()
 
@@ -5949,6 +6132,14 @@ class _SearchResultWindow(QDialog):
         source = self._result_data.get("source", "")
         is_rsd = source == "RSD (master)"
         groups = self._result_data.get("groups")        # list[dict] or None
+
+        # Update item count label
+        if self._result_data.get("show_item_count", False):
+            total = sum(len(g.get("rows", [])) for g in groups) if groups else len(rows)
+            self._item_count_lbl.setText(f"Item Count: {total}")
+            self._item_count_lbl.setVisible(True)
+        else:
+            self._item_count_lbl.setVisible(False)
 
         if not rows:
             no_res = QLabel("No results found.")
@@ -6418,9 +6609,28 @@ class _SearchResultWindow(QDialog):
         p.append("</body></html>")
         return "".join(p)
 
+    def _export(self) -> None:
+        """Dispatch to PDF (Tiles mode) or Excel (Table mode)."""
+        if self._radio_tiles.isChecked():
+            self._export_pdf()
+        else:
+            self._export_excel()
+
     def _export_pdf(self) -> None:
+        from datetime import datetime
+        from pathlib import Path as _Path
+
+        ts = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        default_name = f"search_result_{ts}"
+        start_dir = ""
+        if self._use_root_folders:
+            root = self._cfg.root_folder()
+            if root and _Path(root).is_dir():
+                start_dir = root
+        save_hint = str(_Path(start_dir) / default_name) if start_dir else default_name
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Search Results", "", "PDF Files (*.pdf)"
+            self, "Export Search Results", save_hint, "PDF Files (*.pdf)"
         )
         if not path:
             return
@@ -6428,18 +6638,303 @@ class _SearchResultWindow(QDialog):
             path += ".pdf"
 
         minimal = self._radio_minimal.isChecked()
-        html = self._build_pdf_html(minimal)
+        try:
+            self._write_pdf_reportlab(path, minimal)
+            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+
+    def _write_pdf_reportlab(self, out_path: str, minimal: bool) -> None:
+        """Render search results to PDF using reportlab – image tiles with field labels."""
+        from reportlab.lib.pagesizes import letter as _LETTER
+        from reportlab.lib.colors import HexColor
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfgen.canvas import Canvas as _Canvas
+        from PIL import Image as PILImage
+        from io import BytesIO
+        from pathlib import Path as _Path
+
+        PW, PH   = _LETTER
+        MARGIN   = 36.0
+        AVAIL_W  = PW - 2 * MARGIN
+        NCOLS    = 3
+        COL_GAP  = 8.0
+        ROW_GAP  = 12.0
+        CELL_W   = (AVAIL_W - COL_GAP * (NCOLS - 1)) / NCOLS
+        IMG_H    = 150.0
+        PAD      = 5.0
+        FS       = 6.5
+        LINE_H   = FS + 2.5
+
+        tile_fields = self.MINIMAL_TILE_FIELDS if minimal else self.ALL_TILE_FIELDS
+        TEXT_H   = len(tile_fields) * LINE_H + PAD + 4.0
+        CELL_H   = IMG_H + TEXT_H + PAD * 2
+
+        FONT_B = "Helvetica-Bold"
+        FONT_R = "Helvetica"
+        C_HDR_BG  = HexColor("#111F35")
+        C_BOX_BG  = HexColor("#EFF3F8")
+        C_BOX_BD  = HexColor("#8FAABF")
+        C_WHITE   = HexColor("#FFFFFF")
+        C_DARK    = HexColor("#111111")
+        C_GREY    = HexColor("#555555")
+        C_PLHLD   = HexColor("#C8C8C8")
+        C_PLHLD_T = HexColor("#666666")
+        C_GRP_BG  = HexColor("#E4E8EE")
+        C_GRP_FG  = HexColor("#111F35")
+
+        rows    = self._result_data.get("rows", [])
+        groups  = self._result_data.get("groups")
+        summary = self._result_data.get("search_summary", "")
+
+        entries: list[tuple[str, dict]] = []
+        entries_groups = self._result_data.get("groups")
+        if entries_groups:
+            for grp in entries_groups:
+                qv = grp.get("query_value", "")
+                for rec in grp.get("rows", []):
+                    entries.append((qv, rec))
+        else:
+            for rec in rows:
+                entries.append(("", rec))
+
+        cv = _Canvas(out_path, pagesize=_LETTER)
+
+        def _load_img(p):
+            if not p:
+                return None
+            try:
+                pil = PILImage.open(p)
+                if pil.mode == "RGBA":
+                    bg = PILImage.new("RGB", pil.size, (255, 255, 255))
+                    bg.paste(pil, mask=pil.split()[3])
+                    pil = bg
+                elif pil.mode not in ("RGB", "L"):
+                    pil = pil.convert("RGB")
+                buf = BytesIO()
+                pil.save(buf, format="JPEG", quality=60, optimize=True)
+                buf.seek(0)
+                return ImageReader(buf)
+            except Exception:
+                return None
+
+        def _placeholder(x, y, w, h):
+            cv.setFillColor(C_PLHLD)
+            cv.setStrokeColor(HexColor("#999999"))
+            cv.setLineWidth(0.5)
+            cv.rect(x, y, w, h, fill=1, stroke=1)
+            cv.setFillColor(C_PLHLD_T)
+            cv.setFont(FONT_B, 7.0)
+            cv.drawCentredString(x + w / 2, y + h / 2 - 4, "No Image Found")
+
+        y_cursor = [PH - MARGIN]
+
+        def _draw_header():
+            y = y_cursor[0]
+            cv.setFillColor(C_HDR_BG)
+            cv.rect(MARGIN, y - 22, AVAIL_W, 20, fill=1, stroke=0)
+            cv.setFillColor(C_WHITE)
+            cv.setFont(FONT_B, 13.0)
+            cv.drawString(MARGIN + 6, y - 16, "Search Results")
+            y -= 26
+            if summary:
+                cv.setFont(FONT_R, 8.0)
+                cv.setFillColor(C_GREY)
+                cv.drawString(MARGIN, y - 9, f"Search results for: {summary}")
+                y -= 15
+            if self._result_data.get("show_item_count", False):
+                total = sum(len(g.get("rows", [])) for g in entries_groups) if entries_groups else len(entries)
+                cv.setFont(FONT_B, 8.0)
+                cv.setFillColor(C_GREY)
+                cv.drawString(MARGIN, y - 9, f"Item Count: {total}")
+                y -= 15
+            y -= 4
+            y_cursor[0] = y
+
+        _draw_header()
+        y_top = y_cursor[0]
+        col   = 0
+        active_group: str | None = None
+
+        for section_lbl, record in entries:
+            if groups and section_lbl != active_group:
+                if col > 0:
+                    y_top -= CELL_H + ROW_GAP
+                    col = 0
+                if y_top - 18 - CELL_H < MARGIN:
+                    cv.showPage()
+                    y_cursor[0] = PH - MARGIN
+                    _draw_header()
+                    y_top = y_cursor[0]
+                    col = 0
+                cv.setFillColor(C_GRP_BG)
+                cv.rect(MARGIN, y_top - 14, AVAIL_W, 13, fill=1, stroke=0)
+                cv.setFillColor(C_GRP_FG)
+                cv.setLineWidth(2.5)
+                cv.setStrokeColor(C_GRP_FG)
+                cv.line(MARGIN, y_top - 14, MARGIN, y_top - 1)
+                cv.setFont(FONT_B, 7.5)
+                cv.drawString(MARGIN + 6, y_top - 10.5, section_lbl)
+                y_top -= 20
+                active_group = section_lbl
+
+            if col == 0 and y_top - CELL_H < MARGIN:
+                cv.showPage()
+                y_cursor[0] = PH - MARGIN
+                _draw_header()
+                y_top = y_cursor[0]
+
+            x = MARGIN + col * (CELL_W + COL_GAP)
+            cell_y_bot = y_top - CELL_H
+
+            # Cell background + border
+            cv.setFillColor(C_BOX_BG)
+            cv.setStrokeColor(C_BOX_BD)
+            cv.setLineWidth(0.5)
+            cv.rect(x, cell_y_bot, CELL_W, CELL_H, fill=1, stroke=1)
+
+            # Image area
+            img_x = x + PAD
+            img_y = y_top - PAD - IMG_H
+            img_w = CELL_W - 2 * PAD
+            idh = record.get("IDH", "").strip()
+            img_info = self._image_by_idh.get(idh)
+            img_path = img_info["path"] if img_info and img_info.get("path") else None
+
+            reader = _load_img(img_path)
+            if reader:
+                ow, oh = reader.getSize()
+                ratio = min(img_w / ow, IMG_H / oh)
+                dw, dh = ow * ratio, oh * ratio
+                cv.drawImage(
+                    reader,
+                    img_x + (img_w - dw) / 2,
+                    img_y + (IMG_H - dh) / 2,
+                    dw, dh, mask="auto",
+                )
+            else:
+                _placeholder(img_x, img_y, img_w, IMG_H)
+
+            # Text fields
+            ty = img_y - 2.0 - FS
+            img_name = _Path(img_path).name if img_path else ""
+            for field_name in tile_fields:
+                val = img_name if field_name == "Image Name" else record.get(field_name, "").strip()
+                display = val if val else "\u2014"
+                lbl = f"{field_name}: "
+                lbl_w = cv.stringWidth(lbl, FONT_B, FS)
+                max_v_w = CELL_W - 2 * PAD - lbl_w - 2
+                disp = display
+                while disp and cv.stringWidth(disp, FONT_R, FS) > max_v_w:
+                    disp = disp[:-1]
+                if len(disp) < len(display):
+                    disp = disp.rstrip() + "\u2026"
+                cv.setFont(FONT_B, FS)
+                cv.setFillColor(C_DARK)
+                cv.drawString(x + PAD, ty, lbl)
+                cv.setFont(FONT_R, FS)
+                cv.setFillColor(C_GREY)
+                cv.drawString(x + PAD + lbl_w, ty, disp)
+                ty -= LINE_H
+
+            col += 1
+            if col >= NCOLS:
+                col = 0
+                y_top -= CELL_H + ROW_GAP
+
+        cv.save()
+
+    def _export_excel(self) -> None:
+        from datetime import datetime
+        from pathlib import Path as _Path
+
+        ts = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        default_name = f"search_result_{ts}"
+        start_dir = ""
+        if self._use_root_folders:
+            root = self._cfg.root_folder()
+            if root and _Path(root).is_dir():
+                start_dir = root
+        save_hint = str(_Path(start_dir) / default_name) if start_dir else default_name
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Search Results", save_hint, "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        minimal  = self._radio_minimal.isChecked()
+        cols     = self.MINIMAL_COLS if minimal else self.ALL_COLS
+        rows     = self._result_data.get("rows", [])
+        groups   = self._result_data.get("groups")
+        source   = self._result_data.get("source", "")
+        is_rsd   = source == "RSD (master)"
+        cols     = [c for c in cols if not (is_rsd and c == "Pack Size")]
 
         try:
-            from PySide6.QtPrintSupport import QPrinter
-            from PySide6.QtGui import QTextDocument
-            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-            printer.setOutputFileName(path)
-            printer.setPageSize(QPrinter.PageSize.A4)
-            doc = QTextDocument()
-            doc.setHtml(html)
-            doc.print_(printer)
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Search Results"
+
+            header_fill   = PatternFill(fill_type="solid", fgColor="111F35")
+            header_font   = Font(color="FFFFFF", bold=True, name="Segoe UI", size=11)
+            alt_fill      = PatternFill(fill_type="solid", fgColor="F3F7FC")
+            body_font     = Font(name="Segoe UI", size=10)
+            thin          = Side(style="thin", color="D9E1EA")
+            border        = Border(left=thin, right=thin, top=thin, bottom=thin)
+            center        = Alignment(horizontal="center", vertical="center")
+            left_align    = Alignment(horizontal="left",   vertical="center")
+
+            if groups:
+                # Grouped export: add a leading "Search Value" column
+                all_rows: list[dict] = []
+                for grp in groups:
+                    qv = grp.get("query_value", "")
+                    for rec in grp.get("rows", []):
+                        all_rows.append({"Search Value": qv, **rec})
+                export_cols = ["Search Value"] + list(cols)
+                export_rows = all_rows
+            else:
+                export_cols = list(cols)
+                export_rows = rows
+
+            # Header row
+            for ci, col_name in enumerate(export_cols, start=1):
+                cell = ws.cell(row=1, column=ci, value=col_name)
+                cell.fill   = header_fill
+                cell.font   = header_font
+                cell.alignment = center
+                cell.border = border
+
+            # Data rows
+            for ri, record in enumerate(export_rows, start=2):
+                for ci, col_name in enumerate(export_cols, start=1):
+                    cell = ws.cell(row=ri, column=ci, value=record.get(col_name, ""))
+                    cell.font   = body_font
+                    cell.alignment = left_align
+                    cell.border = border
+                    if ri % 2 == 0:
+                        cell.fill = alt_fill
+
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = (
+                f"A1:{ws.cell(row=1, column=len(export_cols)).coordinate}"
+            )
+            ws.row_dimensions[1].height = 22
+            for ci, col_name in enumerate(export_cols, start=1):
+                max_len = len(col_name)
+                for rec in export_rows:
+                    max_len = max(max_len, len(str(rec.get(col_name, ""))))
+                ws.column_dimensions[
+                    ws.cell(row=1, column=ci).column_letter
+                ].width = min(max(12, max_len + 2), 50)
+
+            wb.save(path)
             QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Failed", str(exc))
@@ -6778,6 +7273,7 @@ class NewUIWindow(QMainWindow):
         self._init_modules()
         self.setStyleSheet(self._stylesheet())
         QTimer.singleShot(0, self._update_home_image)
+        QTimer.singleShot(0, lambda: self.btn_rail_toggle.setChecked(True))
 
     def _make_top_button(self, text: str) -> QPushButton:
         btn = QPushButton(text.upper())
@@ -7451,6 +7947,7 @@ class NewUIWindow(QMainWindow):
         result["field_values"]   = field_values
         result["multi_values"]   = multi_values
         result["source"]         = source
+        result["show_item_count"] = (sample_limit is None)  # True when limit is "All"
 
         # Filter to only rows that have a matching image if checkbox is ticked
         if self.chk_search_matching_image.isChecked():
@@ -7467,7 +7964,7 @@ class NewUIWindow(QMainWindow):
                     grp["rows"] = [r for r in grp["rows"] if r.get("IDH", "").strip() in matched_idhs]
                     grp["idh_list"] = [idh for idh in grp.get("idh_list", []) if idh.strip() in matched_idhs]
 
-        dlg = _SearchResultWindow(result, self._config, parent=self)
+        dlg = _SearchResultWindow(result, self._config, use_root_folders=self._use_root_folders, parent=self)
         dlg.setModal(False)
         dlg.show()
 

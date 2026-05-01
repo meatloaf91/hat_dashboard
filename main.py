@@ -16,3 +16,5 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 #To Do:
+# Include a feature that shows all library inputs for better searching.
+# Work on the Review panel.

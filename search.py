@@ -283,11 +283,12 @@ def filter_df_by_fields(
         return df
 
     if "custom" in filters:
-        term = filters["custom"].lower()
-        mask = df.apply(
-            lambda row: row.astype(str).str.lower().str.contains(term, na=False).any(),
-            axis=1,
-        )
+        term = _norm(filters["custom"])
+        # Vectorised column-wise OR — much faster than row-by-row apply()
+        norm_df = df.astype(str).apply(lambda col: col.apply(_norm))
+        mask = norm_df.apply(
+            lambda col: col.str.contains(term, na=False, regex=False)
+        ).any(axis=1)
         return df[mask].copy()
 
     mask = pd.Series([True] * len(df), index=df.index)
@@ -300,9 +301,13 @@ def filter_df_by_fields(
         if actual_col is None:
             # Column doesn't exist in this file — skip
             continue
-        mask &= df[actual_col].fillna("").astype(str).str.lower().str.contains(
-            term.lower(), na=False
-        )
+        norm_term = _norm(term)
+        norm_col  = df[actual_col].fillna("").astype(str).apply(_norm)
+        # Try both orientations for dimension-like terms (302x600 ↔ 600x302)
+        cell_match = pd.Series([False] * len(df), index=df.index)
+        for variant in _dim_variants(term):
+            cell_match |= norm_col.str.contains(variant, na=False, regex=False)
+        mask &= cell_match
 
     return df[mask].copy()
 
@@ -340,6 +345,35 @@ DISPLAY_COLUMN_FIELD: dict[str, str] = {
 
 import re as _re
 _IDH_PATTERN = _re.compile(r'(?<!\d)(\d{5,8})(?!\d)')
+
+
+def _norm(s: str) -> str:
+    """Lowercase and remove all whitespace — used for loose matching.
+
+    Allows "302x600" to match "302 x 600" (and vice-versa) by collapsing
+    spaces on both the search term and the cell value before comparing.
+    """
+    return _re.sub(r'\s+', '', s.lower())
+
+
+_DIM_RE = _re.compile(r'^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(.*)$')
+
+
+def _dim_variants(term: str) -> list[str]:
+    """Return normalised search variants for *term*.
+
+    If the term looks like a dimension (e.g. ``"302x600"`` after normalisation)
+    both orientations are returned so that ``"302x600"`` matches ``"600x302"``
+    and vice-versa.  Otherwise a single-element list is returned.
+    """
+    normed = _norm(term)
+    m = _DIM_RE.match(normed)
+    if not m:
+        return [normed]
+    a, b, suffix = m.group(1), m.group(2), m.group(3)
+    if a == b:
+        return [normed]
+    return [f"{a}x{b}{suffix}", f"{b}x{a}{suffix}"]
 
 
 def extract_idh_from_filename(name: str) -> str | None:
@@ -512,13 +546,14 @@ def run_search(
         matched = df
     elif "custom" in list_filters:
         terms = list_filters["custom"]
+        # Vectorised column-wise OR for each term (AND across terms)
+        norm_df = df.astype(str).apply(lambda col: col.apply(_norm))
         mask = pd.Series([True] * len(df), index=df.index)
         for term in terms:
-            t = term.lower()
-            mask &= df.apply(
-                lambda row, _t=t: row.astype(str).str.lower().str.contains(_t, na=False).any(),
-                axis=1,
-            )
+            t = _norm(term)
+            mask &= norm_df.apply(
+                lambda col, _t=t: col.str.contains(_t, na=False, regex=False)
+            ).any(axis=1)
         matched = df[mask].copy()
     else:
         mask = pd.Series([True] * len(df), index=df.index)
@@ -529,13 +564,16 @@ def run_search(
             actual_col = _find_column(df.columns, col_name)
             if actual_col is None:
                 continue
-            # OR within field: row matches if cell contains ANY of the terms
+            # OR within field: row matches if cell contains ANY of the terms.
+            # Whitespace is collapsed; dimension terms also try both orientations
+            # so "302x600" matches "600x302" (and vice-versa).
+            norm_col = df[actual_col].fillna("").astype(str).apply(_norm)
             field_mask = pd.Series([False] * len(df), index=df.index)
             for term in terms:
-                field_mask |= (
-                    df[actual_col].fillna("").astype(str)
-                    .str.lower().str.contains(term.lower(), na=False)
-                )
+                for variant in _dim_variants(term):
+                    field_mask |= norm_col.str.contains(
+                        variant, na=False, regex=False
+                    )
             mask &= field_mask
         matched = df[mask].copy()
 
