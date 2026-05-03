@@ -21,10 +21,14 @@ output_folder =
 input_folder  =          ; empty → <root>/HAT DASHBOARD ROOT/MASTER/SAP Data Reformat
 output_folder =
 
+[project_review]
+folder =                 ; empty → no derivation; user must set explicitly
+
 Derivation rules (when a per-tool key is empty):
   tsc          input/output → <root>/HAT DASHBOARD ROOT/MASTER/Tracker Status Collector
   thumbnail    input/output → <root>/HAT DASHBOARD ROOT/MASTER/Thumbnail Generator
   sap_reformat input/output → <root>/HAT DASHBOARD ROOT/MASTER/SAP Data Reformat
+  project_review folder     → set explicitly by user (no root derivation)
 """
 
 from __future__ import annotations
@@ -49,17 +53,18 @@ PROJECT_SUBFOLDERS: list[str] = [
     "Packshot Naming Generator",
     "SAP Data Reformat",
     "SAP Data Compare",
-    "Project Viewer",
+    "Project Review",
 ]
 
 _DEFAULT_SECTIONS: dict[str, dict[str, str]] = {
-    "general":      {"root_folder": ""},
-    "tsc":          {"input_folder": "", "output_folder": ""},
-    "thumbnail":    {"input_folder": "", "output_folder": ""},
-    "sap_reformat": {"input_folder": "", "output_folder": ""},
-    "excel_library":{"folder": ""},
-    "sap_compare":  {"rsd_target_folder": "", "rsd_master_folder": "", "tsc_data_folder": ""},
-    "search":       {"rsd_master_folder": "", "tsc_data_folder": "", "library": "", "thumbnails_folder": ""},
+    "general":        {"root_folder": ""},
+    "tsc":            {"input_folder": "", "output_folder": ""},
+    "thumbnail":      {"input_folder": "", "output_folder": ""},
+    "sap_reformat":   {"input_folder": "", "output_folder": ""},
+    "excel_library":  {"folder": ""},
+    "sap_compare":    {"rsd_target_folder": "", "rsd_master_folder": "", "tsc_data_folder": ""},
+    "search":         {"rsd_master_folder": "", "tsc_data_folder": "", "library": "", "thumbnails_folder": ""},
+    "project_review": {"folder": ""},
 }
 
 
@@ -199,6 +204,13 @@ class HatConfig:
     def excel_library_folder(self) -> str:
         return self._resolve("excel_library", "folder",
                              "HAT DASHBOARD ROOT/MASTER/Excel Library")
+
+    def project_review_folder(self) -> str:
+        """Return the configured Project Review folder path, or '' if not set."""
+        return self.get("project_review", "folder")
+
+    def set_project_review_folder(self, path: str) -> None:
+        self.set("project_review", "folder", path)
 
     def rsd_master_folder(self) -> str:
         """Return folder to scan for the RSD master file.

@@ -13,7 +13,7 @@ from matplotlib.figure import Figure
 
 _BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, Signal, QTimer
+from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, QRect, Signal, QTimer
 from PySide6.QtGui import QColor, QCursor, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -41,6 +42,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSpacerItem,
     QSizePolicy,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -3905,6 +3908,1137 @@ class _TscChartDialog(QDialog):
             )
 
 
+class _ReviewTableDialog(QDialog):
+    """Review Table — loads the 'body_map_IDH' sheet from an SDC or Review excel file."""
+
+    _BLANK_FILTER   = "__BLANK__"
+    _SHEET_NAME     = "body_map_IDH"
+    _HBM_COL        = "Head Bom Mat"
+    _ACCENT_HEADERS = {"Head Bom Mat", "Master IDH Build", "Hit Type", "Assessment Comments"}
+
+    # Hit Type cell rules (key = lowercase cell value)
+    _HIT_TYPE_RULES = {
+        "total hit":   {"bg": "#C3CC9B", "fg": None,      "bold": False},
+        "partial hit": {"bg": "#F08D39", "fg": None,      "bold": False},
+        "0 hit":       {"bg": None,      "fg": "#CC0000", "bold": True},
+    }
+    # Master IDH Build cell rules
+    _IDH_BUILD_RULES = {
+        "3d": {"bg": "#C3CC9B", "fg": None, "bold": False},
+        "2d": {"bg": "#F08D39", "fg": None, "bold": False},
+    }
+    _IDH_BUILD_NA_BG = "#9EA3AB"
+
+    # ── nested filter popup (same as _TscOption1TableDialog) ──────────────
+    class _FilterPopup(QDialog):
+        def __init__(self, values, selected_values, parent=None):
+            super().__init__(parent)
+            self.setWindowFlags(Qt.WindowType.Popup)
+            self.setMinimumSize(260, 330)
+            self.resize(260, 330)
+            self._is_syncing = False
+            self._value_items: list = []
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(4, 4, 4, 4)
+            layout.setSpacing(4)
+            self.search_input = QLineEdit(self)
+            self.search_input.setPlaceholderText("Search")
+            self.search_input.setClearButtonEnabled(True)
+            self.search_input.setObjectName("packshotRowCountInput")
+            layout.addWidget(self.search_input)
+            self.list_widget = QListWidget(self)
+            self.list_widget.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+            layout.addWidget(self.list_widget, 1)
+            self.item_select_all = QListWidgetItem("(Select All)")
+            self.item_select_all.setFlags(self.item_select_all.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            self.item_select_all.setCheckState(Qt.CheckState.Checked)
+            self.item_select_all.setData(Qt.ItemDataRole.UserRole, "__SELECT_ALL__")
+            self.list_widget.addItem(self.item_select_all)
+            selected = selected_values if selected_values is not None else {v for v, _ in values}
+            for value, label in values:
+                item = QListWidgetItem(label)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if value in selected else Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, value)
+                self.list_widget.addItem(item)
+                self._value_items.append((item, value, label))
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            self.btn_apply = QPushButton("Apply")
+            self.btn_apply.setObjectName("packshotUpdateRowsBtn")
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setObjectName("packshotUpdateRowsBtn")
+            btn_row.addWidget(self.btn_apply)
+            btn_row.addWidget(self.btn_cancel)
+            layout.addLayout(btn_row)
+            self.search_input.textChanged.connect(self._apply_search)
+            self.list_widget.itemChanged.connect(self._on_item_changed)
+            self.btn_apply.clicked.connect(self.accept)
+            self.btn_cancel.clicked.connect(self.reject)
+            self.search_input.setFocus()
+            self._sync_select_all_state()
+
+        def _apply_search(self, text):
+            needle = text.strip().lower()
+            for item, _v, label in self._value_items:
+                item.setHidden(needle not in label.lower())
+            self._sync_select_all_state()
+
+        def _on_item_changed(self, item):
+            if self._is_syncing:
+                return
+            if item.data(Qt.ItemDataRole.UserRole) == "__SELECT_ALL__":
+                self._is_syncing = True
+                try:
+                    state = item.checkState()
+                    for vi, _v, _l in self._value_items:
+                        if not vi.isHidden():
+                            vi.setCheckState(state)
+                finally:
+                    self._is_syncing = False
+                return
+            self._sync_select_all_state()
+
+        def _sync_select_all_state(self):
+            visible = [i for i, _v, _l in self._value_items if not i.isHidden()]
+            if not visible:
+                state = Qt.CheckState.Unchecked
+            elif all(i.checkState() == Qt.CheckState.Checked for i in visible):
+                state = Qt.CheckState.Checked
+            elif any(i.checkState() == Qt.CheckState.Checked for i in visible):
+                state = Qt.CheckState.PartiallyChecked
+            else:
+                state = Qt.CheckState.Unchecked
+            self._is_syncing = True
+            try:
+                self.item_select_all.setCheckState(state)
+            finally:
+                self._is_syncing = False
+
+        def get_selected_values(self):
+            return {v for item, v, _l in self._value_items if item.checkState() == Qt.CheckState.Checked}
+
+    # ── nested: HBM lookup button delegate ────────────────────────────────
+    class _HBMButtonDelegate(QStyledItemDelegate):
+        """Draws a small ▶ button on the right edge of every cell in the HBM column.
+        Clicking it calls on_lookup(hbm_value)."""
+        _BTN_W = 22
+
+        def __init__(self, on_lookup, parent=None):
+            super().__init__(parent)
+            self._on_lookup = on_lookup
+
+        def paint(self, painter, option, index):
+            # Paint cell text in a reduced rect (leave room for button)
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            opt.rect = option.rect.adjusted(0, 0, -self._BTN_W, 0)
+            super().paint(painter, opt, index)
+            # Draw small accent button on the right
+            btn_rect = self._btn_rect(option.rect)
+            painter.save()
+            painter.setRenderHint(painter.RenderHint.Antialiasing)
+            painter.setBrush(QColor("#D02752"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(btn_rect, 3, 3)
+            painter.setPen(QColor("#FFFFFF"))
+            font = painter.font()
+            font.setPixelSize(10)
+            painter.setFont(font)
+            painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, "▶")
+            painter.restore()
+
+        def editorEvent(self, event, model, option, index):
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if self._btn_rect(option.rect).contains(event.pos().toPoint()
+                        if hasattr(event.pos(), "toPoint") else event.pos()):
+                    val = index.data(Qt.ItemDataRole.DisplayRole) or ""
+                    self._on_lookup(val.strip())
+                    return True
+            return super().editorEvent(event, model, option, index)
+
+        @staticmethod
+        def _btn_rect(cell_rect):
+            return QRect(
+                cell_rect.right() - _ReviewTableDialog._HBMButtonDelegate._BTN_W + 2,
+                cell_rect.top() + 3,
+                _ReviewTableDialog._HBMButtonDelegate._BTN_W - 4,
+                cell_rect.height() - 6,
+            )
+
+    # ── nested: accent header view ─────────────────────────────────────────
+    class _AccentHeaderView(QHeaderView):
+        """Paints accent columns with #D02752 background, white bold text; normal columns unchanged."""
+        _ACCENT_BG   = QColor("#D02752")
+        _ACCENT_FG   = QColor("#FFFFFF")
+        _NORMAL_BG   = QColor("#111F35")
+        _BORDER      = QColor("#7D8694")
+
+        def __init__(self, highlight_cols: set, parent=None):
+            super().__init__(Qt.Orientation.Horizontal, parent)
+            self._highlight_cols: set[int] = set(highlight_cols)
+            self.setSectionsClickable(True)
+
+        def set_highlight_cols(self, cols: set) -> None:
+            self._highlight_cols = set(cols)
+            self.viewport().update()
+
+        def paintSection(self, painter, rect, logical_index):
+            if logical_index not in self._highlight_cols:
+                super().paintSection(painter, rect, logical_index)
+                return
+            # Fully custom paint — accent background, white bold label
+            painter.save()
+            painter.fillRect(rect, self._ACCENT_BG)
+            painter.setPen(self._BORDER)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            label = self.model().headerData(
+                logical_index, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole
+            )
+            if label:
+                font = painter.font()
+                font.setBold(True)
+                painter.setFont(font)
+                painter.setPen(self._ACCENT_FG)
+                text_rect = rect.adjusted(8, 0, -4, 0)
+                painter.drawText(
+                    text_rect,
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    str(label),
+                )
+            painter.restore()
+
+    # ── constructor ────────────────────────────────────────────────────────
+    def __init__(self, source_file: str, sdc_folder: str = "", project_review_folder: str = "", tracker_files: list | None = None, parent=None) -> None:
+        super().__init__(parent)
+        from pathlib import Path
+        self._source_file = source_file
+        self._sdc_folder = sdc_folder
+        self._project_review_folder = project_review_folder
+        self._tracker_files: list[str] = tracker_files or []
+        self._headers: list[str] = []
+        self._original_snapshot: list[list[str]] = []
+        self._original_headers: list[str] = []
+        self._undo_stack: list[list[list[str]]] = []
+        self._is_batch_edit = False
+        self._is_restoring_undo = False
+        self._column_filters: dict[int, set[str] | None] = {}
+        # user-applied cell formatting: (row, col) -> {"bg": str|None, "fg": str|None, "bold": bool|None}
+        self._user_fmt: dict[tuple[int, int], dict] = {}
+
+        file_name = Path(source_file).name if source_file else "No file"
+        self.setWindowTitle(f"Review Table — {file_name}")
+        # Allow maximize / restore to full screen
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
+        self.resize(1400, 700)
+        self.setMinimumSize(900, 500)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
+
+        # ── title row ─────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_row.setSpacing(12)
+        title_lbl = QLabel("Review Table")
+        title_lbl.setObjectName("packshotTableTitle")
+        title_row.addWidget(title_lbl, 0)
+        self.lbl_file_name = QLabel(file_name)
+        self.lbl_file_name.setObjectName("tscCountLabel")
+        title_row.addWidget(self.lbl_file_name, 0)
+        title_row.addStretch(1)
+        self.lbl_row_count = QLabel("Rows: <b>0</b>")
+        self.lbl_row_count.setObjectName("tscCountLabel")
+        self.lbl_row_count.setTextFormat(Qt.TextFormat.RichText)
+        title_row.addWidget(self.lbl_row_count, 0)
+        root_layout.addLayout(title_row)
+
+        # ── main toolbar ──────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+
+        self.btn_rt_delete       = QPushButton("Delete")
+        self.btn_rt_reset        = QPushButton("Reset")
+        self.btn_rt_undo         = QPushButton("Undo")
+        self.btn_rt_reset_filter = QPushButton("Reset Filter")
+        self.btn_rt_add_row      = QPushButton("Add Row")
+        self.btn_rt_add_col      = QPushButton("Add Column")
+        for _b in (self.btn_rt_delete, self.btn_rt_reset, self.btn_rt_undo,
+                   self.btn_rt_reset_filter, self.btn_rt_add_row, self.btn_rt_add_col):
+            _b.setObjectName("packshotUpdateRowsBtn")
+            toolbar.addWidget(_b, 0)
+
+        toolbar.addSpacing(16)
+        toolbar.addStretch(1)
+
+        self.btn_rt_import_bma = QPushButton("Import another BMA")
+        self.btn_rt_import_bma.setObjectName("tscPrimaryBtn")
+        toolbar.addWidget(self.btn_rt_import_bma, 0)
+
+        self.btn_rt_save = QPushButton("Save")
+        self.btn_rt_save.setObjectName("tscPrimaryBtn")
+        toolbar.addWidget(self.btn_rt_save, 0)
+
+        root_layout.addLayout(toolbar)
+
+        # ── formatting toolbar ────────────────────────────────────────────
+        fmt_toolbar = QHBoxLayout()
+        fmt_toolbar.setSpacing(8)
+        fmt_lbl = QLabel("Format:")
+        fmt_lbl.setObjectName("packshotRowCountLabel")
+        fmt_toolbar.addWidget(fmt_lbl, 0)
+        self.btn_rt_bold       = QPushButton("Bold")
+        self.btn_rt_cell_color = QPushButton("Cell Color")
+        self.btn_rt_text_color = QPushButton("Text Color")
+        for _b in (self.btn_rt_bold, self.btn_rt_cell_color, self.btn_rt_text_color):
+            _b.setObjectName("packshotUpdateRowsBtn")
+            fmt_toolbar.addWidget(_b, 0)
+        fmt_toolbar.addStretch(1)
+        root_layout.addLayout(fmt_toolbar)
+
+        # ── table ──────────────────────────────────────────────────────────
+        headers, rows = self._load_sheet(source_file)
+        self._headers = headers
+        col_count = max(len(headers), 1)
+        self._column_filters = {i: None for i in range(col_count)}
+
+        self.table = _ClipboardTableWidget(0, col_count, self)
+        self.table.setObjectName("packshotClipboardTable")
+
+        # Accent header view (replaces default horizontal header)
+        self._header_view = self._AccentHeaderView(self._compute_accent_cols(), self.table)
+        self._header_view.setDefaultSectionSize(140)
+        self._header_view.setStretchLastSection(True)
+        self._header_view.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._header_view.sectionClicked.connect(self._on_header_clicked)
+        self._header_view.sectionDoubleClicked.connect(self._on_filter_header_clicked)
+        self.table.setHorizontalHeader(self._header_view)
+
+        self._refresh_header_labels()
+        self.table.verticalHeader().setVisible(True)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+
+        self._populate_table(rows)
+        root_layout.addWidget(self.table)
+
+        # Install HBM lookup delegate on the Head Bom Mat column
+        self._install_hbm_delegate()
+
+        # Store original data for full Reset
+        self._original_snapshot = [list(r) for r in self._get_table_snapshot()]
+        self._original_headers  = list(self._headers)
+
+        self._push_undo_snapshot(force=True)
+        self._update_row_count()
+
+        # ── signals ────────────────────────────────────────────────────────
+        self.btn_rt_delete.clicked.connect(self._on_delete_clicked)
+        self.btn_rt_reset.clicked.connect(self._on_reset_clicked)
+        self.btn_rt_undo.clicked.connect(self._on_undo_clicked)
+        self.btn_rt_reset_filter.clicked.connect(self._on_reset_filter_clicked)
+        self.btn_rt_add_row.clicked.connect(self._on_add_row)
+        self.btn_rt_add_col.clicked.connect(self._on_add_col)
+        self.btn_rt_import_bma.clicked.connect(self._on_import_bma_clicked)
+        self.btn_rt_save.clicked.connect(self._on_save_clicked)
+        self.btn_rt_bold.clicked.connect(self._on_format_bold)
+        self.btn_rt_cell_color.clicked.connect(self._on_format_cell_color)
+        self.btn_rt_text_color.clicked.connect(self._on_format_text_color)
+        self.table.itemChanged.connect(self._on_item_changed)
+
+        self._apply_stylesheet()
+
+    # ── sheet loader ───────────────────────────────────────────────────────
+    @staticmethod
+    def _load_sheet(file_path: str) -> tuple[list[str], list[list[str]]]:
+        """Read body_map_IDH sheet; return (headers, data_rows) as plain strings."""
+        try:
+            import pandas as pd
+            df = pd.read_excel(
+                file_path,
+                sheet_name=_ReviewTableDialog._SHEET_NAME,
+                engine="calamine",
+                dtype=str,
+            )
+            df = df.fillna("")
+            return list(df.columns), [list(r) for r in df.values.tolist()]
+        except Exception as exc:
+            return [], []
+
+    # ── table helpers ──────────────────────────────────────────────────────
+    def _compute_accent_cols(self) -> set[int]:
+        lower_headers = [h.strip().lower() for h in self._headers]
+        result: set[int] = set()
+        for name in self._ACCENT_HEADERS:
+            key = name.strip().lower()
+            if key in lower_headers:
+                result.add(lower_headers.index(key))
+        return result
+
+    def _apply_rule_formatting(self, item: "QTableWidgetItem", col_idx: int, value: str) -> None:
+        """Apply rule-based background / foreground / bold to item."""
+        if col_idx >= len(self._headers):
+            return
+        header_key = self._headers[col_idx].strip().lower()
+        val_lower  = value.strip().lower()
+
+        # Reset to defaults
+        item.setBackground(Qt.GlobalColor.transparent)
+        item.setForeground(QColor("#111111"))
+        font = item.font()
+        font.setBold(False)
+        item.setFont(font)
+
+        if header_key == "hit type":
+            rule = self._HIT_TYPE_RULES.get(val_lower)
+            if rule:
+                if rule["bg"]:
+                    item.setBackground(QColor(rule["bg"]))
+                if rule["fg"]:
+                    item.setForeground(QColor(rule["fg"]))
+                if rule["bold"]:
+                    font.setBold(True)
+                    item.setFont(font)
+        elif header_key == "master idh build":
+            if val_lower in self._IDH_BUILD_RULES:
+                rule = self._IDH_BUILD_RULES[val_lower]
+                if rule["bg"]:
+                    item.setBackground(QColor(rule["bg"]))
+            elif "na" in val_lower and val_lower:
+                item.setBackground(QColor(self._IDH_BUILD_NA_BG))
+
+    def _apply_user_formatting(self, item: "QTableWidgetItem", r: int, c: int) -> None:
+        """Apply user-stored overrides on top of rule-based styling."""
+        fmt = self._user_fmt.get((r, c))
+        if not fmt:
+            return
+        if fmt.get("bg"):
+            item.setBackground(QColor(fmt["bg"]))
+        if fmt.get("fg"):
+            item.setForeground(QColor(fmt["fg"]))
+        if fmt.get("bold") is not None:
+            font = item.font()
+            font.setBold(fmt["bold"])
+            item.setFont(font)
+
+    def _populate_table(self, rows: list[list[str]]) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(rows))
+        col_count = self.table.columnCount()
+        for r, row_data in enumerate(rows):
+            for c in range(col_count):
+                val = str(row_data[c]) if c < len(row_data) else ""
+                item = QTableWidgetItem(val)
+                self._apply_rule_formatting(item, c, val)
+                self._apply_user_formatting(item, r, c)
+                self.table.setItem(r, c, item)
+        self.table.blockSignals(False)
+
+    def _get_table_snapshot(self) -> list[list[str]]:
+        return [
+            [(self.table.item(r, c).text() if self.table.item(r, c) else "")
+             for c in range(self.table.columnCount())]
+            for r in range(self.table.rowCount())
+        ]
+
+    def _refresh_header_labels(self) -> None:
+        labels = []
+        for idx, base in enumerate(self._headers):
+            has_filter = self._column_filters.get(idx) is not None
+            labels.append(f"{base} {'▾*' if has_filter else '▾'}")
+        self.table.setHorizontalHeaderLabels(labels)
+        # Update accent columns on the custom header view (if already created)
+        if hasattr(self, "_header_view"):
+            self._header_view.set_highlight_cols(self._compute_accent_cols())
+
+    def _update_row_count(self) -> None:
+        visible = sum(1 for r in range(self.table.rowCount()) if not self.table.isRowHidden(r))
+        self.lbl_row_count.setText(f"Rows: <b>{visible}</b>")
+
+    def _install_hbm_delegate(self) -> None:
+        """Set the HBM button delegate on the Head Bom Mat column (if present)."""
+        lower = [h.strip().lower() for h in self._headers]
+        if self._HBM_COL.lower() in lower:
+            col = lower.index(self._HBM_COL.lower())
+            delegate = self._HBMButtonDelegate(self._on_hbm_lookup, self.table)
+            self.table.setItemDelegateForColumn(col, delegate)
+
+    def _on_hbm_lookup(self, hbm_value: str) -> None:
+        """Look up hbm_value in all tracker files and show a popup with matching row data."""
+        if not hbm_value:
+            QMessageBox.information(self, "Lookup", "Cell is empty — nothing to look up.")
+            return
+        if not self._tracker_files:
+            QMessageBox.information(self, "No Trackers",
+                                    "No Project Tracker files loaded.\n"
+                                    "Set the Project Tracker field in the Review Project panel first.")
+            return
+
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Error", "pandas is required for tracker lookup.")
+            return
+
+        IDH_ALIASES = {"idh number", "idh", "idh no", "idh no.", "idh_number"}
+        results: list[tuple[str, list[str], list[str]]] = []  # (filename, headers, values)
+
+        def _normalise_id(v: str) -> str:
+            """Strip whitespace and trailing .0 so numeric IDs match regardless of type."""
+            v = v.strip()
+            if v.endswith(".0") and v[:-2].isdigit():
+                v = v[:-2]
+            return v.lower()
+
+        def _find_header_row(xl, sheet: str) -> int | None:
+            """Scan the first 20 rows to find the row whose cells contain an IDH-like header."""
+            raw = xl.parse(sheet, header=None, dtype=str).fillna("")
+            for row_idx in range(min(20, len(raw))):
+                row_vals = [str(v).strip().lower() for v in raw.iloc[row_idx]]
+                if any(v in IDH_ALIASES for v in row_vals):
+                    return row_idx
+            return None
+
+        for tf in self._tracker_files:
+            from pathlib import Path as _P
+            if not _P(tf).exists():
+                continue
+            try:
+                xl = pd.ExcelFile(tf, engine="calamine")
+                tracker_sheets = [s for s in xl.sheet_names if "tracker" in s.lower()]
+                for sheet in tracker_sheets:
+                    try:
+                        header_row = _find_header_row(xl, sheet)
+                        if header_row is None:
+                            continue
+                        df = xl.parse(sheet, header=header_row, dtype=str).fillna("")
+                        # Find IDH column
+                        idh_col = next(
+                            (c for c in df.columns if str(c).strip().lower() in IDH_ALIASES),
+                            None,
+                        )
+                        if idh_col is None:
+                            continue
+                        target = _normalise_id(hbm_value)
+                        match = df[df[idh_col].apply(lambda x: _normalise_id(str(x))) == target]
+                        if match.empty:
+                            continue
+                        for _, row in match.iterrows():
+                            results.append((
+                                f"{_P(tf).name} / {sheet}",
+                                list(df.columns),
+                                [str(row[c]) for c in df.columns],
+                            ))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if not results:
+            QMessageBox.information(self, "Not Found",
+                                    f"No matching row found for IDH: {hbm_value}\n\n"
+                                    f"Searched {len(self._tracker_files)} tracker file(s).")
+            return
+
+        # Show popup dialog with results
+        _ACCENT_COLS  = {"idh number", "idh name"}
+        _YELLOW_COLS  = {"packaging size", "packaging type"}
+        _HDR_BG       = QColor("#111F35")
+        _ACCENT_BG    = QColor("#D02752")
+        _YELLOW_BG    = QColor("#FFD150")
+        _HDR_FG       = QColor("#FFFFFF")
+        _DARK_FG      = QColor("#000000")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Tracker Info — {hbm_value}")
+        dlg.setMinimumWidth(800)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(0, 0, 0, 10)
+        v.setSpacing(0)
+
+        for source_label, headers, values in results:
+            tbl = QTableWidget(1, len(headers), dlg)
+            tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            tbl.verticalHeader().setVisible(False)
+            tbl.horizontalHeader().setStretchLastSection(True)
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+            tbl.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            tbl.setShowGrid(True)
+
+            # Style header items
+            for c, col_name in enumerate(headers):
+                hdr_item = QTableWidgetItem(col_name)
+                key = col_name.strip().lower()
+                if key in _ACCENT_COLS:
+                    hdr_item.setBackground(_ACCENT_BG)
+                    hdr_item.setForeground(_HDR_FG)
+                elif key in _YELLOW_COLS:
+                    hdr_item.setBackground(_YELLOW_BG)
+                    hdr_item.setForeground(_DARK_FG)
+                else:
+                    hdr_item.setBackground(_HDR_BG)
+                    hdr_item.setForeground(_HDR_FG)
+                f = hdr_item.font()
+                f.setBold(True)
+                hdr_item.setFont(f)
+                tbl.setHorizontalHeaderItem(c, hdr_item)
+
+            for c, val in enumerate(values):
+                tbl.setItem(0, c, QTableWidgetItem(val))
+
+            tbl.resizeColumnsToContents()
+            tbl.setRowHeight(0, 34)
+            # Use frameWidth so borders are included in the height
+            frame = tbl.frameWidth() * 2
+            tbl.setFixedHeight(tbl.horizontalHeader().sizeHint().height() + 34 + frame + 2)
+            v.addWidget(tbl)
+
+        v.addSpacing(8)
+        btn_close = QPushButton("Close")
+        btn_close.setObjectName("packshotUpdateRowsBtn")
+        btn_close.clicked.connect(dlg.accept)
+        h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 10, 0)
+        h.addStretch(1)
+        h.addWidget(btn_close)
+        v.addLayout(h)
+        dlg.adjustSize()
+        dlg.exec()
+
+    # ── undo stack ─────────────────────────────────────────────────────────
+    def _push_undo_snapshot(self, force: bool = False) -> None:
+        if self._is_restoring_undo or (self._is_batch_edit and not force):
+            return
+        snap = self._get_table_snapshot()
+        if self._undo_stack and self._undo_stack[-1] == snap:
+            return
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > 50:
+            self._undo_stack = self._undo_stack[-50:]
+
+    def _on_table_batch_edit_begin(self) -> None:
+        self._is_batch_edit = True
+
+    def _on_table_batch_edit_end(self) -> None:
+        self._is_batch_edit = False
+        self._push_undo_snapshot()
+
+    def _on_item_changed(self, item: "QTableWidgetItem") -> None:
+        self.table.blockSignals(True)
+        try:
+            r, c = item.row(), item.column()
+            self._apply_rule_formatting(item, c, item.text())
+            self._apply_user_formatting(item, r, c)
+        finally:
+            self.table.blockSignals(False)
+        self._push_undo_snapshot()
+
+    # ── toolbar handlers ───────────────────────────────────────────────────
+    def _on_delete_clicked(self) -> None:
+        """Delete selected rows; if a column header was clicked, delete that column."""
+        sel_model = self.table.selectionModel()
+        # full columns selected?
+        selected_cols = sorted(
+            {idx.column() for idx in self.table.selectedIndexes()
+             if sel_model.isColumnSelected(idx.column(), self.table.rootIndex())},
+            reverse=True,
+        )
+        if selected_cols:
+            self._push_undo_snapshot(force=True)
+            for c in selected_cols:
+                self.table.removeColumn(c)
+                self._headers.pop(c) if c < len(self._headers) else None
+            # rebuild filter keys
+            self._column_filters = {i: None for i in range(self.table.columnCount())}
+            self._refresh_header_labels()
+            self._push_undo_snapshot(force=True)
+            return
+        # rows
+        selected_rows = sorted(
+            {idx.row() for idx in self.table.selectedIndexes()},
+            reverse=True,
+        )
+        if not selected_rows:
+            return
+        self._push_undo_snapshot(force=True)
+        for r in selected_rows:
+            self.table.removeRow(r)
+        self._push_undo_snapshot(force=True)
+        self._update_row_count()
+
+    def _on_reset_clicked(self) -> None:
+        """Restore the table to its original loaded state."""
+        reply = QMessageBox.question(
+            self, "Reset Table",
+            "Reset the table to its original loaded state? All unsaved changes will be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._headers  = list(self._original_headers)
+        self._user_fmt = {}
+        col_count = len(self._headers)
+        self.table.blockSignals(True)
+        self.table.setColumnCount(col_count)
+        self._column_filters = {i: None for i in range(col_count)}
+        self._refresh_header_labels()
+        self._populate_table(self._original_snapshot)
+        self.table.blockSignals(False)
+        self._undo_stack.clear()
+        self._push_undo_snapshot(force=True)
+        self._apply_filters()
+        self._update_row_count()
+
+    def _on_undo_clicked(self) -> None:
+        if len(self._undo_stack) < 2:
+            return
+        self._undo_stack.pop()
+        snapshot = self._undo_stack[-1]
+        self._is_restoring_undo = True
+        self.table.blockSignals(True)
+        col_count = self.table.columnCount()
+        self.table.setRowCount(len(snapshot))
+        for r, row_data in enumerate(snapshot):
+            for c in range(col_count):
+                val = row_data[c] if c < len(row_data) else ""
+                item = self.table.item(r, c)
+                if item is None:
+                    item = QTableWidgetItem(val)
+                    self.table.setItem(r, c, item)
+                else:
+                    item.setText(val)
+                self._apply_rule_formatting(item, c, val)
+                self._apply_user_formatting(item, r, c)
+        self.table.blockSignals(False)
+        self._is_restoring_undo = False
+        self._update_row_count()
+
+    def _on_add_row(self) -> None:
+        """Insert a blank row AFTER the currently selected row (or at end if none selected)."""
+        self._push_undo_snapshot(force=True)
+        current_row = self.table.currentRow()
+        insert_at = (current_row + 1) if current_row >= 0 else self.table.rowCount()
+        self.table.insertRow(insert_at)
+        for c in range(self.table.columnCount()):
+            self.table.setItem(insert_at, c, QTableWidgetItem(""))
+        self._push_undo_snapshot(force=True)
+        self._update_row_count()
+
+    def _on_add_col(self) -> None:
+        """Insert a blank column AFTER the currently selected column (or at end if none selected)."""
+        col_name, ok = QInputDialog.getText(self, "Add Column", "Column name:")
+        if not ok or not col_name.strip():
+            return
+        col_name = col_name.strip()
+        self._push_undo_snapshot(force=True)
+        current_col = self.table.currentColumn()
+        insert_at = (current_col + 1) if current_col >= 0 else self.table.columnCount()
+        self.table.blockSignals(True)
+        self.table.insertColumn(insert_at)
+        self._headers.insert(insert_at, col_name)
+        # Rebuild filter dict, shifting indices for columns at/after insert_at
+        old_filters = self._column_filters.copy()
+        self._column_filters = {}
+        for old_c, fval in old_filters.items():
+            new_c = old_c if old_c < insert_at else old_c + 1
+            self._column_filters[new_c] = fval
+        self._column_filters[insert_at] = None
+        self._refresh_header_labels()
+        for r in range(self.table.rowCount()):
+            self.table.setItem(r, insert_at, QTableWidgetItem(""))
+        self.table.blockSignals(False)
+        self._push_undo_snapshot(force=True)
+
+    def _on_reset_filter_clicked(self) -> None:
+        for k in self._column_filters:
+            self._column_filters[k] = None
+        self._apply_filters()
+
+    # ── formatting handlers ────────────────────────────────────────────────
+    def _on_format_bold(self) -> None:
+        """Toggle bold on all selected cells."""
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        all_bold = all(item.font().bold() for item in selected)
+        target = not all_bold
+        self.table.blockSignals(True)
+        for item in selected:
+            r, c = item.row(), item.column()
+            fmt = self._user_fmt.setdefault((r, c), {})
+            fmt["bold"] = target
+            font = item.font()
+            font.setBold(target)
+            item.setFont(font)
+        self.table.blockSignals(False)
+
+    def _on_format_cell_color(self) -> None:
+        """Pick a background color and apply to selected cells."""
+        color = QColorDialog.getColor(parent=self)
+        if not color.isValid():
+            return
+        hex_color = color.name()
+        self.table.blockSignals(True)
+        for item in self.table.selectedItems():
+            r, c = item.row(), item.column()
+            self._user_fmt.setdefault((r, c), {})["bg"] = hex_color
+            item.setBackground(QColor(hex_color))
+        self.table.blockSignals(False)
+
+    def _on_format_text_color(self) -> None:
+        """Pick a text color and apply to selected cells."""
+        color = QColorDialog.getColor(parent=self)
+        if not color.isValid():
+            return
+        hex_color = color.name()
+        self.table.blockSignals(True)
+        for item in self.table.selectedItems():
+            r, c = item.row(), item.column()
+            self._user_fmt.setdefault((r, c), {})["fg"] = hex_color
+            item.setForeground(QColor(hex_color))
+        self.table.blockSignals(False)
+
+    def _on_import_bma_clicked(self) -> None:
+        """Open another BMA file and append rows whose Head Bom Mat doesn't yet exist."""
+        from pathlib import Path
+        start = self._sdc_folder or ""
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Select BMA/SDC file to import", start,
+            "Excel Files (*.xlsx *.xls *.xlsm)",
+        )
+        if not file or not Path(file).exists():
+            return
+
+        new_headers, new_rows = self._load_sheet(file)
+        if not new_headers:
+            QMessageBox.warning(self, "Import Error",
+                                f"Could not read sheet '{self._SHEET_NAME}' from:\n{file}")
+            return
+
+        # Determine Head Bom Mat column index in current table
+        existing_hbm_col = next(
+            (i for i, h in enumerate(self._headers) if h.strip().lower() == self._HBM_COL.lower()),
+            None,
+        )
+        # Collect existing Head Bom Mat values
+        existing_hbm_vals: set[str] = set()
+        if existing_hbm_col is not None:
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, existing_hbm_col)
+                val = item.text().strip() if item else ""
+                if val:
+                    existing_hbm_vals.add(val.lower())
+
+        # Index mapping: new_col → current_col (match by header name, case-insensitive)
+        header_map: dict[int, int] = {}
+        current_header_lower = [h.strip().lower() for h in self._headers]
+        for new_c, new_h in enumerate(new_headers):
+            key = new_h.strip().lower()
+            if key in current_header_lower:
+                header_map[new_c] = current_header_lower.index(key)
+
+        # Find Head Bom Mat col in new file
+        new_hbm_col = next(
+            (i for i, h in enumerate(new_headers) if h.strip().lower() == self._HBM_COL.lower()),
+            None,
+        )
+
+        added = 0
+        self._push_undo_snapshot(force=True)
+        self.table.blockSignals(True)
+
+        for row_data in new_rows:
+            # Check Head Bom Mat uniqueness
+            if new_hbm_col is not None:
+                hbm_val = str(row_data[new_hbm_col]).strip() if new_hbm_col < len(row_data) else ""
+                if hbm_val.lower() in existing_hbm_vals:
+                    continue
+                if hbm_val:
+                    existing_hbm_vals.add(hbm_val.lower())
+
+            # Append row
+            insert_row = self.table.rowCount()
+            self.table.insertRow(insert_row)
+            for c in range(self.table.columnCount()):
+                self.table.setItem(insert_row, c, QTableWidgetItem(""))
+            for new_c, cur_c in header_map.items():
+                val = str(row_data[new_c]) if new_c < len(row_data) else ""
+                item = QTableWidgetItem(val)
+                self._apply_rule_formatting(item, cur_c, val)
+                self.table.setItem(insert_row, cur_c, item)
+            added += 1
+
+        self.table.blockSignals(False)
+        self._push_undo_snapshot(force=True)
+        self._update_row_count()
+        QMessageBox.information(self, "Import Complete", f"{added} new row(s) added.")
+
+    def _on_save_clicked(self) -> None:
+        """Save table as review_YYYY_MM_DD_HH_MM.xlsx with full formatting in the Project Review folder."""
+        from pathlib import Path
+        from datetime import datetime
+        try:
+            import openpyxl
+            from openpyxl.styles import (PatternFill, Font, Alignment,
+                                         Border, Side, GradientFill)
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            QMessageBox.warning(self, "Error", "openpyxl is required to save.")
+            return
+
+        # ── output path ────────────────────────────────────────────────────
+        if self._project_review_folder and Path(self._project_review_folder).is_dir():
+            out_dir = Path(self._project_review_folder)
+        elif self._source_file:
+            out_dir = Path(self._source_file).parent
+        else:
+            out_dir = Path.cwd()
+        ts = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        out_path = out_dir / f"review_{ts}.xlsx"
+
+        # ── helpers ────────────────────────────────────────────────────────
+        def _hex_fill(hex_color: str | None) -> PatternFill | None:
+            if not hex_color:
+                return None
+            return PatternFill("solid", fgColor=hex_color.lstrip("#"))
+
+        def _hex_font(hex_color: str | None = None, bold: bool = False,
+                      name: str = "Calibri", size: int = 11) -> Font:
+            kw: dict = {"name": name, "size": size, "bold": bold}
+            if hex_color:
+                kw["color"] = hex_color.lstrip("#")
+            return Font(**kw)
+
+        thin = Side(style="thin", color="D0D0D0")
+        cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # Accent header cols (0-based indices)
+        accent_col_indices: set[int] = self._compute_accent_cols()
+        hbm_col = next(
+            (i for i, h in enumerate(self._headers)
+             if h.strip().lower() == self._HBM_COL.lower()),
+            None,
+        )
+
+        # ── build workbook ─────────────────────────────────────────────────
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = self._SHEET_NAME
+
+        col_count = self.table.columnCount()
+        row_count = self.table.rowCount()
+
+        # ── header row (row 1) ─────────────────────────────────────────────
+        for c_idx, col_name in enumerate(self._headers):
+            xl_col = c_idx + 1
+            cell = ws.cell(row=1, column=xl_col, value=col_name)
+            if c_idx in accent_col_indices:
+                cell.fill   = _hex_fill("#D02752")
+                cell.font   = _hex_font("#FFFFFF", bold=True)
+            else:
+                cell.fill   = _hex_fill("#111F35")
+                cell.font   = _hex_font("#FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            cell.border    = cell_border
+
+        ws.row_dimensions[1].height = 22
+
+        # ── data rows ──────────────────────────────────────────────────────
+        xl_row = 2
+        for r in range(row_count):
+            if self.table.isRowHidden(r):
+                continue
+            for c in range(col_count):
+                tbl_item = self.table.item(r, c)
+                raw_text = tbl_item.text() if tbl_item else ""
+                # Strip the delegate arrow hint (not visible in xlsx anyway)
+                xl_cell = ws.cell(row=xl_row, column=c + 1, value=raw_text)
+
+                # Start with defaults
+                bg_hex: str | None = None
+                fg_hex: str | None = None
+                bold = False
+
+                # Rule-based formatting (same logic as _apply_rule_formatting)
+                col_name = self._headers[c] if c < len(self._headers) else ""
+                col_lower = col_name.strip().lower()
+                val_lower  = raw_text.strip().lower()
+
+                if col_lower == "hit type":
+                    rule = self._HIT_TYPE_RULES.get(val_lower)
+                    if rule:
+                        bg_hex = rule.get("bg")
+                        fg_hex = rule.get("fg")
+                        bold   = rule.get("bold", False)
+
+                elif col_lower == "master idh build":
+                    rule = self._IDH_BUILD_RULES.get(val_lower)
+                    if rule:
+                        bg_hex = rule.get("bg")
+                        fg_hex = rule.get("fg")
+                        bold   = rule.get("bold", False)
+                    elif val_lower and "na" in val_lower:
+                        bg_hex = self._IDH_BUILD_NA_BG
+
+                # User formatting overrides
+                user_fmt = self._user_fmt.get((r, c), {})
+                if "bg" in user_fmt and user_fmt["bg"] is not None:
+                    bg_hex = user_fmt["bg"]  # already a "#RRGGBB" hex string
+                if "fg" in user_fmt and user_fmt["fg"] is not None:
+                    fg_hex = user_fmt["fg"]  # already a "#RRGGBB" hex string
+                if "bold" in user_fmt:
+                    bold = user_fmt["bold"]
+
+                if bg_hex:
+                    xl_cell.fill = _hex_fill(bg_hex)
+                if fg_hex or bold:
+                    xl_cell.font = _hex_font(fg_hex, bold=bold)
+                xl_cell.alignment = Alignment(vertical="center", wrap_text=False)
+                xl_cell.border    = cell_border
+
+            ws.row_dimensions[xl_row].height = 18
+            xl_row += 1
+
+        # ── column widths (based on content) ───────────────────────────────
+        for c_idx in range(col_count):
+            col_letter = get_column_letter(c_idx + 1)
+            # Measure header + all data cells
+            max_len = len(self._headers[c_idx]) if c_idx < len(self._headers) else 8
+            for r in range(row_count):
+                if self.table.isRowHidden(r):
+                    continue
+                item = self.table.item(r, c_idx)
+                if item:
+                    max_len = max(max_len, len(item.text()))
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 50)
+
+        # ── freeze top row + autofilter ────────────────────────────────────
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        try:
+            wb.save(str(out_path))
+            QMessageBox.information(self, "Saved", f"Saved to:\n{out_path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Save Error", str(exc))
+
+    # ── filter helpers ─────────────────────────────────────────────────────
+    def _on_header_clicked(self, column: int) -> None:
+        self.table.selectColumn(column)
+
+    def _on_filter_header_clicked(self, column: int) -> None:
+        values: list[str] = []
+        seen: set[str] = set()
+        has_blank = False
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            item = self.table.item(row, column)
+            text = item.text().strip() if item else ""
+            if text == "":
+                has_blank = True
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+
+        value_pairs = [(v, v) for v in values]
+        if has_blank:
+            value_pairs.append((self._BLANK_FILTER, "(Blanks)"))
+
+        popup = self._FilterPopup(value_pairs, self._column_filters.get(column), self)
+        popup.move(QCursor.pos())
+        if popup.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = popup.get_selected_values()
+        self._column_filters[column] = None if len(selected) == len(value_pairs) else selected
+        self._apply_filters()
+
+    def _apply_filters(self) -> None:
+        for row in range(self.table.rowCount()):
+            visible = True
+            for col, fval in self._column_filters.items():
+                if fval is None:
+                    continue
+                item = self.table.item(row, col)
+                text = item.text().strip() if item else ""
+                key = self._BLANK_FILTER if text == "" else text
+                if key not in fval:
+                    visible = False
+                    break
+            self.table.setRowHidden(row, not visible)
+        self._refresh_header_labels()
+        self._update_row_count()
+
+    # ── stylesheet ─────────────────────────────────────────────────────────
+    def _apply_stylesheet(self) -> None:
+        self.setStyleSheet(
+            """
+            QDialog { background-color: #F4F4F4; }
+
+            QTableWidget#packshotClipboardTable {
+                background-color: #FFFFFF; color: #111111;
+                border: 1px solid #A9A9A9; gridline-color: #B8B8B8;
+                selection-background-color: #DCE6F5; selection-color: #111111;
+                font-family: "Segoe UI"; font-size: 12px;
+            }
+            QTableWidget#packshotClipboardTable QHeaderView::section {
+                background-color: #111F35; color: #FFFFFF;
+                border: 1px solid #7D8694; padding: 6px 8px; font-weight: 700;
+            }
+            QTableWidget#packshotClipboardTable QTableCornerButton::section {
+                background-color: #111F35; border: 1px solid #7D8694;
+            }
+
+            QLabel#packshotTableTitle {
+                color: #111F35; font-family: "Segoe UI";
+                font-size: 18px; font-weight: 800;
+            }
+            QLabel#tscCountLabel {
+                color: #111F35; font-family: "Segoe UI";
+                font-size: 13px; font-weight: 600;
+            }
+            QLabel#packshotRowCountLabel {
+                color: #111F35; font-family: "Segoe UI";
+                font-size: 13px; font-weight: 600;
+            }
+            QLineEdit#packshotRowCountInput {
+                background-color: #FFFFFF; color: #111111;
+                border: 1px solid #A9A9A9; border-radius: 8px;
+                min-height: 30px; padding: 0 8px;
+                font-family: "Segoe UI"; font-size: 12px;
+            }
+
+            QPushButton#packshotUpdateRowsBtn {
+                background-color: #9EA3AB; color: #000000;
+                border: 1px solid #8B9098; border-radius: 8px;
+                min-height: 30px; padding: 0 12px;
+                font-family: "Segoe UI"; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#packshotUpdateRowsBtn:pressed {
+                background-color: #111F35; color: #FFFFFF; border: 1px solid #111F35;
+            }
+
+            QPushButton#tscPrimaryBtn {
+                background-color: #111F35; color: #FFFFFF;
+                border: 1px solid #111F35; border-radius: 8px;
+                min-height: 30px; padding: 0 12px;
+                font-family: "Segoe UI"; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#tscPrimaryBtn:pressed {
+                background-color: #0e1726; color: #FFFFFF; border: 1px solid #0e1726;
+            }
+            """
+        )
+
+
 class _MapperOption1TableDialog(QDialog):
     def __init__(self, parent: QWidget | None = None, start_dir: str = "", export_dir: str = "") -> None:
         super().__init__(parent)
@@ -5527,7 +6661,7 @@ class _SettingsDialog(QDialog):
     _PROJECT_HINT = (
         "HAT Dashboard will create the named project folder at the chosen location "
         "with sub-folders: Packshot Naming Generator, SAP Data Reformat, "
-        "SAP Data Compare, and Project Viewer. "
+        "SAP Data Compare, and Project Review. "
         "The project folder path is saved to AppData."
     )
 
@@ -7122,7 +8256,7 @@ class NewUIWindow(QMainWindow):
         master_actions_layout.addStretch(1)
         self.left_nav_stack.addWidget(self.master_left)  # index 1
 
-        # ── PROJECT left buttons: PNG, SDR, SDC, Project Viewer ───────────────────
+        # ── PROJECT left buttons: PNG, SDR, SDC, Project Review ───────────────────
         self.project_left = QWidget()
         project_actions_layout = QVBoxLayout(self.project_left)
         project_actions_layout.setContentsMargins(0, 10, 0, 0)
@@ -7446,6 +8580,8 @@ class NewUIWindow(QMainWindow):
     def _on_project_viewer_clicked(self) -> None:
         self.combined_panel_stack.setCurrentWidget(self.right_panel_project_viewer)
         self.combined_right_panel.setVisible(True)
+        if self._use_root_folders:
+            self._autofill_project_page()
 
     def _on_other_tools_clicked(self) -> None:
         self.combined_panel_stack.setCurrentWidget(self.right_panel_other_tools)
@@ -8117,7 +9253,7 @@ class NewUIWindow(QMainWindow):
         self.right_panel_packshot = self._create_packshot_naming_page()
         self.mapper_right_panel_reformat = self._create_mapper_reformat_page()
         self.mapper_right_panel_compare = self._create_mapper_compare_page()
-        self.right_panel_project_viewer = QWidget()
+        self.right_panel_project_viewer = self._create_project_review_page()
         self.right_panel_other_tools = self._create_other_tools_page()
         self.combined_panel_stack.addWidget(self.right_panel_blank)
         self.combined_panel_stack.addWidget(self.right_panel_tracker)
@@ -8928,6 +10064,10 @@ class NewUIWindow(QMainWindow):
             self.input_mapper_output_location,
         ):
             field.clear()
+        if hasattr(self, "input_pr_source_bma"):
+            self.input_pr_source_bma.clear()
+        if hasattr(self, "input_pr_project_tracker"):
+            self.input_pr_project_tracker.clear()
         self._update_tsc_input_count()
         self._update_png_input_count()
         self._update_sap_input_count()
@@ -9124,6 +10264,64 @@ class NewUIWindow(QMainWindow):
         sdc_out = str(Path(project_folder) / "SAP Data Compare")
         if Path(sdc_out).is_dir():
             self.lbl_compare_output_location.setText(sdc_out)
+
+        # ── Project Review — Source BMA ────────────────────────────────────
+        if hasattr(self, "input_pr_source_bma"):
+            # New Review mode — link from SAP Data Compare ("sdc" in filename)
+            # Continue from Existing mode — link from Project Review ("review" in filename)
+            if self.radio_pr_continue.isChecked():
+                pr_folder = Path(project_folder) / "Project Review"
+                if pr_folder.is_dir():
+                    review_files = sorted(
+                        f for f in pr_folder.iterdir()
+                        if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+                        and "review" in f.stem.lower()
+                    )
+                    if review_files:
+                        chosen = review_files[0] if len(review_files) == 1 else self._pick_latest_review_file(review_files)
+                        self.input_pr_source_bma.setText(str(chosen))
+                    else:
+                        self.input_pr_source_bma.clear()
+                else:
+                    self.input_pr_source_bma.clear()
+            else:  # New Review
+                sdc_folder = Path(project_folder) / "SAP Data Compare"
+                if sdc_folder.is_dir():
+                    sdc_files = sorted(
+                        f for f in sdc_folder.iterdir()
+                        if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+                        and "sdc" in f.stem.lower()
+                    )
+                    if sdc_files:
+                        self.input_pr_source_bma.setText(", ".join(str(f) for f in sdc_files))
+                    else:
+                        self.input_pr_source_bma.clear()
+                else:
+                    self.input_pr_source_bma.clear()
+
+        # ── Project Review — Project Tracker ───────────────────────────────
+        if hasattr(self, "input_pr_project_tracker"):
+            self._autofill_pr_tracker(project_folder)
+
+    def _autofill_pr_tracker(self, project_folder: str) -> None:
+        """Scan the Project Review folder for Briefing Tracker file(s) and fill the input."""
+        if not hasattr(self, "input_pr_project_tracker"):
+            return
+        from pathlib import Path
+        pr_folder = Path(project_folder) / "Project Review"
+        if not pr_folder.is_dir():
+            self.input_pr_project_tracker.clear()
+            return
+        import re
+        tracker_files = sorted(
+            f for f in pr_folder.iterdir()
+            if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+            and re.search(r'briefing.?tracker', f.stem, re.IGNORECASE)
+        )
+        if tracker_files:
+            self.input_pr_project_tracker.setText(", ".join(str(f) for f in tracker_files))
+        else:
+            self.input_pr_project_tracker.clear()
 
     def _get_active_project_folder(self) -> str:
         """Return full path to the currently selected project folder, or '' if unavailable."""
@@ -9567,6 +10765,235 @@ class NewUIWindow(QMainWindow):
         msg.setText("\n\n".join(parts))
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
+
+    def _create_project_review_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        title = QLabel("Review Project")
+        title.setObjectName("collectorTitle")
+        layout.addWidget(title)
+
+        # ── Mode radio buttons (one row) ───────────────────────────────────
+        self.radio_pr_new_review = QRadioButton("New Review")
+        self.radio_pr_new_review.setObjectName("collectorModeRadio")
+        self.radio_pr_new_review.setChecked(True)
+        self.radio_pr_continue = QRadioButton("Continue from Existing")
+        self.radio_pr_continue.setObjectName("collectorModeRadio")
+
+        self.pr_mode_group = QButtonGroup(page)
+        self.pr_mode_group.setExclusive(True)
+        self.pr_mode_group.addButton(self.radio_pr_new_review)
+        self.pr_mode_group.addButton(self.radio_pr_continue)
+
+        # Row 1: both radios on the same line
+        # Row 2: count label aligned under "Continue from Existing" (col 1)
+        self.lbl_pr_source_bma_count = QLabel("")
+        self.lbl_pr_source_bma_count.setObjectName("inputCountLabel")
+
+        mode_grid = QGridLayout()
+        mode_grid.setContentsMargins(0, 0, 10, 0)
+        mode_grid.setHorizontalSpacing(24)
+        mode_grid.setVerticalSpacing(20)
+        mode_grid.addWidget(self.radio_pr_new_review,       0, 0)
+        mode_grid.addWidget(self.radio_pr_continue,         0, 1)
+        mode_grid.addWidget(self.lbl_pr_source_bma_count,   1, 2, Qt.AlignmentFlag.AlignRight)
+        mode_grid.setColumnStretch(1, 1)  # col 1 stretches; col 2 (label) hugs right edge
+        layout.addLayout(mode_grid)
+
+        # ── Source BMA (browse+edit row) ───────────────────────────────────
+        bma_row = QHBoxLayout()
+        bma_row.setSpacing(12)
+        btn_bma_browse = QPushButton("Source BMA")
+        btn_bma_browse.setObjectName("collectorGrayBtn")
+        btn_bma_browse.clicked.connect(self._on_pr_source_bma_browse)
+        bma_row.addWidget(btn_bma_browse, 0)
+        self.input_pr_source_bma = QLineEdit()
+        self.input_pr_source_bma.setObjectName("collectorLineEdit")
+        self.input_pr_source_bma.setPlaceholderText("Select SDC file(s)…")
+        bma_row.addWidget(self.input_pr_source_bma, 1)
+        layout.addLayout(bma_row)
+
+        # Wire up dynamic count + continue-mode autofill
+        self.input_pr_source_bma.textChanged.connect(self._update_pr_source_bma_count)
+        self.radio_pr_continue.toggled.connect(self._on_pr_mode_toggled)
+
+        # ── Project Tracker (browse+edit row) ──────────────────────────────
+        tracker_row = QHBoxLayout()
+        tracker_row.setSpacing(12)
+        btn_tracker_browse = QPushButton("Project Tracker")
+        btn_tracker_browse.setObjectName("collectorGrayBtn")
+        btn_tracker_browse.clicked.connect(self._on_pr_tracker_browse)
+        tracker_row.addWidget(btn_tracker_browse, 0)
+        self.input_pr_project_tracker = QLineEdit()
+        self.input_pr_project_tracker.setObjectName("collectorLineEdit")
+        self.input_pr_project_tracker.setPlaceholderText("Select Briefing Tracker file(s)…")
+        tracker_row.addWidget(self.input_pr_project_tracker, 1)
+        layout.addLayout(tracker_row)
+
+        layout.addStretch(1)
+
+        # ── Open Review Table button ───────────────────────────────────────
+        run_row = QHBoxLayout()
+        run_row.addStretch(1)
+        self.btn_pr_open_review_table = QPushButton("Open Review Table")
+        self.btn_pr_open_review_table.setObjectName("collectorRunBtn")
+        self.btn_pr_open_review_table.setFixedHeight(50)
+        self.btn_pr_open_review_table.setMinimumWidth(200)
+        self.btn_pr_open_review_table.clicked.connect(self._on_pr_open_review_table_clicked)
+        run_row.addWidget(self.btn_pr_open_review_table)
+        run_row.addStretch(1)
+        layout.addLayout(run_row)
+        layout.addSpacing(8)
+
+        return page
+
+    @staticmethod
+    def _pick_latest_review_file(files: list):
+        """Return the file with the latest date in its stem (YYYYMMDD or YYYY-MM-DD/YYYY_MM_DD).
+        Falls back to the last element in sorted order if no date pattern is found."""
+        import re
+        from datetime import datetime
+
+        def _extract_date(p):
+            stem = p.stem
+            m = re.search(r'(\d{4})(\d{2})(\d{2})', stem)
+            if m:
+                try:
+                    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    pass
+            m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', stem)
+            if m:
+                try:
+                    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    pass
+            return datetime.min
+
+        return max(files, key=_extract_date, default=None)
+
+    def _on_pr_mode_toggled(self, checked: bool) -> None:
+        """When 'Continue from Existing' is selected, autofill Source BMA from Project Review folder."""
+        if not checked:
+            return
+        if not self._use_root_folders:
+            return
+        from pathlib import Path
+        project_folder = self._get_active_project_folder()
+        if not project_folder:
+            return
+        pr_folder = Path(project_folder) / "Project Review"
+        if pr_folder.is_dir():
+            review_files = sorted(
+                f for f in pr_folder.iterdir()
+                if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+                and "review" in f.stem.lower()
+            )
+            if review_files:
+                chosen = review_files[0] if len(review_files) == 1 else self._pick_latest_review_file(review_files)
+                self.input_pr_source_bma.setText(str(chosen))
+            else:
+                self.input_pr_source_bma.clear()
+        else:
+            self.input_pr_source_bma.clear()
+        # Also autofill tracker
+        self._autofill_pr_tracker(project_folder)
+
+    def _update_pr_source_bma_count(self) -> None:
+        """Update the Input files count label for Source BMA."""
+        text = self.input_pr_source_bma.text().strip()
+        count = len([p for p in text.split(",") if p.strip()]) if text else 0
+        lbl = getattr(self, "lbl_pr_source_bma_count", None)
+        if lbl is not None:
+            lbl.setText(f"Input files count: {count}" if count > 0 else "")
+
+    def _on_pr_tracker_browse(self) -> None:
+        """Open file dialog to select one or more Briefing Tracker files."""
+        from pathlib import Path
+        start = ""
+        project_folder = self._get_active_project_folder()
+        if project_folder:
+            pr = Path(project_folder) / "Project Review"
+            start = str(pr) if pr.is_dir() else str(project_folder)
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Briefing Tracker file(s)", start,
+            "Excel Files (*.xlsx *.xls *.xlsm)"
+        )
+        if files:
+            self.input_pr_project_tracker.setText(", ".join(files))
+
+    def _on_pr_source_bma_browse(self) -> None:
+        """Open file dialog to select Source BMA file(s).
+        New Review: multiple files allowed. Continue from Existing: single file only."""
+        from pathlib import Path
+        start = ""
+        project_folder = self._get_active_project_folder()
+        continue_mode = getattr(self, "radio_pr_continue", None) and self.radio_pr_continue.isChecked()
+        if project_folder:
+            if continue_mode:
+                pr = Path(project_folder) / "Project Review"
+                start = str(pr) if pr.is_dir() else str(project_folder)
+            else:
+                sdc = Path(project_folder) / "SAP Data Compare"
+                start = str(sdc) if sdc.is_dir() else str(project_folder)
+        if continue_mode:
+            file, _ = QFileDialog.getOpenFileName(
+                self, "Select Source BMA file", start,
+                "Excel Files (*.xlsx *.xls *.xlsm)"
+            )
+            if file:
+                self.input_pr_source_bma.setText(file)
+        else:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Select Source BMA file(s)", start,
+                "Excel Files (*.xlsx *.xls *.xlsm)"
+            )
+            if files:
+                self.input_pr_source_bma.setText(", ".join(files))
+
+    def _on_pr_open_review_table_clicked(self) -> None:
+        """Open the Review Table dialog for the first selected Source BMA file."""
+        from pathlib import Path
+        text = self.input_pr_source_bma.text().strip()
+        if not text:
+            QMessageBox.warning(self, "No File", "Please select a Source BMA file first.")
+            return
+        # Use the first file listed (continue mode = single file; new review = first of multiple)
+        first_file = text.split(",")[0].strip()
+        if not Path(first_file).exists():
+            QMessageBox.warning(self, "File Not Found", f"File not found:\n{first_file}")
+            return
+        # Determine SDC folder for "Import another BMA" starting directory
+        sdc_folder = ""
+        project_review_folder = ""
+        project_folder = self._get_active_project_folder()
+        if project_folder:
+            from pathlib import Path as _Path
+            sdc = _Path(project_folder) / "SAP Data Compare"
+            if sdc.is_dir():
+                sdc_folder = str(sdc)
+            pr = _Path(project_folder) / "Project Review"
+            pr.mkdir(parents=True, exist_ok=True)
+            project_review_folder = str(pr)
+        # Parse tracker files
+        tracker_files: list[str] = []
+        if hasattr(self, "input_pr_project_tracker"):
+            tf_text = self.input_pr_project_tracker.text().strip()
+            if tf_text:
+                from pathlib import Path as _P2
+                tracker_files = [p.strip() for p in tf_text.split(",") if _P2(p.strip()).exists()]
+        dlg = _ReviewTableDialog(
+            first_file,
+            sdc_folder=sdc_folder,
+            project_review_folder=project_review_folder,
+            tracker_files=tracker_files,
+            parent=None,          # non-modal: no parent → independent window
+        )
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
 
     def _create_other_tools_page(self) -> QWidget:
         page = QWidget()
