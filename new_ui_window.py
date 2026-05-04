@@ -3914,7 +3914,12 @@ class _ReviewTableDialog(QDialog):
     _BLANK_FILTER   = "__BLANK__"
     _SHEET_NAME     = "body_map_IDH"
     _HBM_COL        = "Head Bom Mat"
-    _ACCENT_HEADERS = {"Head Bom Mat", "Master IDH Build", "Hit Type", "Assessment Comments"}
+    _ACCENT_HEADERS = {
+        "Head Bom Mat", "Master IDH Build", "Hit Type",
+        # Assessment Comments — canonical + common spelling variants
+        "Assessment Comments", "Assesment Comments", "Asessment Comments",
+        "Asesment Comments", "Comments", "Coments",
+    }
 
     # Hit Type cell rules (key = lowercase cell value)
     _HIT_TYPE_RULES = {
@@ -4125,6 +4130,7 @@ class _ReviewTableDialog(QDialog):
         self._column_filters: dict[int, set[str] | None] = {}
         # user-applied cell formatting: (row, col) -> {"bg": str|None, "fg": str|None, "bold": bool|None}
         self._user_fmt: dict[tuple[int, int], dict] = {}
+        self._tracker_info_dialogs: list = []  # keep refs to non-modal Tracker Info windows
 
         file_name = Path(source_file).name if source_file else "No file"
         self.setWindowTitle(f"Review Table — {file_name}")
@@ -4452,9 +4458,15 @@ class _ReviewTableDialog(QDialog):
         _HDR_FG       = QColor("#FFFFFF")
         _DARK_FG      = QColor("#000000")
 
-        dlg = QDialog(self)
+        dlg = QDialog()
         dlg.setWindowTitle(f"Tracker Info — {hbm_value}")
         dlg.setMinimumWidth(800)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
         v = QVBoxLayout(dlg)
         v.setContentsMargins(0, 0, 0, 10)
         v.setSpacing(0)
@@ -4501,14 +4513,16 @@ class _ReviewTableDialog(QDialog):
         v.addSpacing(8)
         btn_close = QPushButton("Close")
         btn_close.setObjectName("packshotUpdateRowsBtn")
-        btn_close.clicked.connect(dlg.accept)
+        btn_close.clicked.connect(dlg.close)
         h = QHBoxLayout()
         h.setContentsMargins(0, 0, 10, 0)
         h.addStretch(1)
         h.addWidget(btn_close)
         v.addLayout(h)
         dlg.adjustSize()
-        dlg.exec()
+        self._tracker_info_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda: self._tracker_info_dialogs.remove(dlg) if dlg in self._tracker_info_dialogs else None)
+        dlg.show()
 
     # ── undo stack ─────────────────────────────────────────────────────────
     def _push_undo_snapshot(self, force: bool = False) -> None:
@@ -10993,6 +11007,14 @@ class NewUIWindow(QMainWindow):
             parent=None,          # non-modal: no parent → independent window
         )
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # Keep a Python reference so the GC doesn't collect the window while it's open
+        if not hasattr(self, "_review_table_dialogs"):
+            self._review_table_dialogs = []
+        self._review_table_dialogs.append(dlg)
+        dlg.destroyed.connect(
+            lambda: self._review_table_dialogs.remove(dlg)
+            if dlg in self._review_table_dialogs else None
+        )
         dlg.show()
 
     def _create_other_tools_page(self) -> QWidget:
