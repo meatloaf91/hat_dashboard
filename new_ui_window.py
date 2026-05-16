@@ -58,6 +58,7 @@ from general_functions import clear_other_panel_inputs
 from hat_config import HatConfig
 from body_mapper import CompareParams, run_comparison
 from reference_collector import RefCollectorParams, run_reference_collector
+import review_project
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -4113,6 +4114,277 @@ class _ReviewTableDialog(QDialog):
                 )
             painter.restore()
 
+    # ── nested: Check Duplicate dialog ────────────────────────────────────
+    class _CheckDuplicateDialog(QDialog):
+        """Popup for configuring and running a duplicate check."""
+
+        def __init__(self, parent=None) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Check Duplicate")
+            self.resize(440, 320)
+            self.setMinimumSize(380, 280)
+            self._selected_tracker_files: list[str] = []
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(20, 20, 20, 20)
+            root.setSpacing(12)
+
+            # ── title ──────────────────────────────────────────────────────
+            title = QLabel("Check Duplicate")
+            title.setObjectName("_cdTitle")
+            root.addWidget(title)
+
+            # ── compare with self ──────────────────────────────────────────
+            self.chk_compare_self = QCheckBox("Compare with self")
+            self.chk_compare_self.setObjectName("_cdCheck")
+            root.addWidget(self.chk_compare_self)
+
+            # ── compare with other trackers ────────────────────────────────
+            self.chk_compare_others = QCheckBox("Compare with other trackers")
+            self.chk_compare_others.setObjectName("_cdCheck")
+            root.addWidget(self.chk_compare_others)
+
+            # select trackers row (indented, under 2nd checkbox)
+            tracker_row = QHBoxLayout()
+            tracker_row.setContentsMargins(22, 0, 0, 0)
+            tracker_row.setSpacing(6)
+            self.btn_select_trackers = QPushButton("Select Trackers")
+            self.btn_select_trackers.setObjectName("_cdSecBtn")
+            self.btn_select_trackers.setEnabled(False)
+            tracker_row.addWidget(self.btn_select_trackers, 0)
+            self.edit_selected_trackers = QLineEdit()
+            self.edit_selected_trackers.setObjectName("_cdEdit")
+            self.edit_selected_trackers.setReadOnly(True)
+            self.edit_selected_trackers.setPlaceholderText("No trackers selected")
+            tracker_row.addWidget(self.edit_selected_trackers, 1)
+            root.addLayout(tracker_row)
+
+            # ── field for checking ─────────────────────────────────────────
+            field_row = QHBoxLayout()
+            field_row.setSpacing(8)
+            field_lbl = QLabel("Field for checking:")
+            field_lbl.setObjectName("_cdLabel")
+            field_row.addWidget(field_lbl, 0)
+            self.combo_field = QComboBox()
+            self.combo_field.setObjectName("_cdCombo")
+            self.combo_field.addItems(["IDH", "Basic"])
+            field_row.addWidget(self.combo_field, 1)
+            root.addLayout(field_row)
+
+            root.addStretch(1)
+
+            # ── run button ─────────────────────────────────────────────────
+            run_row = QHBoxLayout()
+            run_row.addStretch(1)
+            self.btn_run = QPushButton("Run Duplicate Check")
+            self.btn_run.setObjectName("_cdRunBtn")
+            self.btn_run.setFixedHeight(50)
+            self.btn_run.setMinimumWidth(200)
+            run_row.addWidget(self.btn_run)
+            run_row.addStretch(1)
+            root.addLayout(run_row)
+
+            # ── signals ────────────────────────────────────────────────────
+            self.chk_compare_others.toggled.connect(
+                self.btn_select_trackers.setEnabled)
+            self.btn_select_trackers.clicked.connect(self._on_select_trackers)
+
+            self._apply_style()
+
+        def _on_select_trackers(self) -> None:
+            from pathlib import Path
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Select Tracker Files", "",
+                "Excel files (*.xlsx *.xls)")
+            if files:
+                self._selected_tracker_files = files
+                names = ", ".join(Path(f).name for f in files)
+                self.edit_selected_trackers.setText(names)
+
+        def _apply_style(self) -> None:
+            self.setStyleSheet(
+                """
+                QDialog { background-color: #F4F4F4; }
+                QLabel#_cdTitle {
+                    color: #111F35; font-family: 'Segoe UI';
+                    font-size: 16px; font-weight: 800;
+                }
+                QLabel#_cdLabel {
+                    color: #111F35; font-family: 'Segoe UI';
+                    font-size: 13px; font-weight: 600;
+                }
+                QCheckBox#_cdCheck {
+                    color: #111F35; font-family: 'Segoe UI';
+                    font-size: 13px; font-weight: 500;
+                    spacing: 8px;
+                }
+                QCheckBox#_cdCheck::indicator {
+                    width: 16px; height: 16px;
+                    border: 1px solid #9EA3AB; border-radius: 4px;
+                    background: #FFFFFF;
+                }
+                QCheckBox#_cdCheck::indicator:checked {
+                    background: #111F35; border: 1px solid #111F35;
+                }
+                QPushButton#_cdSecBtn {
+                    background-color: #9EA3AB; color: #000000;
+                    border: 1px solid #8B9098; border-radius: 8px;
+                    min-height: 30px; padding: 0 12px;
+                    font-family: 'Segoe UI'; font-size: 12px; font-weight: 600;
+                }
+                QPushButton#_cdSecBtn:disabled {
+                    background-color: #D0D3D8; color: #888888;
+                    border: 1px solid #C0C3C8;
+                }
+                QPushButton#_cdSecBtn:pressed {
+                    background-color: #111F35; color: #FFFFFF;
+                }
+                QLineEdit#_cdEdit {
+                    background-color: #FFFFFF; color: #111111;
+                    border: 1px solid #A9A9A9; border-radius: 8px;
+                    min-height: 30px; padding: 0 8px;
+                    font-family: 'Segoe UI'; font-size: 12px;
+                }
+                QComboBox#_cdCombo {
+                    background-color: #FFFFFF; color: #111111;
+                    border: 1px solid #A9A9A9; border-radius: 8px;
+                    min-height: 30px; padding: 0 8px;
+                    font-family: 'Segoe UI'; font-size: 12px;
+                }
+                QComboBox#_cdCombo::drop-down { border: none; width: 24px; }
+                QPushButton#_cdRunBtn {
+                    background-color: #111F35; color: #ffffff;
+                    border: none; border-radius: 12px;
+                    padding: 0 18px; font-family: 'Segoe UI';
+                    font-size: 16px; font-weight: 700;
+                }
+                QPushButton#_cdRunBtn:pressed {
+                    background-color: #D02752; color: #ffffff;
+                }
+                """
+            )
+
+    # ── nested: Check Missing IDHs dialog ─────────────────────────────────
+    class _CheckMissingIDHsDialog(QDialog):
+        """Popup for selecting a tracker and running the missing-IDH check."""
+
+        def __init__(self, project_review_folder: str = "", initial_tracker: str = "", parent=None) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Check Missing IDHs")
+            self.resize(480, 210)
+            self.setMinimumSize(380, 190)
+            self._tracker_file: str = initial_tracker
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(20, 20, 20, 20)
+            root.setSpacing(12)
+
+            # ── title ──────────────────────────────────────────────────────
+            title = QLabel("Check Missing IDHs")
+            title.setObjectName("_cdTitle")
+            root.addWidget(title)
+
+            # ── select tracker ─────────────────────────────────────────────
+            tracker_row = QHBoxLayout()
+            tracker_row.setSpacing(6)
+            self.btn_select_tracker = QPushButton("Select Tracker")
+            self.btn_select_tracker.setObjectName("_cdSecBtn")
+            tracker_row.addWidget(self.btn_select_tracker, 0)
+            self.edit_tracker = QLineEdit()
+            self.edit_tracker.setObjectName("_cdEdit")
+            self.edit_tracker.setReadOnly(True)
+            self.edit_tracker.setPlaceholderText("No tracker selected")
+            if initial_tracker:
+                from pathlib import Path as _P
+                self.edit_tracker.setText(_P(initial_tracker).name)
+                self.edit_tracker.setToolTip(initial_tracker)
+            tracker_row.addWidget(self.edit_tracker, 1)
+            root.addLayout(tracker_row)
+
+            root.addStretch(1)
+
+            # ── run button ─────────────────────────────────────────────────
+            run_row = QHBoxLayout()
+            run_row.addStretch(1)
+            self.btn_run = QPushButton("Check Missing IDHs")
+            self.btn_run.setObjectName("_cdRunBtn")
+            self.btn_run.setFixedHeight(50)
+            self.btn_run.setMinimumWidth(220)
+            run_row.addWidget(self.btn_run)
+            run_row.addStretch(1)
+            root.addLayout(run_row)
+
+            # ── signals ────────────────────────────────────────────────────
+            self.btn_select_tracker.clicked.connect(self._on_select_tracker)
+            self.btn_run.clicked.connect(self._on_run_clicked)
+
+            self._apply_style()
+
+        @property
+        def tracker_file(self) -> str:
+            return self._tracker_file
+
+        def _on_select_tracker(self) -> None:
+            from pathlib import Path as _P
+            start = str(_P(self._tracker_file).parent) if self._tracker_file else ""
+            file, _ = QFileDialog.getOpenFileName(
+                self, "Select Tracker File", start,
+                "Excel files (*.xlsx *.xls *.xlsm)"
+            )
+            if not file:
+                return
+            if "tracker" not in _P(file).stem.lower():
+                QMessageBox.warning(
+                    self, "Invalid File",
+                    "The selected file does not have 'tracker' in its name.\n"
+                    "Please select a file with 'tracker' in the filename."
+                )
+                return
+            self._tracker_file = file
+            self.edit_tracker.setText(_P(file).name)
+            self.edit_tracker.setToolTip(file)
+
+        def _on_run_clicked(self) -> None:
+            if not self._tracker_file:
+                QMessageBox.warning(self, "No Tracker", "Please select a tracker file first.")
+                return
+            self.accept()
+
+        def _apply_style(self) -> None:
+            self.setStyleSheet(
+                """
+                QDialog { background-color: #F4F4F4; }
+                QLabel#_cdTitle {
+                    color: #111F35; font-family: 'Segoe UI';
+                    font-size: 16px; font-weight: 800;
+                }
+                QPushButton#_cdSecBtn {
+                    background-color: #9EA3AB; color: #000000;
+                    border: 1px solid #8B9098; border-radius: 8px;
+                    min-height: 30px; padding: 0 12px;
+                    font-family: 'Segoe UI'; font-size: 12px; font-weight: 600;
+                }
+                QPushButton#_cdSecBtn:pressed {
+                    background-color: #111F35; color: #FFFFFF;
+                }
+                QLineEdit#_cdEdit {
+                    background-color: #FFFFFF; color: #111111;
+                    border: 1px solid #A9A9A9; border-radius: 8px;
+                    min-height: 30px; padding: 0 8px;
+                    font-family: 'Segoe UI'; font-size: 12px;
+                }
+                QPushButton#_cdRunBtn {
+                    background-color: #111F35; color: #ffffff;
+                    border: none; border-radius: 12px;
+                    padding: 0 18px; font-family: 'Segoe UI';
+                    font-size: 16px; font-weight: 700;
+                }
+                QPushButton#_cdRunBtn:pressed {
+                    background-color: #D02752; color: #ffffff;
+                }
+                """
+            )
+
     # ── constructor ────────────────────────────────────────────────────────
     def __init__(self, source_file: str, sdc_folder: str = "", project_review_folder: str = "", tracker_files: list | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -4181,6 +4453,14 @@ class _ReviewTableDialog(QDialog):
         toolbar.addSpacing(16)
         toolbar.addStretch(1)
 
+        self.btn_rt_check_duplicate = QPushButton("Check Duplicate")
+        self.btn_rt_check_duplicate.setObjectName("tscPrimaryBtn")
+        toolbar.addWidget(self.btn_rt_check_duplicate, 0)
+
+        self.btn_rt_check_missing_idhs = QPushButton("Check Missing IDHs")
+        self.btn_rt_check_missing_idhs.setObjectName("tscPrimaryBtn")
+        toolbar.addWidget(self.btn_rt_check_missing_idhs, 0)
+
         self.btn_rt_import_bma = QPushButton("Import another BMA")
         self.btn_rt_import_bma.setObjectName("tscPrimaryBtn")
         toolbar.addWidget(self.btn_rt_import_bma, 0)
@@ -4248,6 +4528,8 @@ class _ReviewTableDialog(QDialog):
         self.btn_rt_reset_filter.clicked.connect(self._on_reset_filter_clicked)
         self.btn_rt_add_row.clicked.connect(self._on_add_row)
         self.btn_rt_add_col.clicked.connect(self._on_add_col)
+        self.btn_rt_check_duplicate.clicked.connect(self._on_check_duplicate_clicked)
+        self.btn_rt_check_missing_idhs.clicked.connect(self._on_check_missing_idhs_clicked)
         self.btn_rt_import_bma.clicked.connect(self._on_import_bma_clicked)
         self.btn_rt_save.clicked.connect(self._on_save_clicked)
         self.btn_rt_bold.clicked.connect(self._on_format_bold)
@@ -4256,6 +4538,106 @@ class _ReviewTableDialog(QDialog):
         self.table.itemChanged.connect(self._on_item_changed)
 
         self._apply_stylesheet()
+
+    def _on_check_duplicate_clicked(self) -> None:
+        dlg = self._CheckDuplicateDialog(self)
+        dlg.exec()
+
+    def _on_check_missing_idhs_clicked(self) -> None:
+        """Open the Check Missing IDHs dialog, then append missing entries to the table."""
+        from pathlib import Path
+
+        # Find initial tracker: scan project_review_folder for any Excel with "tracker" in stem
+        initial_tracker = ""
+        if self._project_review_folder:
+            pr = Path(self._project_review_folder)
+            if pr.is_dir():
+                for f in sorted(pr.iterdir()):
+                    if (f.suffix.lower() in {".xlsx", ".xls", ".xlsm"}
+                            and "tracker" in f.stem.lower()):
+                        initial_tracker = str(f)
+                        break
+        # Fall back to already-loaded tracker_files
+        if not initial_tracker:
+            for tf in self._tracker_files:
+                if "tracker" in Path(tf).stem.lower() and Path(tf).exists():
+                    initial_tracker = tf
+                    break
+
+        dlg = self._CheckMissingIDHsDialog(
+            project_review_folder=self._project_review_folder,
+            initial_tracker=initial_tracker,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tracker_file = dlg.tracker_file
+        if not tracker_file:
+            return
+
+        # Find Head Bom Mat column index
+        lower_headers = [h.strip().lower() for h in self._headers]
+        hbm_idx = next((i for i, h in enumerate(lower_headers) if h == "head bom mat"), None)
+        if hbm_idx is None:
+            QMessageBox.warning(self, "Column Not Found",
+                                "Could not find the 'Head Bom Mat' column in the table.")
+            return
+
+        # Collect existing HBM values
+        existing_hbm: set[str] = set()
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, hbm_idx)
+            if item:
+                val = item.text().strip()
+                if val:
+                    existing_hbm.add(val)
+
+        # Find missing IDHs
+        missing = review_project.find_missing_idhs(tracker_file, existing_hbm)
+        if not missing:
+            QMessageBox.information(self, "No Missing IDHs",
+                                    "All IDHs in the tracker are already present in the table.")
+            return
+
+        # Locate Basic Number and Hit Type column indices
+        basic_idx = next(
+            (i for i, h in enumerate(lower_headers)
+             if h in {"basic number", "basic num", "basic no", "basic"}),
+            None,
+        )
+        hit_type_idx = next(
+            (i for i, h in enumerate(lower_headers) if h == "hit type"),
+            None,
+        )
+
+        # Append missing IDHs as new rows
+        self._push_undo_snapshot(force=True)
+        self.table.blockSignals(True)
+        col_count = self.table.columnCount()
+        for idh_val in missing:
+            row_pos = self.table.rowCount()
+            self.table.insertRow(row_pos)
+            for c in range(col_count):
+                if c == hbm_idx:
+                    val = idh_val
+                elif basic_idx is not None and c == basic_idx:
+                    val = "missing"
+                elif hit_type_idx is not None and c == hit_type_idx:
+                    val = "na"
+                else:
+                    val = ""
+                item = QTableWidgetItem(val)
+                self._apply_rule_formatting(item, c, val)
+                self.table.setItem(row_pos, c, item)
+        self.table.blockSignals(False)
+        self._push_undo_snapshot(force=True)
+        self._update_row_count()
+
+        QMessageBox.information(
+            self, "Done",
+            f"Added {len(missing)} missing IDH(s) to the review table."
+        )
 
     # ── sheet loader ───────────────────────────────────────────────────────
     @staticmethod
@@ -6668,7 +7050,7 @@ class _SettingsDialog(QDialog):
 
     _ROOT_HINT = (
         "HAT Dashboard will create a 'HAT DASHBOARD ROOT' folder at the chosen location "
-        "containing a MASTER sub-folder with: Tracker Status Collector, "
+        "containing a MASTER sub-folder with: Briefing Trackers, Tracker Status Collector, "
         "Thumbnail Generator, and SAP Data Reformat. "
         "Settings are saved to AppData and persist across sessions."
     )
@@ -10109,14 +10491,11 @@ class NewUIWindow(QMainWindow):
         from pathlib import Path
 
         # ── TSC ───────────────────────────────────────────────────────────
-        tsc_folder = self._config.tsc_input()
-        if tsc_folder:
-            p = Path(tsc_folder)
+        bt_folder = self._config.briefing_tracker_input()
+        if bt_folder:
+            p = Path(bt_folder)
             if p.is_dir():
-                files = sorted(
-                    f for f in p.glob("*.xlsx")
-                    if "tsc" not in f.stem.lower()
-                )
+                files = sorted(f for f in p.glob("*.xlsx"))
                 if files:
                     file_strs = [str(f) for f in files]
                     self.input_trackers.setText(", ".join(file_strs))
@@ -10127,10 +10506,12 @@ class NewUIWindow(QMainWindow):
                         sc.editText_selected_trackers.setPlainText(
                             ",\n".join(f.name for f in files)
                         )
-            self.input_output.setText(tsc_folder)
+        tsc_out = self._config.tsc_output()
+        if tsc_out:
+            self.input_output.setText(tsc_out)
             if hasattr(self, "status_collector"):
-                self.status_collector.output_location = tsc_folder
-                self.status_collector.editText_output_location.setPlainText(tsc_folder)
+                self.status_collector.output_location = tsc_out
+                self.status_collector.editText_output_location.setPlainText(tsc_out)
         self._update_tsc_input_count()
 
         # ── Thumbnail Generator ───────────────────────────────────────────
@@ -10236,7 +10617,7 @@ class NewUIWindow(QMainWindow):
                     self.lbl_compare_rsd_master.setText("Multiple rsd files found in master")
 
         # TSC Data — MASTER Tracker Status Collector folder, single .xlsx file with "tsc" in name
-        tsc_folder = self._config.tsc_input()
+        tsc_folder = self._config.tsc_output()
         if tsc_folder:
             p_tsc = Path(tsc_folder)
             if p_tsc.is_dir():
@@ -10321,17 +10702,7 @@ class NewUIWindow(QMainWindow):
         """Scan the Project Review folder for Briefing Tracker file(s) and fill the input."""
         if not hasattr(self, "input_pr_project_tracker"):
             return
-        from pathlib import Path
-        pr_folder = Path(project_folder) / "Project Review"
-        if not pr_folder.is_dir():
-            self.input_pr_project_tracker.clear()
-            return
-        import re
-        tracker_files = sorted(
-            f for f in pr_folder.iterdir()
-            if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
-            and re.search(r'briefing.?tracker', f.stem, re.IGNORECASE)
-        )
+        tracker_files = review_project.scan_tracker_files(project_folder)
         if tracker_files:
             self.input_pr_project_tracker.setText(", ".join(str(f) for f in tracker_files))
         else:
@@ -10866,55 +11237,36 @@ class NewUIWindow(QMainWindow):
 
     @staticmethod
     def _pick_latest_review_file(files: list):
-        """Return the file with the latest date in its stem (YYYYMMDD or YYYY-MM-DD/YYYY_MM_DD).
-        Falls back to the last element in sorted order if no date pattern is found."""
-        import re
-        from datetime import datetime
-
-        def _extract_date(p):
-            stem = p.stem
-            m = re.search(r'(\d{4})(\d{2})(\d{2})', stem)
-            if m:
-                try:
-                    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                except ValueError:
-                    pass
-            m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', stem)
-            if m:
-                try:
-                    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                except ValueError:
-                    pass
-            return datetime.min
-
-        return max(files, key=_extract_date, default=None)
+        """Delegates to review_project.pick_latest_review_file."""
+        return review_project.pick_latest_review_file(files)
 
     def _on_pr_mode_toggled(self, checked: bool) -> None:
-        """When 'Continue from Existing' is selected, autofill Source BMA from Project Review folder."""
-        if not checked:
-            return
+        """Autofill Source BMA when the mode radio changes.
+
+        ``checked=True``  → 'Continue from Existing' active → load latest review file
+        ``checked=False`` → 'New Review' active             → load SDC files
+        """
         if not self._use_root_folders:
             return
-        from pathlib import Path
         project_folder = self._get_active_project_folder()
         if not project_folder:
             return
-        pr_folder = Path(project_folder) / "Project Review"
-        if pr_folder.is_dir():
-            review_files = sorted(
-                f for f in pr_folder.iterdir()
-                if f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
-                and "review" in f.stem.lower()
-            )
+        if checked:
+            # Continue from Existing — latest review file from Project Review folder
+            review_files = review_project.scan_review_files(project_folder)
             if review_files:
-                chosen = review_files[0] if len(review_files) == 1 else self._pick_latest_review_file(review_files)
+                chosen = review_files[0] if len(review_files) == 1 else review_project.pick_latest_review_file(review_files)
                 self.input_pr_source_bma.setText(str(chosen))
             else:
                 self.input_pr_source_bma.clear()
+            self._autofill_pr_tracker(project_folder)
         else:
-            self.input_pr_source_bma.clear()
-        # Also autofill tracker
-        self._autofill_pr_tracker(project_folder)
+            # New Review — all SDC files from SAP Data Compare folder
+            sdc_files = review_project.scan_sdc_files(project_folder)
+            if sdc_files:
+                self.input_pr_source_bma.setText(", ".join(str(f) for f in sdc_files))
+            else:
+                self.input_pr_source_bma.clear()
 
     def _update_pr_source_bma_count(self) -> None:
         """Update the Input files count label for Source BMA."""
@@ -11238,7 +11590,11 @@ class NewUIWindow(QMainWindow):
         desktop = str(Path.home() / "Desktop")
 
         if tool == "tsc":
-            path = self._config.tsc_input()
+            path = self._config.briefing_tracker_input()
+            return path if path and Path(path).is_dir() else desktop
+
+        if tool == "tsc_output":
+            path = self._config.tsc_output()
             return path if path and Path(path).is_dir() else desktop
 
         if tool == "thumbnail":
@@ -11316,7 +11672,7 @@ class NewUIWindow(QMainWindow):
         self.status_collector.btn_output_location.clicked.disconnect()
         self.status_collector.btn_output_location.clicked.connect(
             lambda: self.status_collector.get_output_location(
-                self._get_browse_dir("tsc")))
+                self._get_browse_dir("tsc_output")))
 
     def _init_thumbnail_generator_module(self) -> None:
         self.thumbnail_generator = ThumbnailGenerator(self)

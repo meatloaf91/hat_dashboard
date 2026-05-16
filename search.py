@@ -347,13 +347,17 @@ import re as _re
 _IDH_PATTERN = _re.compile(r'(?<!\d)(\d{5,8})(?!\d)')
 
 
-def _norm(s: str) -> str:
-    """Lowercase and remove all whitespace — used for loose matching.
+def _norm(s) -> str:
+    """Lowercase and remove whitespace, trademark/copyright symbols (®, ™, ©),
+    hyphens, and underscores — used for loose matching.
 
-    Allows "302x600" to match "302 x 600" (and vice-versa) by collapsing
-    spaces on both the search term and the cell value before comparing.
+    Allows "loctite 649" to match "LOCTITE® 649", "bonderite m cr" to
+    match "BONDERITE® M-CR 1200 AERO", and "302x600" to match "302 x 600".
+    Non-string values (NaN, None, float) are treated as empty string.
     """
-    return _re.sub(r'\s+', '', s.lower())
+    if not isinstance(s, str):
+        return ""
+    return _re.sub(r'[®™©\-_\s]+', '', s.lower())
 
 
 _DIM_RE = _re.compile(r'^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(.*)$')

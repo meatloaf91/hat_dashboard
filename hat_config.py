@@ -9,9 +9,11 @@ INI structure
 [general]
 root_folder = <path>         ; root location for MASTER hierarchy
 
+[briefing_tracker]
+input_folder =           ; empty → <root>/HAT DASHBOARD ROOT/MASTER/Briefing Trackers
+
 [tsc]
-input_folder  =          ; empty → <root>/HAT DASHBOARD ROOT/MASTER/Tracker Status Collector
-output_folder =
+output_folder =          ; empty → <root>/HAT DASHBOARD ROOT/MASTER/Tracker Status Collector
 
 [thumbnail]
 input_folder  =          ; empty → <root>/HAT DASHBOARD ROOT/MASTER/Thumbnail Generator
@@ -25,7 +27,8 @@ output_folder =
 folder =                 ; empty → no derivation; user must set explicitly
 
 Derivation rules (when a per-tool key is empty):
-  tsc          input/output → <root>/HAT DASHBOARD ROOT/MASTER/Tracker Status Collector
+  briefing_tracker input  → <root>/HAT DASHBOARD ROOT/MASTER/Briefing Trackers
+  tsc          output     → <root>/HAT DASHBOARD ROOT/MASTER/Tracker Status Collector
   thumbnail    input/output → <root>/HAT DASHBOARD ROOT/MASTER/Thumbnail Generator
   sap_reformat input/output → <root>/HAT DASHBOARD ROOT/MASTER/SAP Data Reformat
   project_review folder     → set explicitly by user (no root derivation)
@@ -42,6 +45,7 @@ from configparser import ConfigParser
 # Folder hierarchy created under the chosen root (Setup Root mode)
 # ---------------------------------------------------------------------------
 FOLDER_HIERARCHY: list[str] = [
+    "HAT DASHBOARD ROOT/MASTER/Briefing Trackers",
     "HAT DASHBOARD ROOT/MASTER/Tracker Status Collector",
     "HAT DASHBOARD ROOT/MASTER/Thumbnail Generator",
     "HAT DASHBOARD ROOT/MASTER/SAP Data Reformat",
@@ -57,14 +61,15 @@ PROJECT_SUBFOLDERS: list[str] = [
 ]
 
 _DEFAULT_SECTIONS: dict[str, dict[str, str]] = {
-    "general":        {"root_folder": ""},
-    "tsc":            {"input_folder": "", "output_folder": ""},
-    "thumbnail":      {"input_folder": "", "output_folder": ""},
-    "sap_reformat":   {"input_folder": "", "output_folder": ""},
-    "excel_library":  {"folder": ""},
-    "sap_compare":    {"rsd_target_folder": "", "rsd_master_folder": "", "tsc_data_folder": ""},
-    "search":         {"rsd_master_folder": "", "tsc_data_folder": "", "library": "", "thumbnails_folder": ""},
-    "project_review": {"folder": ""},
+    "general":          {"root_folder": ""},
+    "briefing_tracker": {"input_folder": ""},
+    "tsc":              {"output_folder": ""},
+    "thumbnail":        {"input_folder": "", "output_folder": ""},
+    "sap_reformat":     {"input_folder": "", "output_folder": ""},
+    "excel_library":    {"folder": ""},
+    "sap_compare":      {"rsd_target_folder": "", "rsd_master_folder": "", "tsc_data_folder": ""},
+    "search":           {"rsd_master_folder": "", "tsc_data_folder": "", "library": "", "thumbnails_folder": ""},
+    "project_review":   {"folder": ""},
 }
 
 
@@ -89,7 +94,7 @@ class HatConfig:
 
     def __init__(self) -> None:
         self._path = _config_path()
-        self._cfg = ConfigParser()
+        self._cfg = ConfigParser(interpolation=None)
         self._load()
 
     # ── persistence ────────────────────────────────────────────────────────
@@ -177,9 +182,9 @@ class HatConfig:
             return str(Path(root) / root_rel)
         return ""
 
-    def tsc_input(self) -> str:
-        return self._resolve("tsc", "input_folder",
-                             "HAT DASHBOARD ROOT/MASTER/Tracker Status Collector")
+    def briefing_tracker_input(self) -> str:
+        return self._resolve("briefing_tracker", "input_folder",
+                             "HAT DASHBOARD ROOT/MASTER/Briefing Trackers")
 
     def tsc_output(self) -> str:
         return self._resolve("tsc", "output_folder",
@@ -223,20 +228,28 @@ class HatConfig:
     # ── search page folder helpers ──────────────────────────────────────────
 
     def search_rsd_master_folder(self) -> str:
-        return self._resolve("search", "rsd_master_folder",
-                             "HAT DASHBOARD ROOT/MASTER/SAP Data Reformat")
+        override = self.get("search", "rsd_master_folder")
+        if override:
+            return override
+        return self.sap_reformat_input()
 
     def search_tsc_data_folder(self) -> str:
-        return self._resolve("search", "tsc_data_folder",
-                             "HAT DASHBOARD ROOT/MASTER/Tracker Status Collector")
+        override = self.get("search", "tsc_data_folder")
+        if override:
+            return override
+        return self.tsc_output()
 
     def search_library(self) -> str:
-        return self._resolve("search", "library",
-                             "HAT DASHBOARD ROOT/MASTER/Excel Library")
+        override = self.get("search", "library")
+        if override:
+            return override
+        return self.excel_library_folder()
 
     def search_thumbnails_folder(self) -> str:
-        return self._resolve("search", "thumbnails_folder",
-                             "HAT DASHBOARD ROOT/MASTER/Thumbnail Generator")
+        override = self.get("search", "thumbnails_folder")
+        if override:
+            return override
+        return self.thumbnail_output()
 
     # ── validation ──────────────────────────────────────────────────────────
 
@@ -251,7 +264,7 @@ class HatConfig:
         tool ∈ {'tsc', 'thumbnail', 'sap_reformat'}
         """
         checks: dict[str, list[str]] = {
-            "tsc":         [self.tsc_input(), self.tsc_output()],
+            "tsc":         [self.briefing_tracker_input(), self.tsc_output()],
             "thumbnail":   [self.thumbnail_input(), self.thumbnail_output()],
             "sap_reformat":[self.sap_reformat_input(), self.sap_reformat_output()],
         }
