@@ -11,6 +11,31 @@ from collections import defaultdict
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
+# ── Python 3.14 compatibility ─────────────────────────────────────────────────
+# matplotlib's Path.__deepcopy__ calls copy.deepcopy(super(), memo) which
+# triggers infinite recursion in Python ≥3.14 due to changed super() proxy
+# deepcopy behaviour.  Replace with a direct dict-based deepcopy that avoids
+# the super() proxy entirely.
+def _patch_matplotlib_path_deepcopy() -> None:
+    import sys as _sys
+    if _sys.version_info < (3, 14):
+        return
+    import copy as _copy
+    import matplotlib.path as _mp
+
+    def _safe_deepcopy(self, memo):  # type: ignore[override]
+        cls = type(self)
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            object.__setattr__(result, k, _copy.deepcopy(v, memo))
+        return result
+
+    _mp.Path.__deepcopy__ = _safe_deepcopy  # type: ignore[method-assign]
+
+_patch_matplotlib_path_deepcopy()
+# ─────────────────────────────────────────────────────────────────────────────
+
 _BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
 from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, QRect, Signal, QTimer
@@ -399,6 +424,33 @@ class _PackshotClipboardTableDialog(QDialog):
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().sectionClicked.connect(self._on_filter_header_clicked)
 
+        # ── Copy-all button overlaid on the "Packshot Naming" header cell ────────
+        _hdr = self.table.horizontalHeader()
+        self._copy_packshot_btn = QPushButton("\u29c9", _hdr)  # ⧉ copy symbol
+        self._copy_packshot_btn.setObjectName("packshotCopyHeaderBtn")
+        self._copy_packshot_btn.setFixedSize(28, 24)
+        self._copy_packshot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_packshot_btn.setToolTip("Copy all Packshot Naming values to clipboard")
+        self._copy_packshot_btn.setStyleSheet(
+            "QPushButton#packshotCopyHeaderBtn {"
+            "  background: rgba(255,255,255,0.18);"
+            "  color: #FFFFFF;"
+            "  border: 1px solid rgba(255,255,255,0.50);"
+            "  border-radius: 4px;"
+            "  font-size: 14px;"
+            "  padding: 0;"
+            "}"
+            "QPushButton#packshotCopyHeaderBtn:hover {"
+            "  background: rgba(255,255,255,0.35);"
+            "}"
+            "QPushButton#packshotCopyHeaderBtn:pressed {"
+            "  background: rgba(255,255,255,0.60);"
+            "}"
+        )
+        self._copy_packshot_btn.clicked.connect(self._copy_packshot_naming_column)
+        _hdr.sectionResized.connect(lambda *_: self._position_copy_btn())
+        QTimer.singleShot(0, self._position_copy_btn)
+
         for row in range(5):
             for col in range(6):
                 self.table.setItem(row, col, QTableWidgetItem(""))
@@ -556,6 +608,31 @@ class _PackshotClipboardTableDialog(QDialog):
             last_header_item.setBackground(Qt.GlobalColor.transparent)
             last_header_item.setBackground(QColor("#8A244B"))
             last_header_item.setForeground(QColor("#FFFFFF"))
+
+    def _position_copy_btn(self) -> None:
+        """Pin the copy button to the right edge of the Packshot Naming header section."""
+        hdr = self.table.horizontalHeader()
+        col_x = hdr.sectionViewportPosition(5)
+        col_w = hdr.sectionSize(5)
+        btn_w = self._copy_packshot_btn.width()
+        btn_h = self._copy_packshot_btn.height()
+        x = col_x + col_w - btn_w - 6
+        y = max(0, (hdr.height() - btn_h) // 2)
+        self._copy_packshot_btn.move(x, y)
+        self._copy_packshot_btn.show()
+
+    def _copy_packshot_naming_column(self) -> None:
+        """Copy all visible Packshot Naming cell values to clipboard, one value per line."""
+        values: list[str] = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            item = self.table.item(row, 5)
+            values.append(item.text() if item is not None else "")
+        QApplication.clipboard().setText("\n".join(values))
+        # Brief tick feedback so the user knows it worked
+        self._copy_packshot_btn.setText("\u2713")  # ✓
+        QTimer.singleShot(1500, lambda: self._copy_packshot_btn.setText("\u29c9"))
 
     def _on_filter_header_clicked(self, column: int) -> None:
         values: list[str] = []
@@ -2902,28 +2979,22 @@ class _TscChartDialog(QDialog):
 
     _COUNT_VARIABLES = [
         "SBU",
-        "Build Type",
         "Status",
-        "Packaging Type",
-        "Packaging Size",
+        "Build Type",
         "Year",
     ]
 
     _COMBO_VARIABLES = [
         "SBU",
-        "Build Type",
         "Status",
-        "Packaging Type",
-        "Packaging Size",
+        "Build Type",
         "Year",
     ]
 
     _COMBO_SEG_BASE = [
         "SBU",
-        "Build Type",
         "Status",
-        "Packaging Type",
-        "Packaging Size",
+        "Build Type",
         "Year",
     ]
 
@@ -2939,7 +3010,6 @@ class _TscChartDialog(QDialog):
         "Bar Chart (h)",
         "Bar Chart (v)",
         "Donut Chart",
-        "Histogram",
     ]
 
     _COMBO_CHART_TYPES = [
@@ -2957,6 +3027,11 @@ class _TscChartDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Analytics")
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
         self.resize(1180, 700)
         self.setMinimumSize(900, 540)
         self._headers = headers
@@ -3204,21 +3279,11 @@ class _TscChartDialog(QDialog):
         self._include_blanks_cb.setObjectName("sideCheck")
         sb.addWidget(self._include_blanks_cb)
 
-        # THEME dropdown
-        theme_label = QLabel("THEME")
-        theme_label.setObjectName("sideLabel")
-        theme_label.setContentsMargins(0, 10, 0, 6)
-        sb.addWidget(theme_label)
-
+        # Theme is always "palette"; _theme_combo kept as internal state for _colors()
         self._theme_combo = QComboBox()
-        self._theme_combo.setObjectName("sideCombo")
-        self._theme_combo.addItems(["single hue", "divergent", "palette"])
-        # Default to "palette"
-        self._theme_combo.setCurrentIndex(self._theme_combo.findText("palette"))
-        sb.addSpacing(4)
-        sb.addWidget(self._theme_combo)
+        self._theme_combo.addItems(["palette"])
 
-        # Divider
+        # Divider between OPTIONS and TEXT COLOR
         div_tc = QFrame()
         div_tc.setObjectName("sideDivider")
         sb.addSpacing(14)
@@ -3419,10 +3484,16 @@ class _TscChartDialog(QDialog):
         """Resize canvas height so a vertical scrollbar appears when many items are charted."""
         h_px = max(min_px, n_items * px_per_item + 130) if n_items > 0 else min_px
         self._canvas.setMinimumHeight(h_px)
-        # Update figure's stored inch-size so sizeHint() reflects the new height
-        # (FigureCanvasQTAgg.sizeHint returns figure.bbox in pixels)
+        # Always size the figure to the height that will actually be displayed.
+        # With setWidgetResizable(True) the canvas fills the viewport when h_px ≤
+        # viewport_h, so we use max(h_px, viewport_h) as the figure height.  This
+        # prevents the chart from rendering at a smaller-than-viewport height and
+        # leaving blank white space below (which previously required a
+        # minimize/maximize to trigger resizeEvent and correct the size).
+        viewport_h = self._chart_scroll.viewport().height()
+        figure_h = max(h_px, viewport_h) if viewport_h > 0 else h_px
         dpi = self._figure.dpi
-        self._figure.set_size_inches(self._figure.get_figwidth(), h_px / dpi)
+        self._figure.set_size_inches(self._figure.get_figwidth(), figure_h / dpi)
         self._canvas.updateGeometry()
 
     def _on_mode_changed(self) -> None:
@@ -3498,6 +3569,7 @@ class _TscChartDialog(QDialog):
                                        grouped="Grouped" in ctype)
 
         self._canvas.draw()
+        self._canvas.update()
 
     # -------------------------------------------------------- helpers --------
 
@@ -3590,19 +3662,21 @@ class _TscChartDialog(QDialog):
     # -------------------------------------------------------- chart renderers
 
     def _draw_pie(self, col: str, blanks: bool, donut: bool = False) -> None:
-        self._resize_canvas(0)
         counts = self._value_counts(col, blanks)
         if not counts:
+            self._resize_canvas(0)
             self._no_data()
             return
+        labels = list(counts.keys())
+        values = list(counts.values())
+        # Fixed canvas height keeps pie/donut the same size regardless of variable
+        self._resize_canvas(0)
         ax = self._figure.add_subplot(111)
         # Move pie/donut leftwards to leave space for details/legend
         try:
             ax.set_position([0.05, 0.12, 0.62, 0.8])
         except Exception:
             pass
-        labels = list(counts.keys())
-        values = list(counts.values())
         colors = self._colors(len(labels))
         wedgeprops = {"linewidth": 1.4, "edgecolor": "#FFFFFF"}
         if donut:
@@ -3712,6 +3786,10 @@ class _TscChartDialog(QDialog):
         ax.set_title(f"{col} Count", fontsize=13, fontweight="bold", pad=14)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        if horizontal:
+            self._figure.subplots_adjust(left=0.22, right=0.88, top=0.92, bottom=0.08)
+        else:
+            self._figure.subplots_adjust(left=0.10, right=0.95, top=0.92, bottom=0.22)
 
     def _draw_histogram(self, col: str, blanks: bool) -> None:
         """Numeric histogram – falls back to bar chart if values are non-numeric."""
@@ -3748,6 +3826,7 @@ class _TscChartDialog(QDialog):
         ax.set_title(f"{col} Histogram", fontsize=13, fontweight="bold", pad=14)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        self._figure.subplots_adjust(left=0.10, right=0.95, top=0.92, bottom=0.22)
 
     def _draw_sum_bar(self, x_col: str, sum_col: str, blanks: bool, horizontal: bool) -> None:
         """Draw a bar chart where bar height = sum of sum_col values per x_col category."""
@@ -3814,6 +3893,10 @@ class _TscChartDialog(QDialog):
                      fontsize=13, fontweight="bold", pad=14)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        if horizontal:
+            self._figure.subplots_adjust(left=0.22, right=0.88, top=0.92, bottom=0.08)
+        else:
+            self._figure.subplots_adjust(left=0.10, right=0.95, top=0.92, bottom=0.22)
 
     def _draw_stacked(
         self, x_col: str, seg_col: str, blanks: bool,
@@ -3897,6 +3980,10 @@ class _TscChartDialog(QDialog):
                      fontsize=13, fontweight="bold", pad=14)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        if horizontal:
+            self._figure.subplots_adjust(left=0.22, right=0.82, top=0.92, bottom=0.08)
+        else:
+            self._figure.subplots_adjust(left=0.10, right=0.88, top=0.92, bottom=0.22)
 
     def _on_save_chart(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -4083,21 +4170,46 @@ class _ReviewTableDialog(QDialog):
         def __init__(self, highlight_cols: set, parent=None):
             super().__init__(Qt.Orientation.Horizontal, parent)
             self._highlight_cols: set[int] = set(highlight_cols)
+            self._btn_reserves: dict[int, int] = {}  # col -> px to reserve on right
+            self._user_header_fmt: dict[int, dict] = {}  # col -> {"bg": "#hex", "fg": "#hex"}
             self.setSectionsClickable(True)
 
         def set_highlight_cols(self, cols: set) -> None:
             self._highlight_cols = set(cols)
             self.viewport().update()
 
+        def set_section_btn_reserve(self, col: int, reserve_px: int) -> None:
+            """Reserve right-side pixels in col's header text area for an overlaid button."""
+            self._btn_reserves[col] = reserve_px
+            self.viewport().update()
+
+        def update_header_colors(self, fmt: dict) -> None:
+            """Apply user-defined header colors; triggers repaint."""
+            self._user_header_fmt = dict(fmt)
+            self.viewport().update()
+
         def paintSection(self, painter, rect, logical_index):
-            if logical_index not in self._highlight_cols:
+            user_fmt = self._user_header_fmt.get(logical_index, {})
+            is_accent = logical_index in self._highlight_cols
+
+            if not is_accent and not user_fmt:
                 super().paintSection(painter, rect, logical_index)
                 return
-            # Fully custom paint — accent background, white bold label
+
+            # Fully custom paint
             painter.save()
-            painter.fillRect(rect, self._ACCENT_BG)
+
+            # Background
+            if user_fmt.get("bg"):
+                bg_color = QColor(user_fmt["bg"])
+            elif is_accent:
+                bg_color = self._ACCENT_BG
+            else:
+                bg_color = self._NORMAL_BG
+            painter.fillRect(rect, bg_color)
             painter.setPen(self._BORDER)
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
             label = self.model().headerData(
                 logical_index, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole
             )
@@ -4105,11 +4217,16 @@ class _ReviewTableDialog(QDialog):
                 font = painter.font()
                 font.setBold(True)
                 painter.setFont(font)
-                painter.setPen(self._ACCENT_FG)
-                text_rect = rect.adjusted(8, 0, -4, 0)
+                # Foreground
+                if user_fmt.get("fg"):
+                    painter.setPen(QColor(user_fmt["fg"]))
+                else:
+                    painter.setPen(self._ACCENT_FG)
+                right_margin = self._btn_reserves.get(logical_index, 0) + 4
+                text_rect = rect.adjusted(8, 0, -right_margin, 0)
                 painter.drawText(
                     text_rect,
-                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    int(Qt.AlignmentFlag.AlignCenter),
                     str(label),
                 )
             painter.restore()
@@ -4386,7 +4503,7 @@ class _ReviewTableDialog(QDialog):
             )
 
     # ── constructor ────────────────────────────────────────────────────────
-    def __init__(self, source_file: str, sdc_folder: str = "", project_review_folder: str = "", tracker_files: list | None = None, parent=None) -> None:
+    def __init__(self, source_file: str, sdc_folder: str = "", project_review_folder: str = "", tracker_files: list | None = None, load_colors: bool = False, parent=None) -> None:
         super().__init__(parent)
         from pathlib import Path
         self._source_file = source_file
@@ -4402,6 +4519,8 @@ class _ReviewTableDialog(QDialog):
         self._column_filters: dict[int, set[str] | None] = {}
         # user-applied cell formatting: (row, col) -> {"bg": str|None, "fg": str|None, "bold": bool|None}
         self._user_fmt: dict[tuple[int, int], dict] = {}
+        # user-applied header formatting: col -> {"bg": str|None, "fg": str|None}
+        self._header_fmt: dict[int, dict] = {}
         self._tracker_info_dialogs: list = []  # keep refs to non-modal Tracker Info windows
 
         file_name = Path(source_file).name if source_file else "No file"
@@ -4453,10 +4572,6 @@ class _ReviewTableDialog(QDialog):
         toolbar.addSpacing(16)
         toolbar.addStretch(1)
 
-        self.btn_rt_check_duplicate = QPushButton("Check Duplicate")
-        self.btn_rt_check_duplicate.setObjectName("tscPrimaryBtn")
-        toolbar.addWidget(self.btn_rt_check_duplicate, 0)
-
         self.btn_rt_check_missing_idhs = QPushButton("Check Missing IDHs")
         self.btn_rt_check_missing_idhs.setObjectName("tscPrimaryBtn")
         toolbar.addWidget(self.btn_rt_check_missing_idhs, 0)
@@ -4477,10 +4592,13 @@ class _ReviewTableDialog(QDialog):
         fmt_lbl = QLabel("Format:")
         fmt_lbl.setObjectName("packshotRowCountLabel")
         fmt_toolbar.addWidget(fmt_lbl, 0)
-        self.btn_rt_bold       = QPushButton("Bold")
-        self.btn_rt_cell_color = QPushButton("Cell Color")
-        self.btn_rt_text_color = QPushButton("Text Color")
-        for _b in (self.btn_rt_bold, self.btn_rt_cell_color, self.btn_rt_text_color):
+        self.btn_rt_bold           = QPushButton("Bold")
+        self.btn_rt_cell_color     = QPushButton("Cell Color")
+        self.btn_rt_text_color     = QPushButton("Text Color")
+        self.btn_rt_header_bg      = QPushButton("Header BG")
+        self.btn_rt_header_fg      = QPushButton("Header Text")
+        for _b in (self.btn_rt_bold, self.btn_rt_cell_color, self.btn_rt_text_color,
+                   self.btn_rt_header_bg, self.btn_rt_header_fg):
             _b.setObjectName("packshotUpdateRowsBtn")
             fmt_toolbar.addWidget(_b, 0)
         fmt_toolbar.addStretch(1)
@@ -4488,7 +4606,11 @@ class _ReviewTableDialog(QDialog):
 
         # ── table ──────────────────────────────────────────────────────────
         headers, rows = self._load_sheet(source_file)
+        headers, rows = self._ensure_assessment_col(headers, rows)
         self._headers = headers
+        # Pre-load cell and header colors when continuing from an existing saved file
+        if load_colors:
+            self._user_fmt, self._header_fmt = self._load_sheet_colors(source_file, headers)
         col_count = max(len(headers), 1)
         self._column_filters = {i: None for i in range(col_count)}
 
@@ -4503,6 +4625,8 @@ class _ReviewTableDialog(QDialog):
         self._header_view.sectionClicked.connect(self._on_header_clicked)
         self._header_view.sectionDoubleClicked.connect(self._on_filter_header_clicked)
         self.table.setHorizontalHeader(self._header_view)
+        if self._header_fmt:
+            self._header_view.update_header_colors(self._header_fmt)
 
         self._refresh_header_labels()
         self.table.verticalHeader().setVisible(True)
@@ -4513,6 +4637,33 @@ class _ReviewTableDialog(QDialog):
 
         # Install HBM lookup delegate on the Head Bom Mat column
         self._install_hbm_delegate()
+
+        # ── "Run Initial Assessment" button overlaid on Assessment Comments header ──
+        self._assess_run_btn = QPushButton("clone check", self._header_view)
+        self._assess_run_btn.setObjectName("rtAssessRunBtn")
+        self._assess_run_btn.setFixedSize(90, 22)
+        self._assess_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._assess_run_btn.setToolTip("Run Initial Assessment — detect clones by Basic Number")
+        self._assess_run_btn.setStyleSheet(
+            "QPushButton#rtAssessRunBtn {"
+            "  background: rgba(255,255,255,0.20);"
+            "  color: #FFFFFF;"
+            "  border: 1px solid rgba(255,255,255,0.50);"
+            "  border-radius: 4px;"
+            "  font-size: 12px;"
+            "  padding: 0;"
+            "}"
+            "QPushButton#rtAssessRunBtn:hover {"
+            "  background: rgba(255,255,255,0.38);"
+            "}"
+            "QPushButton#rtAssessRunBtn:pressed {"
+            "  background: rgba(255,255,255,0.60);"
+            "}"
+        )
+        self._assess_run_btn.clicked.connect(self._on_run_initial_assessment)
+        self._header_view.sectionResized.connect(lambda *_: self._position_assess_btn())
+        self._header_view.geometriesChanged.connect(self._position_assess_btn)
+        QTimer.singleShot(0, self._position_assess_btn)
 
         # Store original data for full Reset
         self._original_snapshot = [list(r) for r in self._get_table_snapshot()]
@@ -4528,16 +4679,21 @@ class _ReviewTableDialog(QDialog):
         self.btn_rt_reset_filter.clicked.connect(self._on_reset_filter_clicked)
         self.btn_rt_add_row.clicked.connect(self._on_add_row)
         self.btn_rt_add_col.clicked.connect(self._on_add_col)
-        self.btn_rt_check_duplicate.clicked.connect(self._on_check_duplicate_clicked)
         self.btn_rt_check_missing_idhs.clicked.connect(self._on_check_missing_idhs_clicked)
         self.btn_rt_import_bma.clicked.connect(self._on_import_bma_clicked)
         self.btn_rt_save.clicked.connect(self._on_save_clicked)
         self.btn_rt_bold.clicked.connect(self._on_format_bold)
         self.btn_rt_cell_color.clicked.connect(self._on_format_cell_color)
         self.btn_rt_text_color.clicked.connect(self._on_format_text_color)
+        self.btn_rt_header_bg.clicked.connect(self._on_format_header_bg)
+        self.btn_rt_header_fg.clicked.connect(self._on_format_header_fg)
         self.table.itemChanged.connect(self._on_item_changed)
 
         self._apply_stylesheet()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._position_assess_btn)
 
     def _on_check_duplicate_clicked(self) -> None:
         dlg = self._CheckDuplicateDialog(self)
@@ -4645,16 +4801,126 @@ class _ReviewTableDialog(QDialog):
         """Read body_map_IDH sheet; return (headers, data_rows) as plain strings."""
         try:
             import pandas as pd
-            df = pd.read_excel(
-                file_path,
-                sheet_name=_ReviewTableDialog._SHEET_NAME,
-                engine="calamine",
-                dtype=str,
-            )
-            df = df.fillna("")
-            return list(df.columns), [list(r) for r in df.values.tolist()]
-        except Exception as exc:
-            return [], []
+            sheet_name = _ReviewTableDialog._SHEET_NAME
+            for engine in ("calamine", "openpyxl", None):
+                try:
+                    kw: dict = {} if engine is None else {"engine": engine}
+                    df = pd.read_excel(
+                        file_path,
+                        sheet_name=sheet_name,
+                        dtype=str,
+                        **kw,
+                    )
+                    df = df.fillna("")
+                    return list(df.columns), [list(r) for r in df.values.tolist()]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return [], []
+
+    @staticmethod
+    def _load_sheet_colors(
+        file_path: str, headers: list[str]
+    ) -> tuple[dict[tuple[int, int], dict], dict[int, dict]]:
+        """Read cell and header colors from a saved review xlsx (openpyxl).
+
+        Returns:
+            cell_fmt  – {(row, col): {"bg": "#rrggbb", "fg": "#rrggbb", "bold": bool}}
+            header_fmt – {col: {"bg": "#rrggbb", "fg": "#rrggbb"}}
+        """
+        cell_fmt: dict[tuple[int, int], dict] = {}
+        header_fmt: dict[int, dict] = {}
+
+        def _parse_rgb(raw: str | None) -> str | None:
+            """Convert openpyxl ARGB/RGB string → '#rrggbb', or None if default/absent."""
+            if not raw:
+                return None
+            raw = raw.upper().lstrip("#")
+            if len(raw) == 8:
+                raw = raw[2:]   # strip alpha
+            if len(raw) != 6:
+                return None
+            if raw in ("000000", "FFFFFF"):
+                return None     # ignore default black/white as 'no color'
+            return "#" + raw
+
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            sheet_name = _ReviewTableDialog._SHEET_NAME
+            if sheet_name not in wb.sheetnames:
+                wb.close()
+                return cell_fmt, header_fmt
+            ws = wb[sheet_name]
+
+            # Build xlsx-column → table-column mapping from the header row
+            lower_headers = [h.strip().lower() for h in headers]
+            xl_to_tbl: dict[int, int] = {}   # 0-based xlsx col → 0-based table col
+            # Default accent header colors to ignore (they are not user-set)
+            _ACCENT_BG_NORM = "D02752"
+            _NORMAL_BG_NORM = "111F35"
+            _DEFAULT_FG_NORM = "FFFFFF"
+
+            header_xl_row = next(ws.iter_rows(min_row=1, max_row=1), None)
+            if header_xl_row:
+                for xl_c, cell in enumerate(header_xl_row):
+                    val = str(cell.value or "").strip().lower()
+                    if val in lower_headers:
+                        tbl_c = lower_headers.index(val)
+                        xl_to_tbl[xl_c] = tbl_c
+                        # Read header color — only store if different from defaults
+                        h_bg: str | None = None
+                        h_fg: str | None = None
+                        if cell.fill and cell.fill.fill_type == "solid":
+                            raw = getattr(cell.fill.fgColor, "rgb", None)
+                            raw_norm = (raw or "").upper().lstrip("#")
+                            if len(raw_norm) == 8:
+                                raw_norm = raw_norm[2:]
+                            if raw_norm not in (_ACCENT_BG_NORM, _NORMAL_BG_NORM, "000000", "FFFFFF", ""):
+                                h_bg = "#" + raw_norm if len(raw_norm) == 6 else None
+                        if cell.font and cell.font.color and cell.font.color.type == "rgb":
+                            raw = cell.font.color.rgb
+                            raw_norm = (raw or "").upper().lstrip("#")
+                            if len(raw_norm) == 8:
+                                raw_norm = raw_norm[2:]
+                            if raw_norm not in (_DEFAULT_FG_NORM, "000000", "FFFFFF", ""):
+                                h_fg = "#" + raw_norm if len(raw_norm) == 6 else None
+                        if h_bg or h_fg:
+                            entry: dict = {}
+                            if h_bg:
+                                entry["bg"] = h_bg
+                            if h_fg:
+                                entry["fg"] = h_fg
+                            header_fmt[tbl_c] = entry
+
+            # Read data rows (row 2 onwards = table row 0 onwards)
+            for xl_r, row_cells in enumerate(ws.iter_rows(min_row=2)):
+                tbl_r = xl_r
+                for xl_c, cell in enumerate(row_cells):
+                    tbl_c = xl_to_tbl.get(xl_c)
+                    if tbl_c is None:
+                        continue
+                    entry: dict = {}
+                    if cell.fill and cell.fill.fill_type == "solid":
+                        bg = _parse_rgb(getattr(cell.fill.fgColor, "rgb", None))
+                        if bg:
+                            entry["bg"] = bg
+                    if cell.font:
+                        if cell.font.color and cell.font.color.type == "rgb":
+                            fg = _parse_rgb(cell.font.color.rgb)
+                            if fg:
+                                entry["fg"] = fg
+                        if cell.font.bold:
+                            entry["bold"] = True
+                    if entry:
+                        cell_fmt[(tbl_r, tbl_c)] = entry
+
+            wb.close()
+        except Exception:
+            pass
+
+        return cell_fmt, header_fmt
 
     # ── table helpers ──────────────────────────────────────────────────────
     def _compute_accent_cols(self) -> set[int]:
@@ -4753,6 +5019,115 @@ class _ReviewTableDialog(QDialog):
             col = lower.index(self._HBM_COL.lower())
             delegate = self._HBMButtonDelegate(self._on_hbm_lookup, self.table)
             self.table.setItemDelegateForColumn(col, delegate)
+
+    # ── Assessment Comments column helpers ─────────────────────────────────
+    _ASSESS_COL_VARIANTS: frozenset[str] = frozenset({
+        "assessment comments", "assesment comments", "asessment comments",
+        "asesment comments", "comments", "coments",
+    })
+
+    @staticmethod
+    def _ensure_assessment_col(
+        headers: list[str], rows: list[list[str]]
+    ) -> tuple[list[str], list[list[str]]]:
+        """Insert 'Assessment Comments' after 'Lib IDH' if no variant is present."""
+        lower = [h.strip().lower() for h in headers]
+        if any(h in _ReviewTableDialog._ASSESS_COL_VARIANTS for h in lower):
+            return headers, rows
+        insert_after = next((i for i, h in enumerate(lower) if h == "lib idh"), None)
+        insert_pos = (insert_after + 1) if insert_after is not None else len(headers)
+        headers = list(headers)
+        headers.insert(insert_pos, "Assessment Comments")
+        new_rows: list[list[str]] = []
+        for r in rows:
+            new_r = list(r)
+            while len(new_r) < insert_pos:
+                new_r.append("")
+            new_r.insert(insert_pos, "")
+            new_rows.append(new_r)
+        return headers, new_rows
+
+    def _assess_col_index(self) -> int | None:
+        lower = [h.strip().lower() for h in self._headers]
+        return next((i for i, h in enumerate(lower) if h in self._ASSESS_COL_VARIANTS), None)
+
+    def _position_assess_btn(self) -> None:
+        assess_col = self._assess_col_index()
+        if assess_col is None:
+            self._assess_run_btn.hide()
+            return
+        btn_w = self._assess_run_btn.width()
+        btn_h = self._assess_run_btn.height()
+        # Tell the header painter to leave room for the button on the right
+        self._header_view.set_section_btn_reserve(assess_col, btn_w + 4)
+        col_x = self._header_view.sectionViewportPosition(assess_col)
+        col_w = self._header_view.sectionSize(assess_col)
+        hdr_h = self._header_view.height()
+        x = col_x + col_w - btn_w - 6
+        y = max(0, (hdr_h - btn_h) // 2)
+        self._assess_run_btn.move(x, y)
+        self._assess_run_btn.raise_()
+        self._assess_run_btn.show()
+
+    def _on_run_initial_assessment(self) -> None:
+        """For each Basic Number group, mark subsequent rows as 'Clone of: <HBM>'."""
+        lower = [h.strip().lower() for h in self._headers]
+        basic_variants = {"basic number", "basic num", "basic no", "basic"}
+        basic_col = next((i for i, h in enumerate(lower) if h in basic_variants), None)
+        hbm_col   = next((i for i, h in enumerate(lower) if h == "head bom mat"), None)
+        assess_col = self._assess_col_index()
+
+        if basic_col is None or assess_col is None:
+            QMessageBox.warning(
+                self, "Missing Columns",
+                "Could not find 'Basic Number' or 'Assessment Comments' column.",
+            )
+            return
+
+        self._push_undo_snapshot(force=True)
+        self.table.blockSignals(True)
+
+        # first_row_for[basic_val] = row index of first occurrence
+        first_row_for: dict[str, int] = {}
+        clones_written = 0
+
+        for row in range(self.table.rowCount()):
+            basic_item = self.table.item(row, basic_col)
+            basic_val = basic_item.text().strip() if basic_item else ""
+            if not basic_val:
+                continue
+
+            if basic_val not in first_row_for:
+                first_row_for[basic_val] = row
+                # Leave first occurrence untouched
+            else:
+                first_row = first_row_for[basic_val]
+                hbm_val = ""
+                if hbm_col is not None:
+                    hbm_item = self.table.item(first_row, hbm_col)
+                    hbm_val = hbm_item.text().strip() if hbm_item else ""
+                comment = f"Clone of: {hbm_val}" if hbm_val else "Clone of: (unknown)"
+                item = self.table.item(row, assess_col)
+                if item is None:
+                    item = QTableWidgetItem(comment)
+                    self.table.setItem(row, assess_col, item)
+                else:
+                    item.setText(comment)
+                clones_written += 1
+
+        self.table.blockSignals(False)
+        self._push_undo_snapshot(force=True)
+
+        if clones_written:
+            QMessageBox.information(
+                self, "Assessment Complete",
+                f"Initial assessment done — {clones_written} clone(s) marked.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Assessment Complete",
+                "No duplicate Basic Numbers found — no clones to mark.",
+            )
 
     def _on_hbm_lookup(self, hbm_value: str) -> None:
         """Look up hbm_value in all tracker files and show a popup with matching row data."""
@@ -5099,6 +5474,32 @@ class _ReviewTableDialog(QDialog):
             item.setForeground(QColor(hex_color))
         self.table.blockSignals(False)
 
+    def _on_format_header_bg(self) -> None:
+        """Pick a background color for the currently selected column's header."""
+        col = self.table.currentColumn()
+        if col < 0:
+            QMessageBox.information(self, "No Column Selected",
+                                    "Click on a column header to select it first.")
+            return
+        color = QColorDialog.getColor(parent=self)
+        if not color.isValid():
+            return
+        self._header_fmt.setdefault(col, {})["bg"] = color.name()
+        self._header_view.update_header_colors(self._header_fmt)
+
+    def _on_format_header_fg(self) -> None:
+        """Pick a text color for the currently selected column's header."""
+        col = self.table.currentColumn()
+        if col < 0:
+            QMessageBox.information(self, "No Column Selected",
+                                    "Click on a column header to select it first.")
+            return
+        color = QColorDialog.getColor(parent=self)
+        if not color.isValid():
+            return
+        self._header_fmt.setdefault(col, {})["fg"] = color.name()
+        self._header_view.update_header_colors(self._header_fmt)
+
     def _on_import_bma_clicked(self) -> None:
         """Open another BMA file and append rows whose Head Bom Mat doesn't yet exist."""
         from pathlib import Path
@@ -5116,12 +5517,28 @@ class _ReviewTableDialog(QDialog):
                                 f"Could not read sheet '{self._SHEET_NAME}' from:\n{file}")
             return
 
-        # Determine Head Bom Mat column index in current table
+        if not new_rows:
+            QMessageBox.information(self, "Import", "The selected file contains no data rows.")
+            return
+
+        # Build column mapping: new-file col index → current table col index (case-insensitive)
+        current_lower = [h.strip().lower() for h in self._headers]
+        header_map: dict[int, int] = {}
+        for new_c, new_h in enumerate(new_headers):
+            key = new_h.strip().lower()
+            if key in current_lower:
+                header_map[new_c] = current_lower.index(key)
+
+        if not header_map:
+            QMessageBox.warning(self, "Import Error",
+                                "No matching column headers found between the files.")
+            return
+
+        # Collect existing Head Bom Mat values to skip duplicates
         existing_hbm_col = next(
             (i for i, h in enumerate(self._headers) if h.strip().lower() == self._HBM_COL.lower()),
             None,
         )
-        # Collect existing Head Bom Mat values
         existing_hbm_vals: set[str] = set()
         if existing_hbm_col is not None:
             for r in range(self.table.rowCount()):
@@ -5130,40 +5547,33 @@ class _ReviewTableDialog(QDialog):
                 if val:
                     existing_hbm_vals.add(val.lower())
 
-        # Index mapping: new_col → current_col (match by header name, case-insensitive)
-        header_map: dict[int, int] = {}
-        current_header_lower = [h.strip().lower() for h in self._headers]
-        for new_c, new_h in enumerate(new_headers):
-            key = new_h.strip().lower()
-            if key in current_header_lower:
-                header_map[new_c] = current_header_lower.index(key)
-
-        # Find Head Bom Mat col in new file
         new_hbm_col = next(
             (i for i, h in enumerate(new_headers) if h.strip().lower() == self._HBM_COL.lower()),
             None,
         )
 
-        added = 0
         self._push_undo_snapshot(force=True)
         self.table.blockSignals(True)
 
+        added = 0
+        skipped = 0
+        col_count = self.table.columnCount()
         for row_data in new_rows:
-            # Check Head Bom Mat uniqueness
+            # Skip rows whose Head Bom Mat already exists in the table
             if new_hbm_col is not None:
                 hbm_val = str(row_data[new_hbm_col]).strip() if new_hbm_col < len(row_data) else ""
                 if hbm_val.lower() in existing_hbm_vals:
+                    skipped += 1
                     continue
                 if hbm_val:
                     existing_hbm_vals.add(hbm_val.lower())
 
-            # Append row
             insert_row = self.table.rowCount()
             self.table.insertRow(insert_row)
-            for c in range(self.table.columnCount()):
+            for c in range(col_count):
                 self.table.setItem(insert_row, c, QTableWidgetItem(""))
             for new_c, cur_c in header_map.items():
-                val = str(row_data[new_c]) if new_c < len(row_data) else ""
+                val = str(row_data[new_c]).strip() if new_c < len(row_data) else ""
                 item = QTableWidgetItem(val)
                 self._apply_rule_formatting(item, cur_c, val)
                 self.table.setItem(insert_row, cur_c, item)
@@ -5172,7 +5582,10 @@ class _ReviewTableDialog(QDialog):
         self.table.blockSignals(False)
         self._push_undo_snapshot(force=True)
         self._update_row_count()
-        QMessageBox.information(self, "Import Complete", f"{added} new row(s) added.")
+        msg = f"{added} row(s) added from {Path(file).name}."
+        if skipped:
+            msg += f"\n{skipped} row(s) skipped (Head Bom Mat already exists)."
+        QMessageBox.information(self, "Import Complete", msg)
 
     def _on_save_clicked(self) -> None:
         """Save table as review_YYYY_MM_DD_HH_MM.xlsx with full formatting in the Project Review folder."""
@@ -5233,12 +5646,12 @@ class _ReviewTableDialog(QDialog):
         for c_idx, col_name in enumerate(self._headers):
             xl_col = c_idx + 1
             cell = ws.cell(row=1, column=xl_col, value=col_name)
-            if c_idx in accent_col_indices:
-                cell.fill   = _hex_fill("#D02752")
-                cell.font   = _hex_font("#FFFFFF", bold=True)
-            else:
-                cell.fill   = _hex_fill("#111F35")
-                cell.font   = _hex_font("#FFFFFF", bold=True)
+            # User-set header color takes priority; fall back to accent/normal defaults
+            h_fmt = self._header_fmt.get(c_idx, {})
+            h_bg = h_fmt.get("bg") or ("#D02752" if c_idx in accent_col_indices else "#111F35")
+            h_fg = h_fmt.get("fg") or "#FFFFFF"
+            cell.fill      = _hex_fill(h_bg)
+            cell.font      = _hex_font(h_fg, bold=True)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
             cell.border    = cell_border
 
@@ -11356,6 +11769,7 @@ class NewUIWindow(QMainWindow):
             sdc_folder=sdc_folder,
             project_review_folder=project_review_folder,
             tracker_files=tracker_files,
+            load_colors=self.radio_pr_continue.isChecked(),
             parent=None,          # non-modal: no parent → independent window
         )
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
