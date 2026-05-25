@@ -1267,9 +1267,10 @@ class StatusCollector:
     def attach_tracker_window_dialog(self, dialog) -> None:
         """Connect Tracker Window dialog buttons that are handled by StatusCollector."""
         _start = getattr(dialog, "_browse_start_dir", "")
+        _tsc_out = getattr(dialog, "_tsc_output_dir", "") or _start
         dialog.btn_import_tracker.clicked.connect(lambda: self.import_trackers_to_window(dialog, _start))
         dialog.btn_apply_cleanup.clicked.connect(lambda: self.apply_cleanup_to_table(dialog))
-        dialog.btn_load_tsc.clicked.connect(lambda: self.load_tsc_output_to_window(dialog, _start))
+        dialog.btn_load_tsc.clicked.connect(lambda: self.load_tsc_output_to_window(dialog, _tsc_out))
         dialog.btn_export.clicked.connect(lambda: self.export_tracker_table_to_xlsx(dialog))
 
     def export_tracker_table_to_xlsx(self, dialog) -> None:

@@ -2290,9 +2290,10 @@ class _TscOption1TableDialog(QDialog):
                     selected.add(value)
             return selected
 
-    def __init__(self, parent: QWidget | None = None, start_dir: str = "") -> None:
+    def __init__(self, parent: QWidget | None = None, start_dir: str = "", tsc_output_dir: str = "") -> None:
         super().__init__(parent)
         self._browse_start_dir = start_dir
+        self._tsc_output_dir   = tsc_output_dir
         self.setWindowTitle("Open window")
         self.resize(1300, 620)
         self.setMinimumSize(1080, 520)
@@ -3493,7 +3494,11 @@ class _TscChartDialog(QDialog):
         viewport_h = self._chart_scroll.viewport().height()
         figure_h = max(h_px, viewport_h) if viewport_h > 0 else h_px
         dpi = self._figure.dpi
-        self._figure.set_size_inches(self._figure.get_figwidth(), figure_h / dpi)
+        # figure_h is in logical (device-independent) pixels.  On HiDPI screens
+        # the figure DPI may already be multiplied by the device pixel ratio, so
+        # we must convert logical → physical pixels before dividing by dpi.
+        dpr = self._canvas.devicePixelRatioF()
+        self._figure.set_size_inches(self._figure.get_figwidth(), figure_h * dpr / dpi)
         self._canvas.updateGeometry()
 
     def _on_mode_changed(self) -> None:
@@ -10793,49 +10798,87 @@ class NewUIWindow(QMainWindow):
             )
 
     def _on_compare_browse_rsd_target(self) -> None:
+        start = self._get_browse_dir("sap_compare")
+        if self._use_root_folders:
+            text = self.lbl_compare_rsd_target.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _first = _P(text.split(",")[0].strip())
+                if _first.is_absolute() and _first.parent.is_dir():
+                    start = str(_first.parent)
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select RSD: Target File(s)",
-            self._get_browse_dir("sap_compare"),
-            "Excel Files (*.xlsx)")
+            self, "Select RSD: Target File(s)", start, "Excel Files (*.xlsx)")
         if paths:
             self.lbl_compare_rsd_target.setText(", ".join(paths))
 
     def _on_compare_browse_rsd_master(self) -> None:
+        start = self._get_browse_dir("sap_compare")
+        if self._use_root_folders:
+            text = self.lbl_compare_rsd_master.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _p = _P(text)
+                if _p.is_absolute() and _p.parent.is_dir():
+                    start = str(_p.parent)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select RSD: Master File",
-            self._get_browse_dir("sap_compare"),
-            "Excel Files (*.xlsx *.xls)")
+            self, "Select RSD: Master File", start, "Excel Files (*.xlsx *.xls)")
         if path:
             self.lbl_compare_rsd_master.setStyleSheet("")
             self.lbl_compare_rsd_master.setText(path)
 
     def _on_compare_browse_tsc_data(self) -> None:
+        start = self._get_browse_dir("sap_compare")
+        if self._use_root_folders:
+            text = self.lbl_compare_tsc_data.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _p = _P(text)
+                if _p.is_absolute() and _p.parent.is_dir():
+                    start = str(_p.parent)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select TSC Data File",
-            self._get_browse_dir("sap_compare"),
-            "Excel Files (*.xlsx *.xls)")
+            self, "Select TSC Data File", start, "Excel Files (*.xlsx *.xls)")
         if path:
             self.lbl_compare_tsc_data.setText(path)
 
     def _on_compare_browse_library(self) -> None:
+        start = self._get_browse_dir("excel_library")
+        if self._use_root_folders:
+            text = self.lbl_compare_library.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _p = _P(text)
+                if _p.is_absolute() and _p.parent.is_dir():
+                    start = str(_p.parent)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Excel Library File",
-            self._get_browse_dir("excel_library"),
-            "Excel Files (*.xlsx)")
+            self, "Select Excel Library File", start, "Excel Files (*.xlsx)")
         if path:
             self.lbl_compare_library.setText(path)
 
     def _on_compare_browse_packshot_location(self) -> None:
+        start = self._get_browse_dir("sap_compare")
+        if self._use_root_folders:
+            text = self.lbl_compare_packshot_location.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _p = _P(text)
+                if _p.is_absolute() and _p.is_dir():
+                    start = text
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Packshot Location",
-            self._get_browse_dir("sap_compare"))
+            self, "Select Packshot Location", start)
         if folder:
             self.lbl_compare_packshot_location.setText(folder)
 
     def _on_compare_browse_output_location(self) -> None:
+        start = self._get_browse_dir("sap_compare")
+        if self._use_root_folders:
+            text = self.lbl_compare_output_location.text().strip()
+            if text:
+                from pathlib import Path as _P
+                _p = _P(text)
+                if _p.is_absolute() and _p.is_dir():
+                    start = text
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Output Location",
-            self._get_browse_dir("sap_compare"))
+            self, "Select Output Location", start)
         if folder:
             self.lbl_compare_output_location.setText(folder)
 
@@ -11938,7 +11981,11 @@ class NewUIWindow(QMainWindow):
         self._idh_dup_window.activateWindow()
 
     def _open_tsc_option1_table(self) -> None:
-        self._tsc_option1_dialog = _TscOption1TableDialog(self, start_dir=self._get_browse_dir("tsc"))
+        self._tsc_option1_dialog = _TscOption1TableDialog(
+            self,
+            start_dir=self._get_browse_dir("tsc"),
+            tsc_output_dir=self._get_browse_dir("tsc_output"),
+        )
         # Connect Import Trackers button to status_collector logic
         if hasattr(self, "status_collector"):
             self.status_collector.attach_tracker_window_dialog(self._tsc_option1_dialog)
