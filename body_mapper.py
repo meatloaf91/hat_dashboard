@@ -1164,3 +1164,281 @@ def run_comparison(params: CompareParams) -> CompareResult:
             result.warnings.append(f"Failed to save {out_name}: {exc}")
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Set-mode comparison helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HIT_RANK: dict[str, int] = {"Total Hit": 3, "Partial Hit": 2, "0 Hit": 1, "": 0}
+
+
+def _compute_idh_rows_for_file(
+    target_path: str,
+    master_map: dict[str, list[str]],
+    tsc_map: dict[str, str],
+    lib_map: "dict | None",
+    _cached_target_rows: "list | None" = None,
+) -> list[dict]:
+    """Return a list of row-dicts for one target RSD file (IDH sheet logic)."""
+    target_rows = _cached_target_rows if _cached_target_rows is not None else _read_target_rows([target_path])
+    result_rows: list[dict] = []
+    for trow in target_rows:
+        hit_type = _determine_hit_type(trow.basic_numbers, master_map)
+        master_idh_items = (
+            [] if hit_type == "0 Hit"
+            else _resolve_master_idh(trow.basic_numbers, master_map, tsc_map)
+        )
+        build_label, build_color = _determine_master_build_label(
+            trow.basic_numbers, master_map, tsc_map
+        )
+        bn_to_name: dict[str, str] = dict(zip(trow.basic_numbers, trow.basic_names))
+        if hit_type == "0 Hit":
+            bn_matched_str   = "NA"
+            desc_matched_str = "NA"
+            bn_missed_str    = ", ".join(trow.basic_numbers)
+            desc_missed_str  = " | ".join(bn_to_name.get(bn, "") for bn in trow.basic_numbers)
+        elif hit_type == "Total Hit":
+            bn_matched_str   = ", ".join(trow.basic_numbers)
+            desc_matched_str = " | ".join(bn_to_name.get(bn, "") for bn in trow.basic_numbers)
+            bn_missed_str    = "NA"
+            desc_missed_str  = "NA"
+        else:  # Partial Hit
+            matched_bns      = [bn for bn in trow.basic_numbers if bn in master_map]
+            missed_bns       = [bn for bn in trow.basic_numbers if bn not in master_map]
+            bn_matched_str   = ", ".join(matched_bns)
+            desc_matched_str = " | ".join(bn_to_name.get(bn, "") for bn in matched_bns)
+            bn_missed_str    = ", ".join(missed_bns)
+            desc_missed_str  = " | ".join(bn_to_name.get(bn, "") for bn in missed_bns)
+        lib_mc = lib_ih = None
+        if lib_map is not None:
+            lib_mc, lib_ih = _lib_lookup(trow.basic_numbers, lib_map)
+        result_rows.append({
+            "head_bom_mat":        trow.head_bom_mat,
+            "basic_number_raw":    ", ".join(trow.basic_numbers),
+            "hit_type":            hit_type,
+            "master_idh_items":    master_idh_items,
+            "master_build_label":  build_label,
+            "master_build_color":  build_color,
+            "bn_matched_str":      bn_matched_str,
+            "desc_matched_str":    desc_matched_str,
+            "bn_missed_str":       bn_missed_str,
+            "desc_missed_str":     desc_missed_str,
+            "lib_model_code":      lib_mc,
+            "lib_idh":             lib_ih,
+        })
+    return result_rows
+
+
+def run_set_comparison(
+    target_cu_paths: "dict[int, str]",
+    master_cu_paths: "dict[int, str]",
+    common_levels: "list[int]",
+    tsc_data_path: str,
+    output_dir: str,
+    base_name: str,
+    excel_library_path: str = "",
+    compare_mode: str = "rsd_master",
+) -> CompareResult:
+    """
+    Run a set-mode SDC comparison.
+
+    Pairs target and master files by cu level, processes each pair from most
+    restrictive (cu3) to least (cu1, then cu4 if present), and merges results
+    so each HBM keeps the row with the highest hit-type rank (Total Hit > Partial
+    Hit > 0 Hit).  Produces a single merged output workbook.
+    """
+    result = CompareResult()
+    tsc_only = (compare_mode == "tsc_only")
+
+    # ── shared data ───────────────────────────────────────────────────────────
+    try:
+        tsc_map = _read_tsc_idh_build(tsc_data_path)
+    except Exception as exc:
+        result.warnings.append(f"Error reading TSC Data: {exc}")
+        return result
+
+    lib_map = None
+    if excel_library_path:
+        try:
+            lib_map = _read_library_map(excel_library_path)
+        except Exception as exc:
+            result.warnings.append(f"Error reading Excel Library: {exc}")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+
+    # ── processing order: cu1 → cu2 → cu3, cu4 last ──────────────────────────
+    non_cu4 = sorted([l for l in common_levels if l != 4])   # ascending
+    cu4_list = [4] if 4 in common_levels else []
+    processing_order = non_cu4 + cu4_list
+
+    # ── pre-read all master maps and target rows (avoid repeated I/O) ─────────
+    tsc_bn_map = None  # only used in tsc_only mode
+    if tsc_only:
+        try:
+            tsc_bn_map = _read_tsc_bn_to_idh(tsc_data_path)
+        except Exception as exc:
+            result.warnings.append(f"Error reading TSC BN map: {exc}")
+            return result
+
+    master_maps: dict[int, dict] = {}
+    for cu_level in processing_order:
+        if tsc_only:
+            master_maps[cu_level] = tsc_bn_map  # type: ignore[assignment]
+        else:
+            try:
+                master_maps[cu_level] = _read_master_bn_to_hbm(master_cu_paths[cu_level])
+            except Exception as exc:
+                result.warnings.append(f"cu{cu_level}: Error reading RSD Master: {exc}")
+                master_maps[cu_level] = {}
+
+    target_rows_cache: dict[int, list] = {}
+    for cu_level in processing_order:
+        try:
+            target_rows_cache[cu_level] = _read_target_rows([target_cu_paths[cu_level]])
+        except Exception as exc:
+            result.warnings.append(f"cu{cu_level}: Error reading RSD Target: {exc}")
+            target_rows_cache[cu_level] = []
+
+    # ── Phase 1: collect all rows from every cu-level comparison ─────────────
+    all_rows: list[dict] = []
+
+    for cu_level in processing_order:
+        master_map = master_maps.get(cu_level, {})
+        target_path = target_cu_paths[cu_level]
+
+        try:
+            rows = _compute_idh_rows_for_file(
+                target_path, master_map, tsc_map, lib_map,
+                _cached_target_rows=target_rows_cache.get(cu_level),
+            )
+        except Exception as exc:
+            result.warnings.append(f"cu{cu_level}: Error computing comparison: {exc}")
+            continue
+
+        all_rows.extend(rows)
+
+    # ── Phase 2: deduplicate – keep highest hit type per head_bom_mat ─────────
+    merged: dict[str, dict] = {}    # hbm → best row dict
+    merged_order: list[str] = []    # preserve first-seen insertion order
+
+    for row in all_rows:
+        hbm = row["head_bom_mat"]
+        new_rank = _HIT_RANK.get(row["hit_type"], 0)
+        if hbm not in merged:
+            merged[hbm] = row
+            merged_order.append(hbm)
+        elif new_rank > _HIT_RANK.get(merged[hbm]["hit_type"], 0):
+            merged[hbm] = row
+
+    if not merged:
+        result.warnings.append("Set comparison produced no results.")
+        return result
+
+    # ── build IDH sheet ───────────────────────────────────────────────────────
+    idh_headers = list(_HEADERS)
+    if lib_map is not None:
+        idh_headers.append(("Lib Model Code", _COL_HEADER_RED))
+        idh_headers.append(("Lib IDH",        _COL_HEADER_RED))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "body_map_IDH"
+    _write_header_row(ws, idh_headers)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(idh_headers))}1"
+    ws.row_dimensions[1].height = 30
+
+    for row_idx, hbm in enumerate(merged_order, start=2):
+        row = merged[hbm]
+        _write_result_row(
+            ws, row_idx,
+            head_bom_mat=row["head_bom_mat"],
+            basic_number_raw=row["basic_number_raw"],
+            hit_type=row["hit_type"],
+            master_idh_items=row["master_idh_items"],
+            master_build_label=row["master_build_label"],
+            master_build_color=row["master_build_color"],
+            bn_matched_str=row["bn_matched_str"],
+            desc_matched_str=row["desc_matched_str"],
+            bn_missed_str=row["bn_missed_str"],
+            desc_missed_str=row["desc_missed_str"],
+            lib_model_code=row.get("lib_model_code"),
+            lib_idh=row.get("lib_idh"),
+        )
+    _auto_col_width(ws)
+
+    # ── build GROUP sheet from most inclusive target (lowest cu level) ────────
+    group_cu = next((l for l in [1, 2, 3, 4] if l in target_cu_paths), None)
+    if group_cu is not None:
+        group_target_path = target_cu_paths[group_cu]
+        group_rows = _read_grouping_rows([group_target_path])
+
+        grp_headers = list(_HEADERS_GROUP)
+        if lib_map is not None:
+            grp_headers.extend(_LIB_HEADERS)
+
+        if tsc_only:
+            try:
+                grp_master_map = _read_tsc_bn_to_idh(tsc_data_path)
+            except Exception:
+                grp_master_map = {}
+        else:
+            try:
+                grp_master_map = _read_master_bn_to_hbm(master_cu_paths.get(group_cu, ""))
+            except Exception:
+                grp_master_map = {}
+
+        ws_g = wb.create_sheet("body_map_GROUP")
+        _write_header_row(ws_g, grp_headers)
+        ws_g.freeze_panes = "A2"
+        ws_g.auto_filter.ref = f"A1:{get_column_letter(len(grp_headers))}1"
+        ws_g.row_dimensions[1].height = 30
+
+        for g_idx, grow in enumerate(group_rows, start=2):
+            bns = _parse_basic_numbers(grow.basic_number) if grow.basic_number else []
+            g_hit_type = _determine_hit_type(bns, grp_master_map)
+            g_master_idh_items = (
+                [] if g_hit_type == "0 Hit"
+                else _resolve_master_idh(bns, grp_master_map, tsc_map)
+            )
+            g_build_label, g_build_color = _determine_master_build_label(bns, grp_master_map, tsc_map)
+            if g_hit_type == "0 Hit":
+                g_bn_matched = "NA"; g_desc_matched = "NA"
+                g_bn_missed = grow.basic_number; g_desc_missed = grow.basic_name
+            elif g_hit_type == "Total Hit":
+                g_bn_matched = grow.basic_number; g_desc_matched = grow.basic_name
+                g_bn_missed = "NA"; g_desc_missed = "NA"
+            else:
+                matched_bns = [bn for bn in bns if bn in grp_master_map]
+                missed_bns  = [bn for bn in bns if bn not in grp_master_map]
+                g_bn_matched = ", ".join(matched_bns); g_desc_matched = grow.basic_name if matched_bns else ""
+                g_bn_missed  = ", ".join(missed_bns);  g_desc_missed  = grow.basic_name if missed_bns else ""
+            g_lib_mc = g_lib_ih = None
+            if lib_map is not None:
+                g_lib_mc, g_lib_ih = _lib_lookup(bns, lib_map)
+            _write_group_row(
+                ws_g, g_idx,
+                bc=grow.bc, count=grow.count, basic_number=grow.basic_number,
+                hit_type=g_hit_type, master_idh_items=g_master_idh_items,
+                master_build_label=g_build_label, master_build_color=g_build_color,
+                bn_matched_str=g_bn_matched, desc_matched_str=g_desc_matched,
+                bn_missed_str=g_bn_missed, desc_missed_str=g_desc_missed,
+                lib_model_code=g_lib_mc, lib_idh=g_lib_ih,
+            )
+        _auto_col_width(ws_g)
+
+    # ── save ──────────────────────────────────────────────────────────────────
+    levels_str = "_".join(f"cu{l}" for l in sorted(common_levels))
+    out_name = f"sdc_bma_set_{base_name}_{levels_str}_{timestamp}.xlsx"
+    out_path = out_dir / out_name
+    try:
+        wb.save(str(out_path))
+        result.output_paths.append(str(out_path))
+        result.output_path = str(out_path)
+    except Exception as exc:
+        result.warnings.append(f"Failed to save {out_name}: {exc}")
+
+    return result

@@ -177,6 +177,23 @@ class SapTableReformatter:
         "bulk",
     )
 
+    CLEANUP_1_NEW_RESTRICTED_TERMS = (
+        "sal",
+        "pal",
+        "film",
+        "ship",
+        "wgl",
+        "sheet",
+        "shee",
+        "pl",
+        "t-secur",
+        "saco",
+        "rbosac",
+        "acco_pe",
+        "tear",
+        "bulk",
+    )
+
     CLEANUP_1_RESTRICTED_TERMS = (
         "sal",
         "pal",
@@ -255,23 +272,34 @@ class SapTableReformatter:
             filtered.append(row)
         return filtered
 
+    def _apply_cleanup1_new_filter(self, rows: list[list[str]]) -> list[list[str]]:
+        """Cleanup 1 (new): same as old Cleanup 1 but retains accl and flex SMU rows."""
+        filtered: list[list[str]] = []
+        for row in rows:
+            basic_name = row[self.INDEX_BASIC_NAME]
+            should_delete = any(
+                self._contains_term(basic_name, term)
+                for term in self.CLEANUP_1_NEW_RESTRICTED_TERMS
+            )
+            if not should_delete:
+                filtered.append(row)
+        return filtered
+
     def _apply_cleanup_mode(self, rows: list[list[str]], cleanup_mode: int) -> list[list[str]]:
-        if cleanup_mode == 3:
+        if cleanup_mode == 4:
             return rows
 
-        if cleanup_mode == 1:
-            prefixes = self.CLEANUP_PREFIXES_1
-        elif cleanup_mode == 2:
-            prefixes = self.CLEANUP_PREFIXES_2
-        else:
+        if cleanup_mode != 3:
             raise SapTableReformatError("Unknown cleanup mode selected.")
+
+        # Cleanup 3 (old Cleanup 2): CLEANUP_PREFIXES_2 + remove un-identifiable numeric names
+        prefixes = self.CLEANUP_PREFIXES_2
 
         filtered: list[list[str]] = []
         for row in rows:
             basic_name = row[self.INDEX_BASIC_NAME]
             basic_name_text = basic_name.strip().lower()
-            # Cleanup 2: remove rows whose basic name is purely numeric (un-identifiable)
-            if cleanup_mode == 2 and basic_name.strip().isdigit():
+            if basic_name.strip().isdigit():
                 continue
             if "acco" in basic_name_text or "paco" in basic_name_text:
                 continue
@@ -312,6 +340,8 @@ class SapTableReformatter:
                 continue
 
             if cleanup_mode == 1:
+                eligible_smu_rows = self._apply_cleanup1_new_filter(smu_rows)
+            elif cleanup_mode == 2:
                 eligible_smu_rows = self._apply_cleanup1_filter(smu_rows)
             else:
                 eligible_smu_rows = self._apply_cleanup_mode(smu_rows, cleanup_mode)

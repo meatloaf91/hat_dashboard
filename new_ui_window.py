@@ -81,7 +81,7 @@ from packshot_naming_generator import PackshotNamingGenerator
 from sap_reformat import SapTableReformatError, SapTableReformatter
 from general_functions import clear_other_panel_inputs
 from hat_config import HatConfig
-from body_mapper import CompareParams, run_comparison
+from body_mapper import CompareParams, run_comparison, run_set_comparison
 from reference_collector import RefCollectorParams, run_reference_collector
 import review_project
 from openpyxl import Workbook
@@ -2103,6 +2103,51 @@ class _MultipleTrackerWindow(QDialog):
             QMessageBox.information(self, "Export", f"Exported successfully:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
+
+
+class _SetMismatchDialog(QDialog):
+    """Shown when target and master cu-level file sets do not fully match."""
+
+    def __init__(
+        self,
+        target_levels: "list[int]",
+        master_levels: "list[int]",
+        common_levels: "list[int]",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Compare Set — File Mismatch")
+        self.setModal(True)
+        self.resize(420, 180)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        master_str = ", ".join(f"cu{l}" for l in sorted(master_levels))
+        target_str = ", ".join(f"cu{l}" for l in sorted(target_levels))
+        common_str = ", ".join(f"cu{l}" for l in sorted(common_levels))
+
+        msg = QLabel(
+            f"Compare files:\n"
+            f"RSD: Master:  {master_str}\n"
+            f"RSD: Target:  {target_str}\n\n"
+            f"File count mismatch — tool will proceed to compare {common_str}"
+        )
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_proceed = QPushButton("Proceed")
+        btn_proceed.setObjectName("compareRunBtn")
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setObjectName("compareGrayBtn")
+        btn_row.addWidget(btn_proceed)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        btn_proceed.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
 
 
 class _SdcSelectionDialog(QDialog):
@@ -5897,35 +5942,48 @@ class _MapperOption1TableDialog(QDialog):
         self.btn_undo_table.setObjectName("packshotUpdateRowsBtn")
         config_row.addWidget(self.btn_undo_table, 0)
 
-        self.cleanup_radio_group = QButtonGroup(self)
-        self.cleanup_radio_group.setExclusive(True)
-
         self.radio_cleanup_1 = QRadioButton("Cleanup 1")
         self.radio_cleanup_1.setChecked(True)
+        self.radio_cleanup_1.setObjectName("collectorCleanupRadio")
         self.radio_cleanup_1.setToolTip(
-            "remove non-SMU and unneeded packaging:\n"
+            "remove non-SMU and unneeded packaging\n"
+            "(retains accl and flex SMU rows):\n"
+            "sal, pal, film, ship, wgl, sheet, shee,\n"
+            "pl, t-secur, saco, rbosac, acco_pe, tear, bulk"
+        )
+        config_row.addWidget(self.radio_cleanup_1, 0)
+
+        self.radio_cleanup_2 = QRadioButton("Cleanup 2")
+        self.radio_cleanup_2.setObjectName("collectorCleanupRadio")
+        self.radio_cleanup_2.setToolTip(
+            "remove non-SMU and unneeded packaging\n"
+            "(including accl and flex):\n"
             "sal, flex, pall, accl, film, ship, wgl,\n"
             "sheet, shee, pl, t-secur, saco, acco_pe,\n"
             "tear, bulk"
         )
-        self.cleanup_radio_group.addButton(self.radio_cleanup_1)
-        config_row.addWidget(self.radio_cleanup_1, 0)
+        config_row.addWidget(self.radio_cleanup_2, 0)
 
-        self.radio_cleanup_2 = QRadioButton("Cleanup 2")
-        self.radio_cleanup_2.setToolTip(
+        self.radio_cleanup_3 = QRadioButton("Cleanup 3")
+        self.radio_cleanup_3.setObjectName("collectorCleanupRadio")
+        self.radio_cleanup_3.setToolTip(
             "remove non-SMU, un-identifiable basic name\n"
             "and unneeded packaging:\n"
             "sal, flex, pall, accl, film, ship, wgl,\n"
             "sheet, shee, pl, t-secur, saco, bag,\n"
             "rbosac, leaflet, acco, paco, tear, bulk"
         )
-        self.cleanup_radio_group.addButton(self.radio_cleanup_2)
-        config_row.addWidget(self.radio_cleanup_2, 0)
-
-        self.radio_cleanup_3 = QRadioButton("Cleanup 3")
-        self.radio_cleanup_3.setToolTip("no cleanup, all info retained")
-        self.cleanup_radio_group.addButton(self.radio_cleanup_3)
         config_row.addWidget(self.radio_cleanup_3, 0)
+
+        self.radio_cleanup_4 = QRadioButton("Cleanup 4")
+        self.radio_cleanup_4.setObjectName("collectorCleanupRadio")
+        self.radio_cleanup_4.setToolTip("no cleanup, all info retained")
+        config_row.addWidget(self.radio_cleanup_4, 0)
+
+        self.cleanup_radio_group = QButtonGroup(self)
+        self.cleanup_radio_group.setExclusive(True)
+        for rb in (self.radio_cleanup_1, self.radio_cleanup_2, self.radio_cleanup_3, self.radio_cleanup_4):
+            self.cleanup_radio_group.addButton(rb)
 
         self.btn_import_tracker = QPushButton("Import SAP Data")
         self.btn_import_tracker.setObjectName("packshotUpdateRowsBtn")
@@ -6562,24 +6620,29 @@ class _MapperOption1TableDialog(QDialog):
         self._restore_table_state(previous_snapshot)
 
     def _on_reformat_table_clicked(self) -> None:
-        cleanup_mode = 1
-        if self.radio_cleanup_2.isChecked():
-            cleanup_mode = 2
-        elif self.radio_cleanup_3.isChecked():
-            cleanup_mode = 3
+        cleanup_mode = next(
+            (i for i, rb in enumerate(
+                [self.radio_cleanup_1, self.radio_cleanup_2, self.radio_cleanup_3, self.radio_cleanup_4],
+                start=1,
+            ) if rb.isChecked()),
+            1,
+        )
 
         try:
             reformatted_rows, basic_comb_count = self.sap_table_reformatter.reformat_from_table(self.table, cleanup_mode)
         except SapTableReformatError as exc:
             msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
+            msg.setWindowTitle(f"Cleanup {cleanup_mode} Error")
             msg.setIcon(QMessageBox.Icon.Warning)
             msg.setText(str(exc))
             msg.setStandardButtons(QMessageBox.StandardButton.Ok)
             msg.exec()
             return
 
-        self._reformatted_dialog = _MapperReformattedTableDialog(
+        if not hasattr(self, "_reformatted_dialogs"):
+            self._reformatted_dialogs: list = []
+
+        dlg = _MapperReformattedTableDialog(
             reformatted_rows,
             basic_comb_count,
             cleanup_mode,
@@ -6587,9 +6650,10 @@ class _MapperOption1TableDialog(QDialog):
             source_stem=self._last_imported_stem,
             export_dir=self._export_dir,
         )
-        self._reformatted_dialog.show()
-        self._reformatted_dialog.raise_()
-        self._reformatted_dialog.activateWindow()
+        self._reformatted_dialogs.append(dlg)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
 
 class _MapperReformattedTableDialog(QDialog):
@@ -6720,7 +6784,7 @@ class _MapperReformattedTableDialog(QDialog):
         export_dir: str = "",
     ) -> None:
         super().__init__(parent)
-        self._cleanup_mode = cleanup_mode if cleanup_mode in (1, 2, 3) else 1
+        self._cleanup_mode = cleanup_mode if cleanup_mode in (1, 2, 3, 4) else 1
         self._source_stem = source_stem
         self._export_dir = export_dir
         self.setWindowTitle("Reformatted SAP Data")
@@ -6774,7 +6838,7 @@ class _MapperReformattedTableDialog(QDialog):
         self.label_hsi_count = QLabel("HSI Count: <b>0</b>")
         self.label_hsi_count.setObjectName("mapperReformattedOverview")
         self.label_hsi_count.setTextFormat(Qt.TextFormat.RichText)
-        self.label_hsi_count.setVisible(self._cleanup_mode != 3)
+        self.label_hsi_count.setVisible(self._cleanup_mode != 4)
         header_row.addWidget(self.label_hsi_count, 0)
         header_row.addSpacing(20)
 
@@ -9408,7 +9472,10 @@ class NewUIWindow(QMainWindow):
         self.input_mapper_output_location.clear()
         self._mapper_sap_file_paths = []
         self._mapper_output_location = ""
-        self.radio_mapper_cleanup_1.setChecked(True)
+        self.check_mapper_cleanup_1.setChecked(True)
+        self.check_mapper_cleanup_2.setChecked(True)
+        self.check_mapper_cleanup_3.setChecked(True)
+        self.check_mapper_cleanup_4.setChecked(False)
         self.checkbox_mapper_include_grouping_report.setChecked(True)
         self.mapper_reformat_progress_bar.setValue(0)
         self.mapper_reformat_progress_bar.setVisible(False)
@@ -10428,38 +10495,46 @@ class NewUIWindow(QMainWindow):
         cleanup_radio_row = QHBoxLayout()
         cleanup_radio_row.setSpacing(16)
 
-        self.mapper_cleanup_radio_group = QButtonGroup(page)
-        self.mapper_cleanup_radio_group.setExclusive(True)
+        self.check_mapper_cleanup_1 = QCheckBox("Cleanup 1")
+        self.check_mapper_cleanup_1.setChecked(True)
+        self.check_mapper_cleanup_1.setObjectName("mapperCleanupCheck")
+        self.check_mapper_cleanup_1.setToolTip(
+            "remove non-SMU and unneeded packaging\n"
+            "(retains accl and flex SMU rows):\n"
+            "sal, pal, film, ship, wgl, sheet, shee,\n"
+            "pl, t-secur, saco, rbosac, acco_pe, tear, bulk"
+        )
+        cleanup_radio_row.addWidget(self.check_mapper_cleanup_1, 0)
 
-        self.radio_mapper_cleanup_1 = QRadioButton("Cleanup 1")
-        self.radio_mapper_cleanup_1.setChecked(True)
-        self.radio_mapper_cleanup_1.setObjectName("collectorCleanupRadio")
-        self.radio_mapper_cleanup_1.setToolTip(
-            "remove non-SMU and unneeded packaging:\n"
+        self.check_mapper_cleanup_2 = QCheckBox("Cleanup 2")
+        self.check_mapper_cleanup_2.setChecked(True)
+        self.check_mapper_cleanup_2.setObjectName("mapperCleanupCheck")
+        self.check_mapper_cleanup_2.setToolTip(
+            "remove non-SMU and unneeded packaging\n"
+            "(including accl and flex):\n"
             "sal, flex, pall, accl, film, ship, wgl,\n"
             "sheet, shee, pl, t-secur, saco, acco_pe,\n"
             "tear, bulk"
         )
-        self.mapper_cleanup_radio_group.addButton(self.radio_mapper_cleanup_1)
-        cleanup_radio_row.addWidget(self.radio_mapper_cleanup_1, 0)
+        cleanup_radio_row.addWidget(self.check_mapper_cleanup_2, 0)
 
-        self.radio_mapper_cleanup_2 = QRadioButton("Cleanup 2")
-        self.radio_mapper_cleanup_2.setObjectName("collectorCleanupRadio")
-        self.radio_mapper_cleanup_2.setToolTip(
+        self.check_mapper_cleanup_3 = QCheckBox("Cleanup 3")
+        self.check_mapper_cleanup_3.setChecked(True)
+        self.check_mapper_cleanup_3.setObjectName("mapperCleanupCheck")
+        self.check_mapper_cleanup_3.setToolTip(
             "remove non-SMU, un-identifiable basic name\n"
             "and unneeded packaging:\n"
             "sal, flex, pall, accl, film, ship, wgl,\n"
             "sheet, shee, pl, t-secur, saco, bag,\n"
             "rbosac, leaflet, acco, paco, tear, bulk"
         )
-        self.mapper_cleanup_radio_group.addButton(self.radio_mapper_cleanup_2)
-        cleanup_radio_row.addWidget(self.radio_mapper_cleanup_2, 0)
+        cleanup_radio_row.addWidget(self.check_mapper_cleanup_3, 0)
 
-        self.radio_mapper_cleanup_3 = QRadioButton("Cleanup 3")
-        self.radio_mapper_cleanup_3.setObjectName("collectorCleanupRadio")
-        self.radio_mapper_cleanup_3.setToolTip("no cleanup, all info retained")
-        self.mapper_cleanup_radio_group.addButton(self.radio_mapper_cleanup_3)
-        cleanup_radio_row.addWidget(self.radio_mapper_cleanup_3, 0)
+        self.check_mapper_cleanup_4 = QCheckBox("Cleanup 4")
+        self.check_mapper_cleanup_4.setChecked(False)
+        self.check_mapper_cleanup_4.setObjectName("mapperCleanupCheck")
+        self.check_mapper_cleanup_4.setToolTip("no cleanup, all info retained")
+        cleanup_radio_row.addWidget(self.check_mapper_cleanup_4, 0)
 
         cleanup_radio_row.addStretch(1)
         layout.addLayout(cleanup_radio_row)
@@ -10528,6 +10603,28 @@ class NewUIWindow(QMainWindow):
         title_row.addWidget(self.lbl_sdc_input_count, 0)
         title_row.addStretch(1)
         layout.addLayout(title_row)
+
+        # ── Set vs Individual Files mode ──────────────────────────────────
+        sdc_mode_row = QHBoxLayout()
+        sdc_mode_row.setSpacing(16)
+        self.radio_sdc_set = QRadioButton("Set")
+        self.radio_sdc_set.setObjectName("compareModeRadioSmall")
+        self.radio_sdc_set.setChecked(True)
+        self.radio_sdc_set.setToolTip(
+            "Compare matching cu-level pairs (cu1 vs cu1, cu2 vs cu2, …)\n"
+            "and merge results by best hit type."
+        )
+        self.radio_sdc_individual = QRadioButton("Individual Files")
+        self.radio_sdc_individual.setObjectName("compareModeRadioSmall")
+        self.radio_sdc_individual.setToolTip("Compare one RSD: Target file against one RSD: Master file.")
+        self.sdc_input_mode_group = QButtonGroup(page)
+        self.sdc_input_mode_group.setExclusive(True)
+        self.sdc_input_mode_group.addButton(self.radio_sdc_set)
+        self.sdc_input_mode_group.addButton(self.radio_sdc_individual)
+        sdc_mode_row.addWidget(self.radio_sdc_set, 0)
+        sdc_mode_row.addWidget(self.radio_sdc_individual, 0)
+        sdc_mode_row.addStretch(1)
+        layout.addLayout(sdc_mode_row)
 
         def _make_pair(btn_label: str):
             row = QHBoxLayout()
@@ -10632,6 +10729,8 @@ class NewUIWindow(QMainWindow):
         progress_row.addStretch(1)
         layout.addLayout(progress_row)
 
+        self.radio_sdc_set.toggled.connect(self._sync_mapper_compare_mode_ui)
+        self.radio_sdc_individual.toggled.connect(self._sync_mapper_compare_mode_ui)
         self.checkbox_compare_with_master.stateChanged.connect(self._sync_mapper_compare_mode_ui)
         self.radio_compare_with_rsd_master.toggled.connect(self._sync_mapper_compare_mode_ui)
         self.radio_compare_only_tsc.toggled.connect(self._sync_mapper_compare_mode_ui)
@@ -10651,18 +10750,98 @@ class NewUIWindow(QMainWindow):
         return page
 
     def _on_mapper_compare_run(self) -> None:
-        """Collect UI inputs and run the SDC comparison via body_mapper."""
+        """Dispatch to set-mode or individual-mode comparison."""
+        if hasattr(self, "radio_sdc_set") and self.radio_sdc_set.isChecked():
+            self._on_mapper_compare_run_set()
+        else:
+            self._on_mapper_compare_run_individual()
+
+    def _extract_cu_level(self, file_path: str) -> "int | None":
+        """Return the cu level (1–4) from an RSD filename, or None if not found."""
+        import re as _re
+        m = _re.search(r"[_\-]cu(\d+)[_\-]", Path(file_path).stem, _re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    def _on_mapper_compare_run_set(self) -> None:
+        """Set-mode: pair files by cu level, merge results by best hit type."""
         from pathlib import Path as _Path
 
-        # ── gather RSD: Target paths ─────────────────────────────────────
-        raw_target = self.lbl_compare_rsd_target.text().strip()
-        rsd_target_paths = [p.strip() for p in raw_target.split(",") if p.strip()] if raw_target else []
+        raw_target  = self.lbl_compare_rsd_target.text().strip()
+        raw_master  = self.lbl_compare_rsd_master.text().strip()
+        tsc_data_path = self.lbl_compare_tsc_data.text().strip()
+        output_dir  = self.lbl_compare_output_location.text().strip()
 
-        rsd_master_path = self.lbl_compare_rsd_master.text().strip()
-        tsc_data_path   = self.lbl_compare_tsc_data.text().strip()
-        output_dir      = self.lbl_compare_output_location.text().strip()
+        # ── basic validation ─────────────────────────────────────────────
+        missing: list[str] = []
+        compare_mode = "tsc_only" if self.radio_compare_only_tsc.isChecked() else "rsd_master"
+        if not raw_target:
+            missing.append("RSD: Target")
+        if compare_mode == "rsd_master" and not raw_master:
+            missing.append("RSD: Master")
+        if not tsc_data_path:
+            missing.append("TSC Data")
+        if not output_dir:
+            missing.append("Output Location")
+        if missing:
+            QMessageBox.warning(
+                self, "Missing Input",
+                "Please fill in the following fields:\n" + "\n".join(f"  • {m}" for m in missing),
+            )
+            return
 
-        # ── library validation ───────────────────────────────────────────
+        # ── parse cu levels ───────────────────────────────────────────────
+        target_paths = [p.strip() for p in raw_target.split(",") if p.strip()]
+        master_paths = [p.strip() for p in raw_master.split(",") if p.strip()] if raw_master else []
+
+        target_cu: dict[int, str] = {}
+        for p in target_paths:
+            lvl = self._extract_cu_level(p)
+            if lvl is not None:
+                target_cu[lvl] = p
+
+        master_cu: dict[int, str] = {}
+        if compare_mode == "rsd_master":
+            for p in master_paths:
+                lvl = self._extract_cu_level(p)
+                if lvl is not None:
+                    master_cu[lvl] = p
+
+        if not target_cu:
+            QMessageBox.warning(
+                self, "No cu-tagged Files",
+                "RSD: Target files must include a cu-level tag in their filename (e.g. rsd_name_cu1_...).\n"
+                "Please select the correct files.",
+            )
+            return
+
+        if compare_mode == "rsd_master" and not master_cu:
+            QMessageBox.warning(
+                self, "No cu-tagged Files",
+                "RSD: Master files must include a cu-level tag in their filename (e.g. rsd_name_cu1_...).\n"
+                "Please select the correct files.",
+            )
+            return
+
+        common_levels = sorted(
+            set(target_cu.keys()) & (set(master_cu.keys()) if compare_mode == "rsd_master" else set(target_cu.keys()))
+        )
+        if not common_levels:
+            QMessageBox.warning(
+                self, "No Matching Levels",
+                "No matching cu levels found between RSD: Target and RSD: Master.\n"
+                "Ensure both sides have files tagged with the same cu level (cu1, cu2, etc.).",
+            )
+            return
+
+        # ── mismatch dialog ───────────────────────────────────────────────
+        target_levels = sorted(target_cu.keys())
+        master_levels = sorted(master_cu.keys()) if compare_mode == "rsd_master" else target_levels
+        if target_levels != master_levels:
+            dlg = _SetMismatchDialog(target_levels, master_levels, common_levels, self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+
+        # ── library ───────────────────────────────────────────────────────
         _LIB_ERROR_STYLE = (
             "background-color: rgba(208, 39, 82, 128); color: #000000; "
             "border: 1px solid #6F6F6F; border-radius: 11px; "
@@ -10677,8 +10856,136 @@ class NewUIWindow(QMainWindow):
                 and lib_paths[0].lower().endswith(".xlsx")
                 and _Path(lib_paths[0]).is_file()
             )
+            if lib_is_single_file:
+                excel_library_path = lib_paths[0]
+
+        # ── derive base name from first target file ───────────────────────
+        import re as _re
+        _DATE_SUFFIX = _re.compile(
+            r"[_-]\d{4}[_-]\d{2}[_-]\d{2}[_-]\d{2}[_-]\d{2}$"
+            r"|[_-]\d{2}[_-]\d{2}[_-]\d{2}[_-]\d{2}$"
+        )
+        _CU_TAG = _re.compile(r"[_\-]cu\d+[_\-]?", _re.IGNORECASE)
+
+        def _set_base_name(path: str) -> str:
+            stem = _Path(path).stem
+            if stem.lower().startswith("rsd_"):
+                stem = stem[4:]
+            stem = _CU_TAG.sub("_", stem)
+            return _DATE_SUFFIX.sub("", stem).strip("_")
+
+        base_name = _set_base_name(list(target_cu.values())[0])
+
+        # ── run ───────────────────────────────────────────────────────────
+        self.mapper_compare_progress_bar.setValue(0)
+        self.mapper_compare_progress_bar.setVisible(True)
+        self.btn_run_process_mapper_compare.setEnabled(False)
+        QApplication.processEvents()
+
+        compare_result = run_set_comparison(
+            target_cu_paths=target_cu,
+            master_cu_paths=master_cu if compare_mode == "rsd_master" else {},
+            common_levels=common_levels,
+            tsc_data_path=tsc_data_path,
+            output_dir=output_dir,
+            base_name=base_name,
+            excel_library_path=excel_library_path,
+            compare_mode=compare_mode,
+        )
+
+        self.mapper_compare_progress_bar.setValue(80)
+        QApplication.processEvents()
+
+        # ── reference collector (optional) ────────────────────────────────
+        rc_result = None
+        if (
+            self.checkbox_compare_run_ref_collector.isChecked()
+            and compare_result.output_paths
+        ):
+            packshot_folder = self.lbl_compare_packshot_location.text().strip()
+            if not packshot_folder or not Path(packshot_folder).is_dir():
+                compare_result.warnings.append(
+                    "Reference collector skipped: Packshot Image Library folder is missing or invalid."
+                )
+            else:
+                try:
+                    max_imgs = int(self.input_compare_max_packshot.text().strip())
+                except ValueError:
+                    max_imgs = 5
+                rc_params = RefCollectorParams(
+                    sdc_output_paths   = compare_result.output_paths,
+                    image_library_path = packshot_folder,
+                    output_dir         = output_dir,
+                    tsc_data_path      = tsc_data_path,
+                    max_images         = max(1, max_imgs),
+                )
+                rc_result = run_reference_collector(rc_params)
+                compare_result.warnings.extend(rc_result.warnings)
+
+        self.mapper_compare_progress_bar.setValue(100)
+        QApplication.processEvents()
+        self.mapper_compare_progress_bar.setVisible(False)
+        self.btn_run_process_mapper_compare.setEnabled(True)
+
+        if compare_result.warnings:
+            warn_text = "\n".join(compare_result.warnings)
+            if not compare_result.output_paths:
+                QMessageBox.critical(self, "SDC Set Error", warn_text)
+                return
+            QMessageBox.warning(self, "SDC Set completed with warnings", warn_text)
+
+        if compare_result.output_paths:
+            paths_text = "\n".join(compare_result.output_paths)
+            rc_info = ""
+            if rc_result and rc_result.pdf_paths:
+                rc_info = (
+                    f"\n\nReference Collector PDFs ({len(rc_result.pdf_paths)}) "
+                    f"saved to:\n{output_dir}"
+                )
+            QMessageBox.information(self, "SDC Set Complete", f"Output saved to:\n{paths_text}{rc_info}")
+
+    def _on_mapper_compare_run_individual(self) -> None:
+        """Individual-mode: existing single-target comparison logic."""
+
+        _ERROR_STYLE = (
+            "background-color: rgba(208, 39, 82, 128); color: #000000; "
+            "border: 1px solid #6F6F6F; border-radius: 11px; "
+            "padding: 0 8px; font-family: 'Segoe UI'; font-size: 10px;"
+        )
+
+        # ── gather RSD: Target paths ─────────────────────────────────────
+        raw_target = self.lbl_compare_rsd_target.text().strip()
+        rsd_target_paths = [p.strip() for p in raw_target.split(",") if p.strip()] if raw_target else []
+
+        raw_master = self.lbl_compare_rsd_master.text().strip()
+        tsc_data_path = self.lbl_compare_tsc_data.text().strip()
+        output_dir    = self.lbl_compare_output_location.text().strip()
+
+        # ── validate single master file ──────────────────────────────────
+        compare_mode = "tsc_only" if self.radio_compare_only_tsc.isChecked() else "rsd_master"
+        if compare_mode == "rsd_master":
+            master_parts = [p.strip() for p in raw_master.split(",") if p.strip()]
+            if len(master_parts) > 1:
+                self.lbl_compare_rsd_master.setStyleSheet(_ERROR_STYLE)
+                self.lbl_compare_rsd_master.setText("Only 1 file allowed in Individual mode")
+                return
+            # Ensure any stale error style is cleared when there is exactly 1 file
+            if master_parts:
+                self.lbl_compare_rsd_master.setStyleSheet("")
+        rsd_master_path = raw_master
+
+        # ── library validation ───────────────────────────────────────────
+        excel_library_path = ""
+        if self.checkbox_compare_with_library.isChecked():
+            lib_text = self.lbl_compare_library.text().strip()
+            lib_paths = [p.strip() for p in lib_text.split(",") if p.strip()]
+            lib_is_single_file = (
+                len(lib_paths) == 1
+                and lib_paths[0].lower().endswith(".xlsx")
+                and Path(lib_paths[0]).is_file()
+            )
             if len(lib_paths) > 1 or (lib_text and not lib_is_single_file and "multiple" in lib_text.lower()):
-                self.lbl_compare_library.setStyleSheet(_LIB_ERROR_STYLE)
+                self.lbl_compare_library.setStyleSheet(_ERROR_STYLE)
                 self.lbl_compare_library.setText("multiple excel files in library folder")
                 return
             elif not lib_is_single_file:
@@ -10689,11 +10996,6 @@ class NewUIWindow(QMainWindow):
 
         # ── basic validation ─────────────────────────────────────────────
         missing: list[str] = []
-        compare_mode = (
-            "tsc_only"
-            if self.radio_compare_only_tsc.isChecked()
-            else "rsd_master"
-        )
         if not rsd_target_paths:
             missing.append("RSD: Target")
         if compare_mode == "rsd_master" and not rsd_master_path:
@@ -10812,19 +11114,27 @@ class NewUIWindow(QMainWindow):
             self.lbl_compare_rsd_target.setText(", ".join(paths))
 
     def _on_compare_browse_rsd_master(self) -> None:
-        start = self._get_browse_dir("sap_compare")
+        start = self._get_browse_dir("sap_compare_master")
         if self._use_root_folders:
             text = self.lbl_compare_rsd_master.text().strip()
             if text:
                 from pathlib import Path as _P
-                _p = _P(text)
+                _p = _P(text.split(",")[0].strip())
                 if _p.is_absolute() and _p.parent.is_dir():
                     start = str(_p.parent)
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select RSD: Master File", start, "Excel Files (*.xlsx *.xls)")
-        if path:
-            self.lbl_compare_rsd_master.setStyleSheet("")
-            self.lbl_compare_rsd_master.setText(path)
+        # In "Set" mode allow multi-file selection; in "Individual" use single file picker
+        if hasattr(self, "radio_sdc_set") and self.radio_sdc_set.isChecked():
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Select RSD: Master File(s)", start, "Excel Files (*.xlsx *.xls)")
+            if paths:
+                self.lbl_compare_rsd_master.setStyleSheet("")
+                self.lbl_compare_rsd_master.setText(", ".join(paths))
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select RSD: Master File", start, "Excel Files (*.xlsx *.xls)")
+            if path:
+                self.lbl_compare_rsd_master.setStyleSheet("")
+                self.lbl_compare_rsd_master.setText(path)
 
     def _on_compare_browse_tsc_data(self) -> None:
         start = self._get_browse_dir("sap_compare")
@@ -11061,16 +11371,24 @@ class NewUIWindow(QMainWindow):
                     if f.suffix.lower() == ".xlsx"
                     and "rsd" in f.stem.lower()
                 )
-                if len(master_rsd_files) == 1:
-                    self.lbl_compare_rsd_master.setStyleSheet("")
-                    self.lbl_compare_rsd_master.setText(str(master_rsd_files[0]))
-                elif len(master_rsd_files) > 1:
-                    self.lbl_compare_rsd_master.setStyleSheet(
-                        "background-color: rgba(208, 39, 82, 128); color: #111111; "
-                        "border: 1px solid #6F6F6F; border-radius: 11px; "
-                        "padding: 0 8px; font-family: 'Segoe UI'; font-size: 10px;"
-                    )
-                    self.lbl_compare_rsd_master.setText("Multiple rsd files found in master")
+                _is_set = hasattr(self, "radio_sdc_set") and self.radio_sdc_set.isChecked()
+                if _is_set:
+                    # Set mode: fill all matching rsd_cu* files
+                    if master_rsd_files:
+                        self.lbl_compare_rsd_master.setStyleSheet("")
+                        self.lbl_compare_rsd_master.setText(", ".join(str(f) for f in master_rsd_files))
+                else:
+                    # Individual mode: expect exactly one file
+                    if len(master_rsd_files) == 1:
+                        self.lbl_compare_rsd_master.setStyleSheet("")
+                        self.lbl_compare_rsd_master.setText(str(master_rsd_files[0]))
+                    elif len(master_rsd_files) > 1:
+                        self.lbl_compare_rsd_master.setStyleSheet(
+                            "background-color: rgba(208, 39, 82, 128); color: #111111; "
+                            "border: 1px solid #6F6F6F; border-radius: 11px; "
+                            "padding: 0 8px; font-family: 'Segoe UI'; font-size: 10px;"
+                        )
+                        self.lbl_compare_rsd_master.setText("Multiple rsd files found in master")
 
         # TSC Data — MASTER Tracker Status Collector folder, single .xlsx file with "tsc" in name
         tsc_folder = self._config.tsc_output()
@@ -11233,6 +11551,26 @@ class NewUIWindow(QMainWindow):
         self.lbl_max_packshot.setEnabled(ref_on)
         self.input_compare_max_packshot.setEnabled(ref_on)
 
+        # When switching to Individual mode, flag multi-file master field immediately
+        _ERROR_STYLE = (
+            "background-color: rgba(208, 39, 82, 128); color: #000000; "
+            "border: 1px solid #6F6F6F; border-radius: 11px; "
+            "padding: 0 8px; font-family: 'Segoe UI'; font-size: 10px;"
+        )
+        is_individual = hasattr(self, "radio_sdc_individual") and self.radio_sdc_individual.isChecked()
+        if is_individual and rsd_mode:
+            master_text = self.lbl_compare_rsd_master.text().strip()
+            parts = [p for p in master_text.split(",") if p.strip()]
+            if len(parts) > 1:
+                self.lbl_compare_rsd_master.setStyleSheet(_ERROR_STYLE)
+                self.lbl_compare_rsd_master.setText("Only 1 file allowed in Individual mode")
+        elif not is_individual:
+            # Switching back to Set mode: clear any individual-mode error
+            current = self.lbl_compare_rsd_master.text().strip()
+            if current == "Only 1 file allowed in Individual mode":
+                self.lbl_compare_rsd_master.setStyleSheet("")
+                self.lbl_compare_rsd_master.setText("")
+
     def _sync_mapper_reformat_mode_ui(self) -> None:
         is_option_1 = self.radio_mapper_option_1.isChecked()
 
@@ -11243,9 +11581,10 @@ class NewUIWindow(QMainWindow):
         self.btn_mapper_output_location.setEnabled(not is_option_1)
         self.input_mapper_output_location.setEnabled(not is_option_1)
 
-        self.radio_mapper_cleanup_1.setEnabled(not is_option_1)
-        self.radio_mapper_cleanup_2.setEnabled(not is_option_1)
-        self.radio_mapper_cleanup_3.setEnabled(not is_option_1)
+        self.check_mapper_cleanup_1.setEnabled(not is_option_1)
+        self.check_mapper_cleanup_2.setEnabled(not is_option_1)
+        self.check_mapper_cleanup_3.setEnabled(not is_option_1)
+        self.check_mapper_cleanup_4.setEnabled(not is_option_1)
         self.checkbox_mapper_include_grouping_report.setEnabled(not is_option_1)
 
         self.btn_run_process_mapper_reformat.setEnabled(not is_option_1)
@@ -11253,7 +11592,10 @@ class NewUIWindow(QMainWindow):
         if is_option_1:
             self.input_mapper_sap_data_files.clear()
             self.input_mapper_output_location.clear()
-            self.radio_mapper_cleanup_1.setChecked(True)
+            self.check_mapper_cleanup_1.setChecked(True)
+            self.check_mapper_cleanup_2.setChecked(True)
+            self.check_mapper_cleanup_3.setChecked(True)
+            self.check_mapper_cleanup_4.setChecked(False)
             self.checkbox_mapper_include_grouping_report.setChecked(True)
 
     # ------------------------------------------------------------------
@@ -11504,12 +11846,18 @@ class NewUIWindow(QMainWindow):
             QMessageBox.warning(self, "Missing Input", "Please select an output location first.")
             return
 
-        # Determine cleanup mode
-        cleanup_mode = 1
-        if self.radio_mapper_cleanup_2.isChecked():
-            cleanup_mode = 2
-        elif self.radio_mapper_cleanup_3.isChecked():
-            cleanup_mode = 3
+        # Determine cleanup modes (all checked boxes)
+        cleanup_modes = [
+            i for i, cb in enumerate(
+                [self.check_mapper_cleanup_1, self.check_mapper_cleanup_2,
+                 self.check_mapper_cleanup_3, self.check_mapper_cleanup_4],
+                start=1,
+            )
+            if cb.isChecked()
+        ]
+        if not cleanup_modes:
+            QMessageBox.warning(self, "No Cleanup Selected", "Please select at least one cleanup mode.")
+            return
 
         include_grouping = self.checkbox_mapper_include_grouping_report.isChecked()
         reformatter = SapTableReformatter()
@@ -11519,7 +11867,8 @@ class NewUIWindow(QMainWindow):
 
         errors: list[str] = []
         success_count = 0
-        total_files = len(file_paths)
+        total_jobs = len(file_paths) * len(cleanup_modes)
+        job_idx = 0
 
         # Show and reset progress bar
         self.mapper_reformat_progress_bar.setValue(0)
@@ -11527,68 +11876,63 @@ class NewUIWindow(QMainWindow):
         self.btn_run_process_mapper_reformat.setEnabled(False)
         QApplication.processEvents()
 
-        for file_idx, file_path in enumerate(file_paths):
-            fname = Path(file_path).stem
-            try:
-                # 1. Read raw file
-                self.mapper_reformat_progress_bar.setValue(int((file_idx / total_files) * 30))
-                QApplication.processEvents()
-                raw_df = self._opt2_read_excel_raw(file_path)
-
-                # 2. Detect headers & extract rows
-                self.mapper_reformat_progress_bar.setValue(int((file_idx / total_files) * 100 + 30 / total_files))
-                QApplication.processEvents()
-                header_row, col_map = self._opt2_detect_headers(raw_df)
-                extracted_rows = self._opt2_extract_rows(raw_df, header_row, col_map)
-                if not extracted_rows:
-                    errors.append(f"{Path(file_path).name}: No data rows found.")
-                    self.mapper_reformat_progress_bar.setValue(int((file_idx + 1) / total_files * 100))
+        for cleanup_mode in cleanup_modes:
+            for file_path in file_paths:
+                fname = Path(file_path).stem
+                try:
+                    self.mapper_reformat_progress_bar.setValue(int(job_idx / total_jobs * 30))
                     QApplication.processEvents()
-                    continue
+                    raw_df = self._opt2_read_excel_raw(file_path)
 
-                # 3. Reformat
-                self.mapper_reformat_progress_bar.setValue(int((file_idx / total_files) * 100 + 50 / total_files))
+                    self.mapper_reformat_progress_bar.setValue(int(job_idx / total_jobs * 60))
+                    QApplication.processEvents()
+                    header_row_idx, col_map = self._opt2_detect_headers(raw_df)
+                    extracted_rows = self._opt2_extract_rows(raw_df, header_row_idx, col_map)
+                    if not extracted_rows:
+                        errors.append(f"{Path(file_path).name} (cu{cleanup_mode}): No data rows found.")
+                        job_idx += 1
+                        self.mapper_reformat_progress_bar.setValue(int(job_idx / total_jobs * 100))
+                        QApplication.processEvents()
+                        continue
+
+                    self.mapper_reformat_progress_bar.setValue(int(job_idx / total_jobs * 80))
+                    QApplication.processEvents()
+                    reformatted_rows, basic_comb_count = reformatter.reformat_from_rows(extracted_rows, cleanup_mode)
+
+                    wb = Workbook()
+                    ws_reformat = wb.active
+                    ws_reformat.title = "reformatted_sap"
+
+                    reformat_header = [
+                        "Head Bom Mat", "HSI", "BOM COMPONENT", "Component Desc",
+                        "Basic Number", "BC", "Basic Name",
+                    ]
+                    ws_reformat.append(reformat_header)
+                    for row_vals in reformatted_rows:
+                        ws_reformat.append(row_vals)
+
+                    self._opt2_style_worksheet(ws_reformat)
+
+                    if include_grouping:
+                        grouping_data = self._opt2_build_grouping_data(reformatted_rows)
+                        ws_grouping = wb.create_sheet("grouping_data")
+                        ws_grouping.append(["BC", "Count", "Basic Number", "Basic Name"])
+                        for comb_name, count, bn, bname in grouping_data:
+                            ws_grouping.append([comb_name, count, bn, bname])
+                        self._opt2_style_worksheet(ws_grouping)
+
+                    cu_tag = f"cu{cleanup_mode}"
+                    out_name = f"rsd_{fname}_{cu_tag}_{timestamp}.xlsx"
+                    out_path = out_dir / out_name
+                    wb.save(str(out_path))
+                    success_count += 1
+
+                except Exception as exc:
+                    errors.append(f"{Path(file_path).name} (cu{cleanup_mode}): {exc}")
+
+                job_idx += 1
+                self.mapper_reformat_progress_bar.setValue(int(job_idx / total_jobs * 100))
                 QApplication.processEvents()
-                reformatted_rows, basic_comb_count = reformatter.reformat_from_rows(extracted_rows, cleanup_mode)
-
-                # 4. Build workbook
-                wb = Workbook()
-                ws_reformat = wb.active
-                ws_reformat.title = "reformatted_sap"
-
-                reformat_header = [
-                    "Head Bom Mat", "HSI", "BOM COMPONENT", "Component Desc",
-                    "Basic Number", "BC", "Basic Name",
-                ]
-                ws_reformat.append(reformat_header)
-                for row_vals in reformatted_rows:
-                    ws_reformat.append(row_vals)
-
-                self._opt2_style_worksheet(ws_reformat)
-
-                # 5. Grouping report sheet (optional)
-                if include_grouping:
-                    grouping_data = self._opt2_build_grouping_data(reformatted_rows)
-                    ws_grouping = wb.create_sheet("grouping_data")
-                    ws_grouping.append(["BC", "Count", "Basic Number", "Basic Name"])
-                    for comb_name, count, bn, bname in grouping_data:
-                        ws_grouping.append([comb_name, count, bn, bname])
-                    self._opt2_style_worksheet(ws_grouping)
-
-                # 6. Save
-                self.mapper_reformat_progress_bar.setValue(int((file_idx / total_files) * 100 + 90 / total_files))
-                QApplication.processEvents()
-                cu_tag = f"cu{cleanup_mode}"
-                out_name = f"rsd_{fname}_{cu_tag}_{timestamp}.xlsx"
-                out_path = out_dir / out_name
-                wb.save(str(out_path))
-                success_count += 1
-
-            except Exception as exc:
-                errors.append(f"{Path(file_path).name}: {exc}")
-
-            self.mapper_reformat_progress_bar.setValue(int((file_idx + 1) / total_files * 100))
-            QApplication.processEvents()
 
         self.mapper_reformat_progress_bar.setVisible(False)
         self.btn_run_process_mapper_reformat.setEnabled(True)
@@ -12066,6 +12410,10 @@ class NewUIWindow(QMainWindow):
 
         if tool == "excel_library":
             path = self._config.excel_library_folder()
+            return path if path and Path(path).is_dir() else desktop
+
+        if tool == "sap_compare_master":
+            path = self._config.rsd_master_folder()
             return path if path and Path(path).is_dir() else desktop
 
         if tool == "sap_compare":
@@ -12858,6 +13206,32 @@ class NewUIWindow(QMainWindow):
         #collectorCleanupRadio::indicator:checked {
             background: #111F35;
             border: 1px solid #111F35;
+        }
+
+        #mapperCleanupCheck {
+            color: #000000;
+            font-family: "Segoe UI";
+            font-size: 14px;
+            font-weight: 500;
+            spacing: 8px;
+        }
+
+        #mapperCleanupCheck::indicator {
+            width: 16px;
+            height: 16px;
+            border: 1px solid #6F6F6F;
+            border-radius: 3px;
+            background: #D3D3D3;
+        }
+
+        #mapperCleanupCheck::indicator:checked {
+            background: #111F35;
+            border: 1px solid #111F35;
+        }
+
+        #mapperCleanupCheck::indicator:disabled {
+            background: #E8E8E8;
+            border: 1px solid #BBBBBB;
         }
 
         #collectorCheck {
