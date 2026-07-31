@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QTextEdit,
     QDialog,
     QColorDialog,
     QFileDialog,
@@ -12170,6 +12171,256 @@ class NewUIWindow(QMainWindow):
         )
         dlg.show()
 
+    class _MissingValuesResultDialog(QDialog):
+        """Dialog that displays missing values and offers clipboard copying."""
+
+        def __init__(self, values: list[str], parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Missing Values Result")
+            self.resize(560, 420)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(20, 20, 20, 20)
+            layout.setSpacing(12)
+
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title = QLabel("Missing Values")
+            title.setObjectName("collectorTitle")
+            title_row.addWidget(title)
+            title_row.addSpacing(100)
+            count_label = QLabel(f"count: {len(values)}")
+            count_label.setObjectName("collectorSectionLabel")
+            count_label.setContentsMargins(0, 0, 0, 0)
+            title_row.addWidget(count_label)
+            layout.addLayout(title_row)
+
+            body = QTextEdit(self)
+            body.setReadOnly(True)
+            body.setPlainText("\n".join(values) if values else "No missing values found.")
+            layout.addWidget(body, 1)
+
+            actions = QHBoxLayout()
+            actions.addStretch(1)
+            copy_btn = QPushButton("Copy values to clipboard")
+            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(body.toPlainText()))
+            actions.addWidget(copy_btn)
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.close)
+            actions.addWidget(close_btn)
+            layout.addLayout(actions)
+
+    class _MissingValuesCheckWindow(QDialog):
+        """Dialog for checking missing values between an Excel main file and a target file."""
+
+        def __init__(self, parent=None, mode: str = "Excel vs Excel"):
+            super().__init__(parent)
+            self.setWindowTitle("Missing Values Check")
+            self.resize(640, 320)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(20, 20, 20, 20)
+            layout.setSpacing(12)
+
+            mode_label = QLabel(mode.lower())
+            mode_label.setObjectName("collectorSectionLabel")
+            layout.addWidget(mode_label)
+
+            main_row = QHBoxLayout()
+            self.btn_missing_main_file = QPushButton("Main File")
+            self.btn_missing_main_file.clicked.connect(self._browse_main_file)
+            self.input_missing_main_file = QLineEdit()
+            self.input_missing_main_file.setReadOnly(True)
+            self.input_missing_main_file.setPlaceholderText("Select main Excel file")
+            main_row.addWidget(self.btn_missing_main_file)
+            main_row.addWidget(self.input_missing_main_file, 1)
+            layout.addLayout(main_row)
+
+            target_row = QHBoxLayout()
+            self.btn_missing_target_file = QPushButton("Target File")
+            self.btn_missing_target_file.clicked.connect(self._browse_target_file)
+            self.input_missing_target_file = QLineEdit()
+            self.input_missing_target_file.setReadOnly(True)
+            self.input_missing_target_file.setPlaceholderText("Select target Excel file")
+            target_row.addWidget(self.btn_missing_target_file)
+            target_row.addWidget(self.input_missing_target_file, 1)
+            layout.addLayout(target_row)
+
+            main_column_row = QHBoxLayout()
+            main_column_label = QLabel("Main file column")
+            main_column_row.addWidget(main_column_label)
+            self.combo_missing_main_column = QComboBox()
+            self.combo_missing_main_column.setEnabled(False)
+            self.combo_missing_main_column.setMinimumHeight(34)
+            self.combo_missing_main_column.setMaximumWidth(260)
+            self.combo_missing_main_column.currentTextChanged.connect(self._refresh_missing_values_button_state)
+            main_column_row.addWidget(self.combo_missing_main_column, 0)
+            layout.addLayout(main_column_row)
+
+            target_column_row = QHBoxLayout()
+            target_column_label = QLabel("Target file column")
+            target_column_row.addWidget(target_column_label)
+            self.combo_missing_target_column = QComboBox()
+            self.combo_missing_target_column.setEnabled(False)
+            self.combo_missing_target_column.setMinimumHeight(34)
+            self.combo_missing_target_column.setMaximumWidth(260)
+            self.combo_missing_target_column.currentTextChanged.connect(self._refresh_missing_values_button_state)
+            target_column_row.addWidget(self.combo_missing_target_column, 0)
+            layout.addLayout(target_column_row)
+
+            self.chk_missing_export = QCheckBox(
+                "export check missing values report (file will be a .xlsx and will be saved in main file location.)"
+            )
+            self.chk_missing_export.setToolTip(
+                "export check missing values report (file will be a .xlsx and will be saved in main file location.)"
+            )
+            layout.addWidget(self.chk_missing_export)
+
+            self.btn_check_missing_values = QPushButton("Check Missing Values")
+            self.btn_check_missing_values.setEnabled(False)
+            self.btn_check_missing_values.clicked.connect(self._run_missing_values_check)
+            layout.addWidget(self.btn_check_missing_values, alignment=Qt.AlignmentFlag.AlignRight)
+
+            layout.addStretch(1)
+
+            self.setStyleSheet("""
+                QDialog { background-color: #F4F4F4; }
+                QLabel { font-family: 'Segoe UI'; font-size: 13px; color: #333333; }
+                QLineEdit {
+                    background-color: #FFFFFF; color: #111111;
+                    border: 1px solid #BBBBBB; border-radius: 6px;
+                    padding: 0 8px; min-height: 34px;
+                    font-family: 'Segoe UI'; font-size: 12px;
+                }
+                QComboBox {
+                    background-color: #FFFFFF; color: #111111;
+                    border: 1px solid #BBBBBB; border-radius: 6px;
+                    padding: 4px 8px; min-height: 34px;
+                    font-family: 'Segoe UI'; font-size: 12px;
+                }
+                QPushButton {
+                    background-color: #9EA3AB; color: #000000;
+                    border: 1px solid #8B9098; border-radius: 6px;
+                    padding: 0 12px; min-height: 34px;
+                    font-family: 'Segoe UI'; font-size: 12px; font-weight: 600;
+                }
+                QPushButton:hover { background-color: #ACB1B8; }
+                QPushButton:pressed { background-color: #111F35; color: #ffffff; }
+                QCheckBox { font-family: 'Segoe UI'; font-size: 12px; color: #333333; }
+            """)
+
+        def _browse_main_file(self) -> None:
+            start_dir = self._get_browse_dir("packshot") if hasattr(self, "_get_browse_dir") else ""
+            file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Main Excel File",
+                start_dir,
+                "Excel Files (*.xlsx *.xls *.xlsm)",
+            )
+            if file:
+                self.input_missing_main_file.setText(file)
+                self._populate_column_dropdown(file, self.combo_missing_main_column)
+                self._refresh_missing_values_button_state()
+
+        def _browse_target_file(self) -> None:
+            start_dir = self._get_browse_dir("packshot") if hasattr(self, "_get_browse_dir") else ""
+            file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Target Excel File",
+                start_dir,
+                "Excel Files (*.xlsx *.xls *.xlsm)",
+            )
+            if file:
+                self.input_missing_target_file.setText(file)
+                self._populate_column_dropdown(file, self.combo_missing_target_column)
+                self._refresh_missing_values_button_state()
+
+        def _populate_column_dropdown(self, file_path: str, combo: QComboBox) -> None:
+            try:
+                excel_file = pd.ExcelFile(file_path)
+                first_sheet = excel_file.sheet_names[0]
+                df = pd.read_excel(file_path, sheet_name=first_sheet)
+            except Exception as exc:
+                QMessageBox.warning(self, "Unable to read file", f"Could not read Excel columns from selected file.\n{exc}")
+                combo.clear()
+                combo.setEnabled(False)
+                return
+
+            columns = [str(col) for col in df.columns if str(col).strip()]
+            combo.clear()
+            combo.addItems(columns)
+            combo.setEnabled(bool(columns))
+            if not columns:
+                QMessageBox.warning(self, "No columns found", "The selected Excel file does not contain any usable columns.")
+
+        def _refresh_missing_values_button_state(self) -> None:
+            main_path = self.input_missing_main_file.text().strip()
+            target_path = self.input_missing_target_file.text().strip()
+            main_has_column = self.combo_missing_main_column.count() > 0 and self.combo_missing_main_column.currentText() != ""
+            target_has_column = self.combo_missing_target_column.count() > 0 and self.combo_missing_target_column.currentText() != ""
+            self.btn_check_missing_values.setEnabled(bool(main_path and target_path and main_has_column and target_has_column))
+
+        def _run_missing_values_check(self) -> None:
+            main_path = self.input_missing_main_file.text().strip()
+            target_path = self.input_missing_target_file.text().strip()
+            main_column = self.combo_missing_main_column.currentText().strip()
+            target_column = self.combo_missing_target_column.currentText().strip()
+            if not main_path or not target_path or not main_column or not target_column:
+                QMessageBox.warning(self, "Missing input", "Please select both Excel files and both columns before checking.")
+                return
+            if not Path(main_path).exists() or not Path(target_path).exists():
+                QMessageBox.warning(self, "File not found", "One of the selected files could not be found.")
+                return
+
+            try:
+                main_df = pd.read_excel(main_path)
+                target_df = pd.read_excel(target_path)
+            except Exception as exc:
+                QMessageBox.warning(self, "Read error", f"Could not read the Excel files.\n{exc}")
+                return
+
+            if main_column not in main_df.columns:
+                QMessageBox.warning(self, "Column not found", f"The main-file column '{main_column}' was not found in the selected main file.")
+                return
+            if target_column not in target_df.columns:
+                QMessageBox.warning(self, "Column not found", f"The target-file column '{target_column}' was not found in the selected target file.")
+                return
+
+            main_values = main_df[main_column].dropna().astype(str).str.strip()
+            target_values = target_df[target_column].dropna().astype(str).str.strip()
+            target_values_set = {v.casefold() for v in target_values.tolist() if str(v).strip()}
+
+            missing_values: list[str] = []
+            seen_values: set[str] = set()
+            for value in main_values.tolist():
+                value_text = str(value).strip()
+                if not value_text:
+                    continue
+                normalized = value_text.casefold()
+                if normalized in target_values_set or normalized in seen_values:
+                    continue
+                missing_values.append(value_text)
+                seen_values.add(normalized)
+
+            result_dialog_cls = NewUIWindow._MissingValuesResultDialog
+            results_dialog = result_dialog_cls(missing_values, self)
+            results_dialog.show()
+            results_dialog.raise_()
+            results_dialog.activateWindow()
+
+            if self.chk_missing_export.isChecked():
+                export_path = Path(main_path).parent / (
+                    f"missing_values_check_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.xlsx"
+                )
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Missing Values Check"
+                ws.append(["Main Column", "Target Column", "Missing Values", "Main File", "Target File"])
+                for value in missing_values:
+                    ws.append([main_column, target_column, value, main_path, target_path])
+                wb.save(export_path)
+                QMessageBox.information(self, "Export complete", f"Report saved to:\n{export_path}")
+
     def _create_other_tools_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -12212,6 +12463,37 @@ class NewUIWindow(QMainWindow):
         layout.addLayout(controls_row)
 
         self.btn_idh_dup_open_window.clicked.connect(self._open_idh_dup_window)
+
+        # ── Missing Values Check ─────────────────────────────────────────────
+        layout.addSpacing(8)
+        section_label = QLabel("Missing Values Check")
+        section_label.setObjectName("collectorSectionLabel")
+        layout.addWidget(section_label)
+        layout.addSpacing(-8)
+
+        self.radio_missing_vals_excel_vs_excel = QRadioButton("Excel vs Excel")
+        self.radio_missing_vals_excel_vs_excel.setObjectName("idhDupRadio")
+        self.radio_missing_vals_excel_vs_excel.setChecked(True)
+        self.radio_missing_vals_excel_vs_images = QRadioButton("Excel vs Images")
+        self.radio_missing_vals_excel_vs_images.setObjectName("idhDupRadio")
+
+        self.missing_vals_mode_group = QButtonGroup(page)
+        self.missing_vals_mode_group.setExclusive(True)
+        self.missing_vals_mode_group.addButton(self.radio_missing_vals_excel_vs_excel)
+        self.missing_vals_mode_group.addButton(self.radio_missing_vals_excel_vs_images)
+
+        self.btn_missing_vals_open_window = QPushButton("Open Window")
+        self.btn_missing_vals_open_window.setObjectName("collectorGrayBtn")
+
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
+        controls_row.addWidget(self.radio_missing_vals_excel_vs_excel)
+        controls_row.addWidget(self.radio_missing_vals_excel_vs_images)
+        controls_row.addWidget(self.btn_missing_vals_open_window)
+        controls_row.addStretch(1)
+        layout.addLayout(controls_row)
+
+        self.btn_missing_vals_open_window.clicked.connect(self._open_missing_values_window)
 
         layout.addStretch(1)
         return page
@@ -12323,6 +12605,15 @@ class NewUIWindow(QMainWindow):
         self._idh_dup_window.show()
         self._idh_dup_window.raise_()
         self._idh_dup_window.activateWindow()
+
+    def _open_missing_values_window(self) -> None:
+        mode = "Excel vs Excel"
+        if getattr(self, "radio_missing_vals_excel_vs_images", None) and self.radio_missing_vals_excel_vs_images.isChecked():
+            mode = "Excel vs Images"
+        self._missing_values_window = self._MissingValuesCheckWindow(self, mode=mode)
+        self._missing_values_window.show()
+        self._missing_values_window.raise_()
+        self._missing_values_window.activateWindow()
 
     def _open_tsc_option1_table(self) -> None:
         self._tsc_option1_dialog = _TscOption1TableDialog(
