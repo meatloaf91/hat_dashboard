@@ -234,7 +234,8 @@ class _ClipboardTableWidget(QTableWidget):
         if event.matches(QKeySequence.StandardKey.Paste):
             self._paste_clipboard()
             return
-        super().keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
 
     def _copy_selection(self) -> None:
         selected_ranges = self.selectedRanges()
@@ -8974,6 +8975,7 @@ class ArtworkCropCanvas(QLabel):
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._pan_start: tuple[float, float] | None = None
+        self._hover_bounds = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(700, 460)
         self.setMouseTracking(True)
@@ -8996,6 +8998,10 @@ class ArtworkCropCanvas(QLabel):
 
     def set_crop_style(self, color: str) -> None:
         self._crop_color = color
+        self._refresh()
+
+    def set_hover_bounds(self, bounds: object | None) -> None:
+        self._hover_bounds = bounds
         self._refresh()
 
     def _display_rect(self):
@@ -9030,6 +9036,13 @@ class ArtworkCropCanvas(QLabel):
         x, y, width, height = self._to_display_rect(self._crop)
         painter.setPen(QPen(QColor(getattr(self, "_crop_color", "#B8F35A")), 4))
         painter.drawRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
+        if self._hover_bounds is not None:
+            hover_x, hover_y, hover_width, hover_height = self._to_display_rect(self._hover_bounds)
+            painter.setPen(QPen(QColor("#FFFF00"), 3, Qt.PenStyle.DashLine))
+            painter.drawRect(
+                round(hover_x), round(hover_y),
+                max(1, round(hover_width)), max(1, round(hover_height)),
+            )
         painter.end()
         self.setPixmap(canvas)
 
@@ -9084,7 +9097,7 @@ class ArtworkCropCanvas(QLabel):
 class ArtworkCropDialog(QDialog):
     """Large single-artwork crop editor."""
 
-    def __init__(self, inspection: ArtworkInspection, parent: QWidget | None = None) -> None:
+    def __init__(self, inspection: ArtworkInspection, parent: QWidget | None = None, initial_bounds: object | None = None) -> None:
         super().__init__(parent)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.setWindowTitle(f"Manual Cut - {inspection.input_path.name}")
@@ -9094,7 +9107,80 @@ class ArtworkCropDialog(QDialog):
         self._mode = "manual"
         self._selected_source: CutSelection | None = None
         self._manual_hide_selection: CutSelection | None = None
+        self._selection_actions: dict[tuple[str, str], str] = {}
+        self._action_combos: dict[tuple[str, str], QComboBox] = {}
+        self._action_options: dict[tuple[str, str], CutOption] = {}
+        self._initial_bounds = initial_bounds
+        self._hover_option: CutOption | None = None
+        self._hover_enabled = False
         self._build_ui()
+
+    def _add_action_row(self, layout: QVBoxLayout, option: CutOption, mode: str) -> None:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel(option.label)
+        label.setObjectName("cropOptionCheck")
+        label.installEventFilter(self)
+        label.setProperty("crop_option", option)
+        row.addWidget(label)
+        row.addStretch(1)
+        combo = QComboBox()
+        combo.setObjectName("cropOptionCheck")
+        combo.addItems(["show", "hide", "trim", "trim & hide"])
+        combo.setCurrentText("show")
+        combo.setFixedWidth(115)
+        self._set_action_combo_color(combo, "show")
+        row.addWidget(combo)
+        key = (mode, option.label)
+        self._selection_actions[key] = "show"
+        self._action_combos[key] = combo
+        self._action_options[key] = option
+
+        def handle_change(action: str) -> None:
+            self._selection_actions[key] = action
+            self._set_action_combo_color(combo, action)
+            if action == "show":
+                self.canvas.set_crop_style("#B8F35A")
+                self._selected_source = None
+                self._manual_hide_selection = None
+                self.canvas._refresh()
+                return
+            if action in {"trim", "trim & hide"}:
+                if self._manual_crop_checkbox.isChecked():
+                    self._manual_crop_checkbox.setChecked(False)
+                self.canvas.set_crop_style("#00FF66")
+                self.canvas._crop = option.bounds
+                self._selected_source = CutSelection(option.bounds, mode, option.label, option.color_rgb, option.xref)
+                self._manual_hide_selection = None if action == "trim" else CutSelection(option.bounds, mode, option.label, option.color_rgb, option.xref)
+                for other_key, other_action in list(self._selection_actions.items()):
+                    if other_key != key and other_action in {"trim", "trim & hide"}:
+                        self._selection_actions[other_key] = "show"
+                        other_combo = self._action_combos.get(other_key)
+                        if other_combo is not None:
+                            other_combo.blockSignals(True)
+                            other_combo.setCurrentText("show")
+                            other_combo.blockSignals(False)
+                            self._set_action_combo_color(other_combo, "show")
+            elif action == "hide":
+                self.canvas.set_crop_style("#00FF66")
+                self._selected_source = None
+                self._manual_hide_selection = CutSelection(self.canvas.crop(), mode, option.label, option.color_rgb, option.xref)
+            self.canvas._refresh()
+
+        combo.currentTextChanged.connect(handle_change)
+        layout.addLayout(row)
+
+    @staticmethod
+    def _set_action_combo_color(combo: QComboBox, action: str) -> None:
+        colors = {
+            "show": "#7CD5C7",
+            "hide": "#D3D3D3",
+            "trim": "#BD5579",
+            "trim & hide": "#BD5579",
+        }
+        combo.setStyleSheet(
+            f"QComboBox {{ background-color: {colors.get(action, '#FFFFFF')}; }}"
+        )
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -9107,123 +9193,89 @@ class ArtworkCropDialog(QDialog):
         hint.setObjectName("manualCutDescription")
         layout.addWidget(hint)
 
-        initial = self._inspection.detected_bounds
+        initial = self._initial_bounds if self._initial_bounds is not None else self._inspection.detected_bounds
         body = QHBoxLayout()
         crop_panel = QFrame()
         crop_panel.setObjectName("cropControlPanel")
         crop_panel.setFixedWidth(350)
         crop_layout = QVBoxLayout(crop_panel)
-        crop_title = QLabel("Cropping")
+        crop_title = QLabel("Local Crop Setup")
         crop_title.setObjectName("manualCutSectionLabel")
         crop_layout.addWidget(crop_title)
+        self._manual_crop_checkbox = QCheckBox("manual crop")
+        self._manual_crop_checkbox.setObjectName("cropOptionCheck")
+        self._manual_crop_checkbox.setStyleSheet(
+            "QCheckBox#cropOptionCheck::indicator:checked "
+            "{ background-color: #D02752; border: 1px solid #D02752; }"
+        )
+        self._manual_crop_checkbox.toggled.connect(self._manual_crop_changed)
+        crop_layout.addWidget(self._manual_crop_checkbox)
+        self._hover_checkbox = QCheckBox("show crop border on hover")
+        self._hover_checkbox.setObjectName("cropOptionCheck")
+        self._hover_checkbox.setStyleSheet(
+            "QCheckBox#cropOptionCheck::indicator:checked "
+            "{ background-color: #D02752; border: 1px solid #D02752; }"
+        )
+        self._hover_checkbox.toggled.connect(self._set_hover_enabled)
+        crop_layout.addWidget(self._hover_checkbox)
         tabs = QTabWidget()
         tabs.setObjectName("cropTabs")
-        layers_tab = QWidget()
-        layers_layout = QVBoxLayout(layers_tab)
-        self._layer_group = QButtonGroup(layers_tab)
-        self._layer_group.setExclusive(True)
+        layers_tab = QWidget(); layers_layout = QVBoxLayout(layers_tab)
         layer_options = [option for option in self._inspection.options if option.kind == "layer"]
-        if not layer_options:
-            layers_layout.addWidget(QLabel("No PDF layers found."))
-        for option in layer_options:
-            check = QCheckBox(option.label)
-            check.setObjectName("cropOptionCheck")
-            self._layer_group.addButton(check)
-            layers_layout.addWidget(check)
-            check.toggled.connect(lambda checked, choice=option: self._set_source_crop(choice, checked, "layer"))
+        if not layer_options: layers_layout.addWidget(QLabel("No PDF layers found."))
+        for option in layer_options: self._add_action_row(layers_layout, option, "layer")
         layers_layout.addStretch(1)
-        separations_tab = QWidget()
-        separations_layout = QVBoxLayout(separations_tab)
-        self._separation_group = QButtonGroup(separations_tab)
-        self._separation_group.setExclusive(True)
+        layers_scroll = QScrollArea()
+        layers_scroll.setWidgetResizable(True)
+        layers_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layers_scroll.setWidget(layers_tab)
+        separations_tab = QWidget(); separations_layout = QVBoxLayout(separations_tab)
         separation_options = [option for option in self._inspection.options if option.kind == "spot_color"]
-        if not separation_options:
-            separations_layout.addWidget(QLabel("No vector separations found."))
-        for option in separation_options:
-            check = QCheckBox(option.label)
-            check.setObjectName("cropOptionCheck")
-            self._separation_group.addButton(check)
-            separations_layout.addWidget(check)
-            check.toggled.connect(lambda checked, choice=option: self._set_source_crop(choice, checked, "separation"))
+        if not separation_options: separations_layout.addWidget(QLabel("No vector separations found."))
+        for option in separation_options: self._add_action_row(separations_layout, option, "spot_color")
         separations_layout.addStretch(1)
-        manual_tab = QWidget()
-        manual_layout = QVBoxLayout(manual_tab)
-        manual_label = QLabel("Drag the crop rectangle on the artwork.")
-        manual_label.setWordWrap(True)
-        manual_layout.addWidget(manual_label)
-        hide_label = QLabel("Clean version: hide selected element")
-        hide_label.setObjectName("manualCutSectionLabel")
-        manual_layout.addWidget(hide_label)
-        hide_tabs = QTabWidget()
-        hide_tabs.setObjectName("manualHideTabs")
-        hide_layer_tab = QWidget()
-        hide_layer_layout = QVBoxLayout(hide_layer_tab)
-        manual_layer_group = QButtonGroup(hide_layer_tab)
-        manual_layer_group.setExclusive(True)
-        for option in layer_options:
-            check = QCheckBox(option.label)
-            check.setObjectName("cropOptionCheck")
-            manual_layer_group.addButton(check)
-            hide_layer_layout.addWidget(check)
-            check.toggled.connect(lambda checked, choice=option: self._set_manual_hide(choice, checked, "layer"))
-        if not layer_options:
-            hide_layer_layout.addWidget(QLabel("No PDF layers found."))
-        hide_layer_layout.addStretch(1)
-        hide_color_tab = QWidget()
-        hide_color_layout = QVBoxLayout(hide_color_tab)
-        manual_color_group = QButtonGroup(hide_color_tab)
-        manual_color_group.setExclusive(True)
-        for option in separation_options:
-            check = QCheckBox(option.label)
-            check.setObjectName("cropOptionCheck")
-            manual_color_group.addButton(check)
-            hide_color_layout.addWidget(check)
-            check.toggled.connect(lambda checked, choice=option: self._set_manual_hide(choice, checked, "spot_color"))
-        if not separation_options:
-            hide_color_layout.addWidget(QLabel("No separations found."))
-        hide_color_layout.addStretch(1)
-        hide_tabs.addTab(hide_layer_tab, "Layer")
-        hide_tabs.addTab(hide_color_tab, "Spot Color")
-        manual_layout.addWidget(hide_tabs, 1)
-        manual_layout.addStretch(1)
-        tabs.addTab(layers_tab, "By Layer")
-        tabs.addTab(separations_tab, "By Spot Color")
-        tabs.addTab(manual_tab, "Manual Selection")
-        tabs.currentChanged.connect(self._tab_changed)
+        separations_scroll = QScrollArea()
+        separations_scroll.setWidgetResizable(True)
+        separations_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        separations_scroll.setWidget(separations_tab)
+        tabs.addTab(layers_scroll, "By Layer")
+        tabs.addTab(separations_scroll, "By Spot Color")
         crop_layout.addWidget(tabs, 1)
         body.addWidget(crop_panel)
         self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
         body.addWidget(self.canvas, 1)
         layout.addLayout(body, 1)
 
-        zoom_row = QHBoxLayout()
-        zoom_label = QLabel("Zoom")
-        zoom_label.setObjectName("manualCutDescription")
-        zoom_row.addWidget(zoom_label)
-        zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        zoom_slider.setObjectName("manualCutZoomSlider")
-        zoom_slider.setRange(100, 300)
-        zoom_slider.setValue(100)
-        zoom_slider.setTickInterval(25)
-        zoom_slider.valueChanged.connect(self.canvas.set_zoom)
-        zoom_row.addWidget(zoom_slider, 1)
-        self.zoom_value = QLabel("100%")
-        self.zoom_value.setObjectName("manualCutDescription")
-        zoom_slider.valueChanged.connect(lambda value: self.zoom_value.setText(f"{value}%"))
-        zoom_row.addWidget(self.zoom_value)
+        zoom_row = QHBoxLayout(); zoom_label = QLabel("Zoom"); zoom_label.setObjectName("manualCutDescription"); zoom_row.addWidget(zoom_label)
+        zoom_slider = QSlider(Qt.Orientation.Horizontal); zoom_slider.setObjectName("manualCutZoomSlider"); zoom_slider.setRange(100, 300); zoom_slider.setValue(100); zoom_slider.setTickInterval(25); zoom_slider.valueChanged.connect(self.canvas.set_zoom); zoom_row.addWidget(zoom_slider, 1)
+        self.zoom_value = QLabel("100%"); self.zoom_value.setObjectName("manualCutDescription"); zoom_slider.valueChanged.connect(lambda value: self.zoom_value.setText(f"{value}%")); zoom_row.addWidget(self.zoom_value)
         layout.addLayout(zoom_row)
 
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        cancel = QPushButton("Cancel")
-        cancel.setObjectName("manualCutCancelButton")
-        cancel.clicked.connect(self.reject)
-        accept = QPushButton("Use this crop")
-        accept.setObjectName("artworkProcessButton")
-        accept.clicked.connect(self.accept)
-        footer.addWidget(cancel)
-        footer.addWidget(accept)
-        layout.addLayout(footer)
+        footer = QHBoxLayout(); footer.addStretch(1)
+        accept = QPushButton("Use this crop"); accept.setObjectName("collectorRunBtn"); accept.setFixedHeight(50); accept.setMinimumWidth(180); accept.clicked.connect(self.accept); footer.addWidget(accept); layout.addLayout(footer)
+
+    def _manual_crop_changed(self, checked: bool) -> None:
+        if not checked:
+            return
+        for key, action in list(self._selection_actions.items()):
+            if action in {"trim", "trim & hide"}:
+                self._selection_actions[key] = "show"
+                combo = self._action_combos.get(key)
+                if combo is not None:
+                    combo.blockSignals(True)
+                    combo.setCurrentText("show")
+                    combo.blockSignals(False)
+                    self._set_action_combo_color(combo, "show")
+        self._selected_source = None
+        self._manual_hide_selection = None
+        self.canvas.set_crop_style("#00FF66")
+        self.canvas._refresh()
+
+    def _set_hover_enabled(self, enabled: bool) -> None:
+        self._hover_enabled = enabled
+        if not enabled:
+            self._hover_option = None
+        self.canvas.set_hover_bounds(self._hover_option.bounds if self._hover_option else None)
 
     def _set_source_crop(self, option: object, checked: bool, mode: str) -> None:
         if not checked:
@@ -9237,7 +9289,7 @@ class ArtworkCropDialog(QDialog):
             option.color_rgb,
             option.xref,
         )
-        self.canvas.set_crop_style("#E3262E")
+        self.canvas.set_crop_style("#00FF66")
         self.canvas._refresh()
 
     def _set_manual_hide(self, option: object, checked: bool, mode: str) -> None:
@@ -9246,18 +9298,27 @@ class ArtworkCropDialog(QDialog):
         self._manual_hide_selection = CutSelection(
             self.canvas.crop(), mode, option.label, option.color_rgb, option.xref,
         )
-        self.canvas.set_crop_style("#E3262E")
+        self.canvas.set_crop_style("#00FF66")
         self.canvas._refresh()
 
     def _tab_changed(self, index: int) -> None:
         self._mode = "manual" if index == 2 else "source"
         if index == 2:
-            self.canvas.set_crop_style("#B8F35A")
+            self.canvas.set_crop_style("#00FF66")
             self._selected_source = None
         else:
-            self.canvas.set_crop_style("#E3262E")
+            self.canvas.set_crop_style("#00FF66")
 
     def eventFilter(self, obj, event) -> bool:
+        if isinstance(obj, QLabel) and obj.property("crop_option") is not None:
+            option = obj.property("crop_option")
+            if event.type() == QEvent.Type.Enter:
+                self._hover_option = option
+                if self._hover_enabled:
+                    self.canvas.set_hover_bounds(option.bounds)
+            elif event.type() == QEvent.Type.Leave:
+                self._hover_option = None
+                self.canvas.set_hover_bounds(None)
         return super().eventFilter(obj, event)
 
     def _inspection_image(self) -> QImage:
@@ -9275,11 +9336,40 @@ class ArtworkCropDialog(QDialog):
         return self.canvas.crop()
 
     def crop_selection(self) -> CutSelection:
+        hide_items = tuple(
+            (option.kind, option.label, option.color_rgb, option.xref)
+            for key, option in self._action_options.items()
+            if self._selection_actions.get(key) in {"hide", "trim & hide"}
+        )
+        if self._manual_crop_checkbox.isChecked():
+            return CutSelection(
+                self.canvas.crop(),
+                "manual",
+                hide_items=hide_items,
+                manual_crop=True,
+            )
+        trim_option = next(
+            (self._action_options[key] for key, action in self._selection_actions.items()
+             if action in {"trim", "trim & hide"}),
+            None,
+        )
+        if trim_option is not None:
+            return CutSelection(
+                trim_option.bounds,
+                trim_option.kind,
+                trim_option.label,
+                trim_option.color_rgb,
+                trim_option.xref,
+                hide_items=hide_items,
+            )
+        if hide_items:
+            return CutSelection(self.canvas.crop(), "manual", hide_items=hide_items)
         if self._manual_hide_selection is not None:
             hide = self._manual_hide_selection
             return CutSelection(
                 self.canvas.crop(), "manual", "", None, None,
                 hide.kind, hide.name, hide.color_rgb, hide.xref,
+                hide_items=((hide.kind, hide.name, hide.color_rgb, hide.xref),),
             )
         if self._selected_source is not None:
             return CutSelection(
@@ -9288,12 +9378,13 @@ class ArtworkCropDialog(QDialog):
                 self._selected_source.name,
                 self._selected_source.color_rgb,
                 self._selected_source.xref,
+                hide_items=(),
             )
-        return CutSelection(self.canvas.crop(), "manual")
+        return CutSelection(self._inspection.page_bounds, "manual")
 
 
 class ArtworkManualCutDialog(QDialog):
-    """Thumbnail gallery for bulk artwork review."""
+    """Manual cut dialog with individual and bulk review modes."""
 
     def __init__(self, inspections: list[ArtworkInspection], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -9304,7 +9395,27 @@ class ArtworkManualCutDialog(QDialog):
         self._inspections = inspections
         self._selections: dict[Path, object | None] = {}
         self._preview_labels: dict[Path, QLabel] = {}
+        self._bulk_mode = True
+        self._bulk_actions: dict[tuple[str, str], str] = {}
+        self._bulk_combos: dict[tuple[str, str], QComboBox] = {}
+        self._bulk_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self._card_widgets: dict[Path, QFrame] = {}
+        self._global_hover_enabled = False
+        self._global_hover_option: tuple[str, str] | None = None
+        self.output_folder: Path | None = None
         self._build_ui()
+
+    @staticmethod
+    def _set_action_combo_color(combo: QComboBox, action: str) -> None:
+        colors = {
+            "show": "#7CD5C7",
+            "hide": "#D3D3D3",
+            "trim": "#BD5579",
+            "trim & hide": "#BD5579",
+        }
+        combo.setStyleSheet(
+            f"QComboBox {{ background-color: {colors.get(action, '#FFFFFF')}; }}"
+        )
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -9314,35 +9425,223 @@ class ArtworkManualCutDialog(QDialog):
         heading = QLabel("Manual Cut")
         heading.setObjectName("manualCutTitle")
         layout.addWidget(heading)
+
+        self._bulk_panel = QWidget()
+        self._bulk_panel.setVisible(True)
+        self._bulk_panel.setFixedWidth(350)
+        self._bulk_panel.setObjectName("cropControlPanel")
+        self._bulk_layout = QVBoxLayout(self._bulk_panel)
+        self._bulk_layout.setContentsMargins(12, 12, 12, 12)
+        crop_title = QLabel("Global Crop Setup")
+        crop_title.setObjectName("manualCutSectionLabel")
+        self._bulk_layout.addWidget(crop_title)
+        self._global_hover_checkbox = QCheckBox("show crop border on hover")
+        self._global_hover_checkbox.setObjectName("cropOptionCheck")
+        self._global_hover_checkbox.setStyleSheet(
+            "QCheckBox#cropOptionCheck::indicator:checked "
+            "{ background-color: #D02752; border: 1px solid #D02752; }"
+        )
+        self._global_hover_checkbox.toggled.connect(self._set_global_hover_enabled)
+        self._bulk_layout.addWidget(self._global_hover_checkbox)
+        self._bulk_tabs = QTabWidget()
+        self._bulk_tabs.setObjectName("cropTabs")
+        self._bulk_tabs.addTab(self._bulk_layer_tab(), "By Layer")
+        self._bulk_tabs.addTab(self._bulk_spot_tab(), "By Spot Color")
+        self._bulk_layout.addWidget(self._bulk_tabs, 1)
+
         intro = QLabel("Click an artwork thumbnail to open its manual crop editor.")
         intro.setObjectName("manualCutDescription")
         layout.addWidget(intro)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setObjectName("manualCutScroll")
-        cards = QWidget()
-        cards_layout = QGridLayout(cards)
-        cards_layout.setContentsMargins(2, 2, 2, 2)
-        cards_layout.setSpacing(14)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setObjectName("manualCutScroll")
+        self._cards = QWidget()
+        self._cards_layout = QGridLayout(self._cards)
+        self._cards_layout.setContentsMargins(2, 2, 2, 2)
+        self._cards_layout.setSpacing(14)
         for index, inspection in enumerate(self._inspections):
-            cards_layout.addWidget(self._build_card(inspection), index // 3, index % 3)
+            self._cards_layout.addWidget(self._build_card(inspection), index // 3, index % 3)
         for column in range(3):
-            cards_layout.setColumnStretch(column, 1)
-        scroll.setWidget(cards)
-        layout.addWidget(scroll, 1)
+            self._cards_layout.setColumnStretch(column, 1)
+        self._scroll.setWidget(self._cards)
+        content_row = QHBoxLayout()
+        content_row.setSpacing(12)
+        content_row.addWidget(self._bulk_panel, 0, Qt.AlignmentFlag.AlignTop)
+        content_row.addWidget(self._scroll, 1)
+        layout.addLayout(content_row, 1)
 
         footer = QHBoxLayout()
         footer.addStretch(1)
-        cancel = QPushButton("Cancel")
-        cancel.setObjectName("manualCutCancelButton")
-        cancel.clicked.connect(self.reject)
         apply_button = QPushButton("Use selected cuts")
-        apply_button.setObjectName("artworkProcessButton")
-        apply_button.clicked.connect(self.accept)
-        footer.addWidget(cancel)
+        apply_button.setObjectName("collectorRunBtn")
+        apply_button.setFixedHeight(50)
+        apply_button.setMinimumWidth(180)
+        apply_button.clicked.connect(self._choose_output_folder_and_accept)
         footer.addWidget(apply_button)
         layout.addLayout(footer)
+
+    def _choose_output_folder_and_accept(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Choose folder to save artwork files")
+        if not folder:
+            return
+        self.output_folder = Path(folder)
+        self.accept()
+
+    def _build_bulk_catalog(self, kind: str) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for inspection in self._inspections:
+            for option in inspection.options:
+                if option.kind != kind:
+                    continue
+                label = option.label.strip()
+                if label and label not in seen:
+                    seen.add(label)
+                    names.append(label)
+        return names
+
+    def _bulk_layer_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+        names = self._build_bulk_catalog("layer")
+        if not names:
+            layout.addWidget(QLabel("No PDF layers found."))
+            return tab
+        for name in names:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            label = QLabel(name)
+            label.setObjectName("cropOptionCheck")
+            label.installEventFilter(self)
+            label.setProperty("global_crop_option", ("layer", name))
+            row.addWidget(label)
+            row.addStretch(1)
+            combo = QComboBox()
+            combo.setObjectName("cropOptionCheck")
+            combo.addItems(["show", "hide", "trim", "trim & hide"])
+            combo.setCurrentText("show")
+            combo.setFixedWidth(115)
+            self._set_action_combo_color(combo, "show")
+            row.addWidget(combo)
+            key = ("layer", name)
+            self._bulk_actions[key] = "show"
+            self._bulk_combos[key] = combo
+            combo.currentTextChanged.connect(
+                lambda action, target=name: self._on_bulk_combo_change("layer", target, action)
+            )
+            layout.addLayout(row)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(tab)
+        return scroll
+
+    def _bulk_spot_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+        names = self._build_bulk_catalog("spot_color")
+        if not names:
+            layout.addWidget(QLabel("No vector separations found."))
+            return tab
+        for name in names:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            label = QLabel(name)
+            label.setObjectName("cropOptionCheck")
+            label.installEventFilter(self)
+            label.setProperty("global_crop_option", ("spot_color", name))
+            row.addWidget(label)
+            row.addStretch(1)
+            combo = QComboBox()
+            combo.setObjectName("cropOptionCheck")
+            combo.addItems(["show", "hide", "trim", "trim & hide"])
+            combo.setCurrentText("show")
+            combo.setFixedWidth(115)
+            self._set_action_combo_color(combo, "show")
+            row.addWidget(combo)
+            key = ("spot_color", name)
+            self._bulk_actions[key] = "show"
+            self._bulk_combos[key] = combo
+            combo.currentTextChanged.connect(
+                lambda action, target=name: self._on_bulk_combo_change("spot_color", target, action)
+            )
+            layout.addLayout(row)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(tab)
+        return scroll
+
+    def _on_bulk_combo_change(self, kind: str, name: str, action: str) -> None:
+        key = (kind, name)
+        self._bulk_actions[key] = action
+        combo = self._bulk_combos.get(key)
+        if combo is not None:
+            self._set_action_combo_color(combo, action)
+        if action in {"trim", "trim & hide"}:
+            for other_key, other_action in list(self._bulk_actions.items()):
+                if other_key != key and other_action in {"trim", "trim & hide"}:
+                    self._bulk_actions[other_key] = "show"
+                    other_combo = self._bulk_combos.get(other_key)
+                    if other_combo is not None:
+                        other_combo.blockSignals(True)
+                        other_combo.setCurrentText("show")
+                        other_combo.blockSignals(False)
+                        self._set_action_combo_color(other_combo, "show")
+        self._refresh_bulk_previews()
+
+    def _set_global_hover_enabled(self, enabled: bool) -> None:
+        self._global_hover_enabled = enabled
+        if not enabled:
+            self._global_hover_option = None
+        self._refresh_bulk_previews()
+
+    def _set_global_hover_option(self, option: tuple[str, str] | None) -> None:
+        self._global_hover_option = option if self._global_hover_enabled else None
+        self._refresh_bulk_previews()
+
+    def _refresh_bulk_previews(self) -> None:
+        trim_choice = next(
+            ((kind, name) for (kind, name), action in self._bulk_actions.items()
+             if action in {"trim", "trim & hide"}),
+            None,
+        )
+        for inspection in self._inspections:
+            local_selection = self._selections.get(inspection.input_path)
+            if local_selection is not None:
+                local_bounds = (
+                    local_selection.bounds
+                    if local_selection.kind in {"layer", "spot_color"}
+                    else None
+                )
+                self._update_preview(inspection, local_bounds)
+                continue
+            bounds = None
+            hover_bounds = None
+            if trim_choice is not None:
+                trim_kind, trim_name = trim_choice
+                option = next(
+                    (candidate for candidate in inspection.options
+                     if candidate.kind == trim_kind and candidate.label == trim_name),
+                    None,
+                )
+                if option is not None:
+                    bounds = option.bounds
+            if self._global_hover_option is not None:
+                hover_kind, hover_name = self._global_hover_option
+                hover_option = next(
+                    (candidate for candidate in inspection.options
+                     if candidate.kind == hover_kind and candidate.label == hover_name),
+                    None,
+                )
+                if hover_option is not None:
+                    hover_bounds = hover_option.bounds
+            self._update_preview(inspection, bounds, hover_bounds)
 
     def _build_card(self, inspection: ArtworkInspection) -> QFrame:
         card = QFrame()
@@ -9355,47 +9654,131 @@ class ArtworkManualCutDialog(QDialog):
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview.setFixedSize(300, 210)
         preview.setCursor(Qt.CursorShape.PointingHandCursor)
-        preview.setToolTip(inspection.input_path.name)
         preview.installEventFilter(self)
         self._preview_labels[inspection.input_path] = preview
+        self._card_widgets[inspection.input_path] = card
         card_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         self._selections[inspection.input_path] = None
         self._update_preview(inspection, None)
         return card
 
     def eventFilter(self, obj, event) -> bool:
+        if isinstance(obj, QLabel) and obj.property("global_crop_option") is not None:
+            option = obj.property("global_crop_option")
+            if event.type() == QEvent.Type.Enter:
+                self._global_hover_option = option
+                if self._global_hover_enabled:
+                    self._refresh_bulk_previews()
+            elif event.type() == QEvent.Type.Leave:
+                self._global_hover_option = None
+                self._refresh_bulk_previews()
         if event.type() == QEvent.Type.MouseButtonPress and obj in self._preview_labels.values():
             path = next(path for path, label in self._preview_labels.items() if label is obj)
             inspection = next(item for item in self._inspections if item.input_path == path)
-            editor = ArtworkCropDialog(inspection, self)
+            initial_bounds = None
+            if self._bulk_mode:
+                trim_choice = next(
+                    ((kind, name) for (kind, name), action in self._bulk_actions.items()
+                     if action in {"trim", "trim & hide"}),
+                    None,
+                )
+                if trim_choice is not None:
+                    trim_kind, trim_name = trim_choice
+                    trim_option = next(
+                        (option for option in inspection.options
+                         if option.kind == trim_kind and option.label == trim_name),
+                        None,
+                    )
+                    if trim_option is not None:
+                        initial_bounds = trim_option.bounds
+            editor = ArtworkCropDialog(inspection, self, initial_bounds)
             if editor.exec() == QDialog.DialogCode.Accepted:
                 selection = editor.crop_selection()
                 self._selections[path] = selection
-                self._update_preview(inspection, selection.bounds)
+                card = self._card_widgets.get(path)
+                if card is not None:
+                    card.setStyleSheet("")
+                preview = self._preview_labels.get(path)
+                if preview is not None:
+                    preview.setStyleSheet(
+                        "QLabel#manualCutPreview { border: 2px solid #D02752; border-radius: 8px; }"
+                    )
+                trim_bounds = (
+                    selection.bounds
+                    if selection.kind in {"layer", "spot_color"} or selection.manual_crop
+                    else None
+                )
+                self._update_preview(inspection, trim_bounds)
             return True
         return super().eventFilter(obj, event)
 
-    def _update_preview(self, inspection: ArtworkInspection, bounds: object) -> None:
-        pixmap = QPixmap()
+    def _update_preview(self, inspection: ArtworkInspection, bounds: object, hover_bounds: object = None) -> None:
         raw = inspection.preview
         image = QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(image)
         pixmap = pixmap.scaled(286, 196, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        if bounds is not None:
+        painter = None
+        if bounds is not None or hover_bounds is not None:
             painter = QPainter(pixmap)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             scale_x = pixmap.width() / max(inspection.page_bounds.width, 1)
             scale_y = pixmap.height() / max(inspection.page_bounds.height, 1)
-            pen = QPen(QColor("#B8F35A"), 4)
+        if bounds is not None:
+            pen = QPen(QColor("#00FF66"), 4)
             painter.setPen(pen)
             painter.drawRect(
                 round(bounds.left * scale_x), round(bounds.top * scale_y),
                 max(1, round(bounds.width * scale_x)), max(1, round(bounds.height * scale_y)),
             )
+        if hover_bounds is not None:
+            painter.setPen(QPen(QColor("#FFFF00"), 3, Qt.PenStyle.DashLine))
+            painter.drawRect(
+                round(hover_bounds.left * scale_x), round(hover_bounds.top * scale_y),
+                max(1, round(hover_bounds.width * scale_x)),
+                max(1, round(hover_bounds.height * scale_y)),
+            )
+        if painter is not None:
             painter.end()
         self._preview_labels[inspection.input_path].setPixmap(pixmap)
 
     def selections(self) -> dict[Path, object | None]:
+        if self._bulk_mode:
+            selections: dict[Path, object | None] = {}
+            for inspection in self._inspections:
+                local_selection = self._selections.get(inspection.input_path)
+                if local_selection is not None:
+                    selections[inspection.input_path] = local_selection
+                    continue
+                trim_option: CutOption | None = None
+                hide_items: list[tuple[str, str, tuple[int, int, int] | None, int | None]] = []
+                for option in inspection.options:
+                    action = self._bulk_actions.get((option.kind, option.label), "")
+                    if action in {"trim", "trim & hide"}:
+                        trim_option = option
+                    if action in {"hide", "trim & hide"}:
+                        hide_items.append((option.kind, option.label, option.color_rgb, option.xref))
+                if trim_option is not None:
+                    selection = CutSelection(
+                        bounds=trim_option.bounds,
+                        kind=trim_option.kind,
+                        name=trim_option.label,
+                        color_rgb=trim_option.color_rgb,
+                        xref=trim_option.xref,
+                        hide_items=tuple(hide_items),
+                    )
+                elif hide_items:
+                    selection = CutSelection(
+                        bounds=inspection.page_bounds,
+                        kind="manual",
+                        hide_items=tuple(hide_items),
+                    )
+                else:
+                    selection = CutSelection(
+                        bounds=inspection.page_bounds,
+                        kind="manual",
+                    )
+                selections[inspection.input_path] = selection
+            return selections
         return dict(self._selections)
 
 
@@ -9846,50 +10229,35 @@ class NewUIWindow(QMainWindow):
         source_row.addWidget(source_button)
         panel_layout.addLayout(source_row)
 
-        output_row = QHBoxLayout()
-        output_row.setSpacing(8)
-        output_label = QLabel("Output folder")
-        output_label.setObjectName("artworkFieldLabel")
-        self.artwork_output = QLineEdit()
-        self.artwork_output.setObjectName("artworkInput")
-        self.artwork_output.setPlaceholderText("Select an output folder")
-        output_button = QPushButton("Browse")
-        output_button.setObjectName("artworkBrowseButton")
-        output_button.clicked.connect(self._choose_artwork_output)
-        output_row.addWidget(output_label)
-        output_row.addWidget(self.artwork_output, 1)
-        output_row.addWidget(output_button)
-        panel_layout.addLayout(output_row)
-
         settings_row = QHBoxLayout()
         settings_row.setSpacing(10)
-        dpi_label = QLabel("Resolution")
-        dpi_label.setObjectName("artworkFieldLabel")
+        settings_row.addStretch(1)
         self.artwork_dpi = QLineEdit("300")
         self.artwork_dpi.setObjectName("artworkSmallInput")
         self.artwork_dpi.setFixedWidth(70)
-        dpi_unit = QLabel("DPI")
+        dpi_unit = QLabel("dpi")
         dpi_unit.setObjectName("artworkMutedLabel")
-        self.artwork_include_diecut = QCheckBox("Write die-cut copy")
-        self.artwork_include_diecut.setObjectName("artworkCheckBox")
-        self.artwork_include_diecut.setChecked(True)
-        settings_row.addWidget(dpi_label)
         settings_row.addWidget(self.artwork_dpi)
         settings_row.addWidget(dpi_unit)
         settings_row.addSpacing(16)
+        self.artwork_include_diecut = QCheckBox("include w/ diecut version")
+        self.artwork_include_diecut.setObjectName("artworkCheckBox")
+        self.artwork_include_diecut.setChecked(True)
         settings_row.addWidget(self.artwork_include_diecut)
-        self.artwork_manual_cut_button = QPushButton("Manual Cut")
-        self.artwork_manual_cut_button.setObjectName("artworkSecondaryButton")
-        self.artwork_manual_cut_button.clicked.connect(self._open_manual_cut)
-        settings_row.addWidget(self.artwork_manual_cut_button)
         settings_row.addStretch(1)
         panel_layout.addLayout(settings_row)
+        panel_layout.addSpacing(12)
 
-        self.artwork_process_button = QPushButton("Process artwork")
-        self.artwork_process_button.setObjectName("artworkProcessButton")
-        self.artwork_process_button.setFixedHeight(40)
-        self.artwork_process_button.clicked.connect(self._process_artwork)
-        panel_layout.addWidget(self.artwork_process_button, 0, Qt.AlignmentFlag.AlignLeft)
+        manual_cut_row = QHBoxLayout()
+        manual_cut_row.addStretch(1)
+        self.artwork_manual_cut_button = QPushButton("Manual Cut")
+        self.artwork_manual_cut_button.setObjectName("collectorRunBtn")
+        self.artwork_manual_cut_button.setFixedHeight(50)
+        self.artwork_manual_cut_button.setMinimumWidth(180)
+        self.artwork_manual_cut_button.clicked.connect(self._open_manual_cut)
+        manual_cut_row.addWidget(self.artwork_manual_cut_button)
+        manual_cut_row.addStretch(1)
+        panel_layout.addLayout(manual_cut_row)
 
         self.artwork_log = QTextEdit()
         self.artwork_log.setObjectName("artworkLog")
@@ -9904,13 +10272,6 @@ class NewUIWindow(QMainWindow):
         if paths:
             self._artwork_paths = [Path(path) for path in paths]
             self.artwork_input.setText(" | ".join(paths))
-            if not self.artwork_output.text().strip():
-                self.artwork_output.setText(str(Path(paths[0]).parent / "artwork_output"))
-
-    def _choose_artwork_output(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose artwork output folder")
-        if folder:
-            self.artwork_output.setText(folder)
 
     def _process_artwork(self) -> None:
         input_paths = [path for path in getattr(self, "_artwork_paths", []) if path.is_file()]
@@ -9929,8 +10290,7 @@ class NewUIWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid resolution", "Resolution must be a whole number of at least 72 DPI.")
             return
 
-        output_text = self.artwork_output.text().strip()
-        output_dir = Path(output_text) if output_text else input_paths[0].parent / "artwork_output"
+        output_dir = input_paths[0].parent / "artwork_output"
         self.artwork_process_button.setEnabled(False)
         QApplication.processEvents()
         try:
@@ -9970,8 +10330,9 @@ class NewUIWindow(QMainWindow):
         dialog = ArtworkManualCutDialog(inspections, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        output_text = self.artwork_output.text().strip()
-        output_dir = Path(output_text) if output_text else input_paths[0].parent / "artwork_output"
+        output_dir = dialog.output_folder
+        if output_dir is None:
+            return
         try:
             dpi = int(self.artwork_dpi.text().strip())
             if dpi < 72:

@@ -81,6 +81,8 @@ class CutSelection:
 	hide_name: str = ""
 	hide_color_rgb: tuple[int, int, int] | None = None
 	hide_xref: int | None = None
+	hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = ()
+	manual_crop: bool = False
 
 
 @dataclass
@@ -318,10 +320,12 @@ def _normalize_white(image: Any, tolerance: int) -> Any:
 def _save_pixmap(pixmap: Any, target: Path, output_format: OutputFormat, white_tolerance: int) -> None:
 	_, Image = _require_dependencies()
 	if hasattr(pixmap, "samples"):
-		image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+		mode = "RGBA" if pixmap.alpha else "RGB"
+		image = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
 	else:
 		image = pixmap
-	image = _normalize_white(image, white_tolerance)
+	if image.mode == "RGB":
+		image = _normalize_white(image, white_tolerance)
 	target.parent.mkdir(parents=True, exist_ok=True)
 	if output_format == "jpeg":
 		image.save(target, format="JPEG", quality=95, dpi=(300, 300))
@@ -335,7 +339,8 @@ def _remove_color_from_pixmap(pixmap: Any, color_rgb: tuple[int, int, int], tole
 	"""Erase a selected separation color from a rendered clean copy."""
 	_, Image = _require_dependencies()
 	if hasattr(pixmap, "samples"):
-		image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+		mode = "RGBA" if pixmap.alpha else "RGB"
+		image = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
 	else:
 		image = pixmap.copy()
 	pixels = image.load()
@@ -344,7 +349,7 @@ def _remove_color_from_pixmap(pixmap: Any, color_rgb: tuple[int, int, int], tole
 		for x in range(image.width):
 			current = pixels[x, y]
 			if max(abs(current[0] - red), abs(current[1] - green), abs(current[2] - blue)) <= tolerance:
-				pixels[x, y] = (255, 255, 255)
+				pixels[x, y] = (current[0], current[1], current[2], 0) if image.mode == "RGBA" else (255, 255, 255)
 	return image
 
 
@@ -371,6 +376,8 @@ class ArtworkProcessor:
 			selection = cut_bounds if isinstance(cut_bounds, CutSelection) else None
 			if selection is not None:
 				cut_bounds = selection.bounds
+			if selection is not None and selection.kind == "manual" and not selection.manual_crop:
+				cut_bounds = _bounds_from_rect(page.rect)
 			if cut_bounds is not None:
 				detection = DetectionResult(
 					cut_bounds, 1.0, "manual selection", ["User-selected manual cut"], []
@@ -412,20 +419,27 @@ class ArtworkProcessor:
 		hide_kind = selection.hide_kind if selection else ""
 		hide_name = selection.hide_name if selection else ""
 		hide_xref = selection.hide_xref if selection else None
-		target_xrefs = [
+		hide_color_rgb = selection.hide_color_rgb if selection else None
+		hide_items = list(getattr(selection, "hide_items", ()) or [])
+		if selection and hide_kind and hide_name:
+			hide_items.append((hide_kind, hide_name, hide_color_rgb, hide_xref))
+		layer_targets = [
 			layer.get("xref") for layer in layers
 			if layer.get("xref") and (
 				(selection and selection.kind == "layer" and str(layer.get("name", "")) == selection.name)
 				or (selection and hide_kind == "layer" and (hide_xref == layer.get("xref") or str(layer.get("name", "")) == hide_name))
+				or any(
+					(item_kind == "layer" and (item_xref == layer.get("xref") or str(layer.get("name", "")) == item_name))
+					for item_kind, item_name, _, item_xref in hide_items
+				)
 				or (selection is None and any(term in str(layer.get("name", "")).lower() for term in DIECUT_TERMS + CAD_TERMS))
 			)
 		]
-		if target_xrefs:
+		base_pixmap = _crop_pixmap(page, detection.bounds, self.options.dpi)
+		pixmap = base_pixmap
+		if layer_targets:
 			try:
-				# Illustrator PDFs expose OCGs through get_ocgs(). MuPDF's
-				# in-memory config is not always used by get_pixmap, so persist
-				# the visibility config and render the reopened document.
-				document.set_layer(-1, basestate="ON", off=target_xrefs)
+				document.set_layer(-1, basestate="ON", off=layer_targets)
 				with tempfile.TemporaryDirectory(prefix="hat_artwork_") as temp_dir:
 					temp_path = Path(temp_dir) / "clean_render.pdf"
 					document.save(temp_path)
@@ -434,20 +448,22 @@ class ArtworkProcessor:
 						clean_page = clean_document[0]
 						scale = self.options.dpi / 72.0
 						clip = fitz.Rect(detection.bounds.left, detection.bounds.top, detection.bounds.right, detection.bounds.bottom)
-						pixmap = clean_page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False, colorspace=fitz.csRGB)
+						pixmap = clean_page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=True, colorspace=fitz.csRGB)
 					finally:
 						clean_document.close()
-					return pixmap, None
 			except (TypeError, RuntimeError, ValueError, OSError):
 				pass
 		warning = "Clean export uses the cropped render because this PDF is flattened or has no controllable OCG layers."
+		for item_kind, item_name, item_color, item_xref in hide_items:
+			if item_kind == "spot_color" and item_color:
+				pixmap = _remove_color_from_pixmap(pixmap, item_color)
+				warning = None
 		if selection and hide_kind == "spot_color" and hide_color_rgb:
-			return _remove_color_from_pixmap(
-				_crop_pixmap(page, detection.bounds, self.options.dpi), hide_color_rgb
-			), None
-		if selection and hide_kind == "spot_color":
+			pixmap = _remove_color_from_pixmap(pixmap, hide_color_rgb)
+			warning = None
+		if selection and hide_kind == "spot_color" and not hide_color_rgb:
 			warning = "The selected spot color could not be masked because its color metadata was not available."
-		return _crop_pixmap(page, detection.bounds, self.options.dpi), warning
+		return pixmap, warning
 
 	def process_batch(self, input_dir: Path, output_dir: Path) -> list[ProcessResult]:
 		paths = sorted(path for path in input_dir.glob("*.pdf") if path.is_file())
