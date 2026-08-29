@@ -39,7 +39,7 @@ _patch_matplotlib_path_deepcopy()
 _BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
 from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, QRect, Signal, QTimer
-from PySide6.QtGui import QColor, QCursor, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont
+from PySide6.QtGui import QColor, QCursor, QImage, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QTextEdit,
+    QDoubleSpinBox,
     QDialog,
     QColorDialog,
     QFileDialog,
@@ -65,6 +66,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSlider,
+    QTabWidget,
     QStackedWidget,
     QSpacerItem,
     QSizePolicy,
@@ -84,6 +87,8 @@ from general_functions import clear_other_panel_inputs
 from hat_config import HatConfig
 from body_mapper import CompareParams, run_comparison, run_set_comparison
 from reference_collector import RefCollectorParams, run_reference_collector
+from artwork_processing import ArtworkInspection, ArtworkProcessor, ProcessOptions, inspect_artwork
+from artwork_processing import ArtworkInspection, ArtworkProcessor, Bounds, CutSelection, ProcessOptions, inspect_artwork
 import review_project
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -8953,14 +8958,455 @@ class _SearchResultWindow(QDialog):
             QMessageBox.critical(self, "Export Failed", str(exc))
 
 
+class ArtworkCropCanvas(QLabel):
+    """Preview canvas with a draggable crop rectangle in PDF-point space."""
+
+    cropChanged = Signal(object)
+
+    def __init__(self, image: QImage, page_bounds: object, initial_bounds: object, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._image = QPixmap.fromImage(image)
+        self._page_bounds = page_bounds
+        self._crop = initial_bounds
+        self._drag_start: tuple[float, float] | None = None
+        self._drag_current: tuple[float, float] | None = None
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_start: tuple[float, float] | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(700, 460)
+        self.setMouseTracking(True)
+        self._refresh()
+
+    def _image_rect(self):
+        target = self.size()
+        target.setWidth(max(1, round(target.width() * self._zoom)))
+        target.setHeight(max(1, round(target.height() * self._zoom)))
+        return self._image.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+    def set_zoom(self, value: int) -> None:
+        self._zoom = max(1.0, value / 100.0)
+        self._refresh()
+
+    def wheelEvent(self, event) -> None:
+        step = 25 if event.angleDelta().y() > 0 else -25
+        self.set_zoom(round(self._zoom * 100) + step)
+        event.accept()
+
+    def set_crop_style(self, color: str) -> None:
+        self._crop_color = color
+        self._refresh()
+
+    def _display_rect(self):
+        scaled = self._image_rect()
+        left = (self.width() - scaled.width()) / 2 + self._pan_x
+        top = (self.height() - scaled.height()) / 2 + self._pan_y
+        return left, top, scaled.width(), scaled.height()
+
+    def _to_page_point(self, x: float, y: float) -> tuple[float, float]:
+        left, top, width, height = self._display_rect()
+        px = self._page_bounds.left + ((x - left) / max(width, 1)) * self._page_bounds.width
+        py = self._page_bounds.top + ((y - top) / max(height, 1)) * self._page_bounds.height
+        return (
+            max(self._page_bounds.left, min(self._page_bounds.right, px)),
+            max(self._page_bounds.top, min(self._page_bounds.bottom, py)),
+        )
+
+    def _to_display_rect(self, bounds: object) -> tuple[float, float, float, float]:
+        left, top, width, height = self._display_rect()
+        x = left + (bounds.left - self._page_bounds.left) / max(self._page_bounds.width, 1) * width
+        y = top + (bounds.top - self._page_bounds.top) / max(self._page_bounds.height, 1) * height
+        w = bounds.width / max(self._page_bounds.width, 1) * width
+        h = bounds.height / max(self._page_bounds.height, 1) * height
+        return x, y, w, h
+
+    def _refresh(self) -> None:
+        pixmap = self._image_rect()
+        canvas = QPixmap(self.size())
+        canvas.fill(QColor("#F2F2F2"))
+        painter = QPainter(canvas)
+        painter.drawPixmap((self.width() - pixmap.width()) // 2, (self.height() - pixmap.height()) // 2, pixmap)
+        x, y, width, height = self._to_display_rect(self._crop)
+        painter.setPen(QPen(QColor(getattr(self, "_crop_color", "#B8F35A")), 4))
+        painter.drawRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
+        painter.end()
+        self.setPixmap(canvas)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_start = (event.position().x(), event.position().y())
+            return
+        point = self._to_page_point(event.position().x(), event.position().y())
+        self._drag_start = point
+        self._drag_current = point
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._pan_start is not None:
+            self._pan_x += event.position().x() - self._pan_start[0]
+            self._pan_y += event.position().y() - self._pan_start[1]
+            self._pan_start = (event.position().x(), event.position().y())
+            self._refresh()
+            return
+        if self._drag_start is None:
+            return
+        self._drag_current = self._to_page_point(event.position().x(), event.position().y())
+        self._set_drag_crop()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._pan_start is not None:
+            self._pan_start = None
+            return
+        if self._drag_start is not None:
+            self._drag_current = self._to_page_point(event.position().x(), event.position().y())
+            self._set_drag_crop()
+        self._drag_start = None
+        self._drag_current = None
+
+    def _set_drag_crop(self) -> None:
+        if self._drag_start is None or self._drag_current is None:
+            return
+        from artwork_processing import Bounds
+        x1, y1 = self._drag_start
+        x2, y2 = self._drag_current
+        self._crop = Bounds(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        self._refresh()
+        self.cropChanged.emit(self._crop)
+
+    def crop(self) -> object:
+        return self._crop
+
+
+class ArtworkCropDialog(QDialog):
+    """Large single-artwork crop editor."""
+
+    def __init__(self, inspection: ArtworkInspection, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowTitle(f"Manual Cut - {inspection.input_path.name}")
+        self.resize(980, 700)
+        self.setMinimumSize(780, 560)
+        self._inspection = inspection
+        self._mode = "manual"
+        self._selected_source: CutSelection | None = None
+        self._manual_hide_selection: CutSelection | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        title = QLabel(self._inspection.input_path.name)
+        title.setObjectName("manualCutTitle")
+        layout.addWidget(title)
+        hint = QLabel("Select a crop method on the left. Use the mouse wheel to zoom and middle-drag to pan.")
+        hint.setObjectName("manualCutDescription")
+        layout.addWidget(hint)
+
+        initial = self._inspection.detected_bounds
+        body = QHBoxLayout()
+        crop_panel = QFrame()
+        crop_panel.setObjectName("cropControlPanel")
+        crop_panel.setFixedWidth(350)
+        crop_layout = QVBoxLayout(crop_panel)
+        crop_title = QLabel("Cropping")
+        crop_title.setObjectName("manualCutSectionLabel")
+        crop_layout.addWidget(crop_title)
+        tabs = QTabWidget()
+        tabs.setObjectName("cropTabs")
+        layers_tab = QWidget()
+        layers_layout = QVBoxLayout(layers_tab)
+        self._layer_group = QButtonGroup(layers_tab)
+        self._layer_group.setExclusive(True)
+        layer_options = [option for option in self._inspection.options if option.kind == "layer"]
+        if not layer_options:
+            layers_layout.addWidget(QLabel("No PDF layers found."))
+        for option in layer_options:
+            check = QCheckBox(option.label)
+            check.setObjectName("cropOptionCheck")
+            self._layer_group.addButton(check)
+            layers_layout.addWidget(check)
+            check.toggled.connect(lambda checked, choice=option: self._set_source_crop(choice, checked, "layer"))
+        layers_layout.addStretch(1)
+        separations_tab = QWidget()
+        separations_layout = QVBoxLayout(separations_tab)
+        self._separation_group = QButtonGroup(separations_tab)
+        self._separation_group.setExclusive(True)
+        separation_options = [option for option in self._inspection.options if option.kind == "spot_color"]
+        if not separation_options:
+            separations_layout.addWidget(QLabel("No vector separations found."))
+        for option in separation_options:
+            check = QCheckBox(option.label)
+            check.setObjectName("cropOptionCheck")
+            self._separation_group.addButton(check)
+            separations_layout.addWidget(check)
+            check.toggled.connect(lambda checked, choice=option: self._set_source_crop(choice, checked, "separation"))
+        separations_layout.addStretch(1)
+        manual_tab = QWidget()
+        manual_layout = QVBoxLayout(manual_tab)
+        manual_label = QLabel("Drag the crop rectangle on the artwork.")
+        manual_label.setWordWrap(True)
+        manual_layout.addWidget(manual_label)
+        hide_label = QLabel("Clean version: hide selected element")
+        hide_label.setObjectName("manualCutSectionLabel")
+        manual_layout.addWidget(hide_label)
+        hide_tabs = QTabWidget()
+        hide_tabs.setObjectName("manualHideTabs")
+        hide_layer_tab = QWidget()
+        hide_layer_layout = QVBoxLayout(hide_layer_tab)
+        manual_layer_group = QButtonGroup(hide_layer_tab)
+        manual_layer_group.setExclusive(True)
+        for option in layer_options:
+            check = QCheckBox(option.label)
+            check.setObjectName("cropOptionCheck")
+            manual_layer_group.addButton(check)
+            hide_layer_layout.addWidget(check)
+            check.toggled.connect(lambda checked, choice=option: self._set_manual_hide(choice, checked, "layer"))
+        if not layer_options:
+            hide_layer_layout.addWidget(QLabel("No PDF layers found."))
+        hide_layer_layout.addStretch(1)
+        hide_color_tab = QWidget()
+        hide_color_layout = QVBoxLayout(hide_color_tab)
+        manual_color_group = QButtonGroup(hide_color_tab)
+        manual_color_group.setExclusive(True)
+        for option in separation_options:
+            check = QCheckBox(option.label)
+            check.setObjectName("cropOptionCheck")
+            manual_color_group.addButton(check)
+            hide_color_layout.addWidget(check)
+            check.toggled.connect(lambda checked, choice=option: self._set_manual_hide(choice, checked, "spot_color"))
+        if not separation_options:
+            hide_color_layout.addWidget(QLabel("No separations found."))
+        hide_color_layout.addStretch(1)
+        hide_tabs.addTab(hide_layer_tab, "Layer")
+        hide_tabs.addTab(hide_color_tab, "Spot Color")
+        manual_layout.addWidget(hide_tabs, 1)
+        manual_layout.addStretch(1)
+        tabs.addTab(layers_tab, "By Layer")
+        tabs.addTab(separations_tab, "By Spot Color")
+        tabs.addTab(manual_tab, "Manual Selection")
+        tabs.currentChanged.connect(self._tab_changed)
+        crop_layout.addWidget(tabs, 1)
+        body.addWidget(crop_panel)
+        self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
+        body.addWidget(self.canvas, 1)
+        layout.addLayout(body, 1)
+
+        zoom_row = QHBoxLayout()
+        zoom_label = QLabel("Zoom")
+        zoom_label.setObjectName("manualCutDescription")
+        zoom_row.addWidget(zoom_label)
+        zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        zoom_slider.setObjectName("manualCutZoomSlider")
+        zoom_slider.setRange(100, 300)
+        zoom_slider.setValue(100)
+        zoom_slider.setTickInterval(25)
+        zoom_slider.valueChanged.connect(self.canvas.set_zoom)
+        zoom_row.addWidget(zoom_slider, 1)
+        self.zoom_value = QLabel("100%")
+        self.zoom_value.setObjectName("manualCutDescription")
+        zoom_slider.valueChanged.connect(lambda value: self.zoom_value.setText(f"{value}%"))
+        zoom_row.addWidget(self.zoom_value)
+        layout.addLayout(zoom_row)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("manualCutCancelButton")
+        cancel.clicked.connect(self.reject)
+        accept = QPushButton("Use this crop")
+        accept.setObjectName("artworkProcessButton")
+        accept.clicked.connect(self.accept)
+        footer.addWidget(cancel)
+        footer.addWidget(accept)
+        layout.addLayout(footer)
+
+    def _set_source_crop(self, option: object, checked: bool, mode: str) -> None:
+        if not checked:
+            return
+        self._mode = mode
+        self.canvas._crop = option.bounds
+        self._selected_source = CutSelection(
+            option.bounds,
+            "layer" if mode == "layer" else "spot_color",
+            option.label,
+            option.color_rgb,
+            option.xref,
+        )
+        self.canvas.set_crop_style("#E3262E")
+        self.canvas._refresh()
+
+    def _set_manual_hide(self, option: object, checked: bool, mode: str) -> None:
+        if not checked:
+            return
+        self._manual_hide_selection = CutSelection(
+            self.canvas.crop(), mode, option.label, option.color_rgb, option.xref,
+        )
+        self.canvas.set_crop_style("#E3262E")
+        self.canvas._refresh()
+
+    def _tab_changed(self, index: int) -> None:
+        self._mode = "manual" if index == 2 else "source"
+        if index == 2:
+            self.canvas.set_crop_style("#B8F35A")
+            self._selected_source = None
+        else:
+            self.canvas.set_crop_style("#E3262E")
+
+    def eventFilter(self, obj, event) -> bool:
+        return super().eventFilter(obj, event)
+
+    def _inspection_image(self) -> QImage:
+        raw = self._inspection.preview
+        return QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
+
+    def _set_bounds(self, bounds: object) -> None:
+        self.canvas._crop = bounds
+        self.canvas._refresh()
+
+    def _spin_changed(self) -> None:
+        return
+
+    def crop_bounds(self) -> object:
+        return self.canvas.crop()
+
+    def crop_selection(self) -> CutSelection:
+        if self._manual_hide_selection is not None:
+            hide = self._manual_hide_selection
+            return CutSelection(
+                self.canvas.crop(), "manual", "", None, None,
+                hide.kind, hide.name, hide.color_rgb, hide.xref,
+            )
+        if self._selected_source is not None:
+            return CutSelection(
+                self.canvas.crop(),
+                self._selected_source.kind,
+                self._selected_source.name,
+                self._selected_source.color_rgb,
+                self._selected_source.xref,
+            )
+        return CutSelection(self.canvas.crop(), "manual")
+
+
+class ArtworkManualCutDialog(QDialog):
+    """Thumbnail gallery for bulk artwork review."""
+
+    def __init__(self, inspections: list[ArtworkInspection], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowTitle("Manual Cut - Artwork Preview")
+        self.resize(1120, 760)
+        self.setMinimumSize(860, 560)
+        self._inspections = inspections
+        self._selections: dict[Path, object | None] = {}
+        self._preview_labels: dict[Path, QLabel] = {}
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        heading = QLabel("Manual Cut")
+        heading.setObjectName("manualCutTitle")
+        layout.addWidget(heading)
+        intro = QLabel("Click an artwork thumbnail to open its manual crop editor.")
+        intro.setObjectName("manualCutDescription")
+        layout.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setObjectName("manualCutScroll")
+        cards = QWidget()
+        cards_layout = QGridLayout(cards)
+        cards_layout.setContentsMargins(2, 2, 2, 2)
+        cards_layout.setSpacing(14)
+        for index, inspection in enumerate(self._inspections):
+            cards_layout.addWidget(self._build_card(inspection), index // 3, index % 3)
+        for column in range(3):
+            cards_layout.setColumnStretch(column, 1)
+        scroll.setWidget(cards)
+        layout.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("manualCutCancelButton")
+        cancel.clicked.connect(self.reject)
+        apply_button = QPushButton("Use selected cuts")
+        apply_button.setObjectName("artworkProcessButton")
+        apply_button.clicked.connect(self.accept)
+        footer.addWidget(cancel)
+        footer.addWidget(apply_button)
+        layout.addLayout(footer)
+
+    def _build_card(self, inspection: ArtworkInspection) -> QFrame:
+        card = QFrame()
+        card.setObjectName("manualCutCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 14, 14, 14)
+
+        preview = QLabel()
+        preview.setObjectName("manualCutPreview")
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setFixedSize(300, 210)
+        preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        preview.setToolTip(inspection.input_path.name)
+        preview.installEventFilter(self)
+        self._preview_labels[inspection.input_path] = preview
+        card_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        self._selections[inspection.input_path] = None
+        self._update_preview(inspection, None)
+        return card
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress and obj in self._preview_labels.values():
+            path = next(path for path, label in self._preview_labels.items() if label is obj)
+            inspection = next(item for item in self._inspections if item.input_path == path)
+            editor = ArtworkCropDialog(inspection, self)
+            if editor.exec() == QDialog.DialogCode.Accepted:
+                selection = editor.crop_selection()
+                self._selections[path] = selection
+                self._update_preview(inspection, selection.bounds)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _update_preview(self, inspection: ArtworkInspection, bounds: object) -> None:
+        pixmap = QPixmap()
+        raw = inspection.preview
+        image = QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        pixmap = pixmap.scaled(286, 196, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        if bounds is not None:
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            scale_x = pixmap.width() / max(inspection.page_bounds.width, 1)
+            scale_y = pixmap.height() / max(inspection.page_bounds.height, 1)
+            pen = QPen(QColor("#B8F35A"), 4)
+            painter.setPen(pen)
+            painter.drawRect(
+                round(bounds.left * scale_x), round(bounds.top * scale_y),
+                max(1, round(bounds.width * scale_x)), max(1, round(bounds.height * scale_y)),
+            )
+            painter.end()
+        self._preview_labels[inspection.input_path].setPixmap(pixmap)
+
+    def selections(self) -> dict[Path, object | None]:
+        return dict(self._selections)
+
+
 class NewUIWindow(QMainWindow):
     """UI-only dashboard shell. No business logic is connected yet."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("HAT Dashboard")
-        self.resize(910, 792)
-        self.setMinimumSize(910, 792)
+        self.resize(1047, 792)
+        self.setMinimumSize(1047, 792)
 
         root = QWidget()
         root.setObjectName("root")
@@ -8982,6 +9428,7 @@ class NewUIWindow(QMainWindow):
         self.btn_master = self._make_top_button("Master")
         self.btn_project = self._make_top_button("Project")
         self.btn_search = self._make_top_button("Search")
+        self.btn_artwork = self._make_top_button("Artwork")
 
         main_row = QHBoxLayout()
         main_row.setSpacing(14)
@@ -9075,6 +9522,7 @@ class NewUIWindow(QMainWindow):
         buttons_row.addWidget(self.btn_master)
         buttons_row.addWidget(self.btn_project)
         buttons_row.addWidget(self.btn_search)
+        buttons_row.addWidget(self.btn_artwork)
         buttons_row.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
         header_row.addWidget(buttons_slot, 1)
 
@@ -9266,6 +9714,8 @@ class NewUIWindow(QMainWindow):
         self.content_stack.addWidget(self.active_tools_page)
         self.search_page = self._build_search_page()
         self.content_stack.addWidget(self.search_page)
+        self.artwork_page = self._build_artwork_page()
+        self.content_stack.addWidget(self.artwork_page)
         content_layout.addWidget(self.content_stack, 1)
         content_layout.addWidget(self.section_title, 0, Qt.AlignLeft | Qt.AlignBottom)
 
@@ -9275,6 +9725,7 @@ class NewUIWindow(QMainWindow):
         self._register_top_button(self.btn_master, "MASTER")
         self._register_top_button(self.btn_project, "PROJECT")
         self._register_top_button(self.btn_search, "SEARCH")
+        self._register_top_button(self.btn_artwork, "ARTWORK")
         self.btn_home.setChecked(True)
         self._set_section_title("HOME")
 
@@ -9299,6 +9750,7 @@ class NewUIWindow(QMainWindow):
             "MASTER": 120,
             "PROJECT": 120,
             "SEARCH": 110,
+            "ARTWORK": 120,
         }
         btn.setMinimumWidth(width_map.get(text.upper(), 120))
         return btn
@@ -9341,11 +9793,205 @@ class NewUIWindow(QMainWindow):
             self.content_stack.setCurrentWidget(self.search_page)
             self.left_nav_stack.setCurrentWidget(self.left_nav_blank)
             self.combined_right_panel.setVisible(False)
+        elif title == "ARTWORK":
+            self.project_selector_row.setVisible(False)
+            self._content_layout.setSpacing(0)
+            self.content_stack.setCurrentWidget(self.artwork_page)
+            self.left_nav_stack.setCurrentWidget(self.left_nav_blank)
+            self.combined_right_panel.setVisible(False)
         else:  # HOME
             self.project_selector_row.setVisible(False)
             self._content_layout.setSpacing(16)
             self.content_stack.setCurrentWidget(self.empty_page)
             self.combined_right_panel.setVisible(False)
+
+    def _build_artwork_page(self) -> QWidget:
+        """Build the Artwork processing controls and results panel."""
+        outer = QWidget()
+        outer_layout = QHBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 16, 0, 0)
+        outer_layout.setSpacing(18)
+
+        left_spacer = QWidget()
+        left_spacer.setMaximumWidth(178)
+        outer_layout.addWidget(left_spacer)
+
+        panel = QFrame()
+        panel.setObjectName("artworkPanel")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(24, 24, 24, 24)
+        panel_layout.setSpacing(12)
+
+        title = QLabel("Artwork Processing")
+        title.setObjectName("artworkTitle")
+        panel_layout.addWidget(title)
+
+        description = QLabel("Detect a dieline, crop the artwork, and export TIFF files.")
+        description.setObjectName("artworkDescription")
+        panel_layout.addWidget(description)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(8)
+        source_label = QLabel("PDF artwork")
+        source_label.setObjectName("artworkFieldLabel")
+        self.artwork_input = QLineEdit()
+        self.artwork_input.setObjectName("artworkInput")
+        self.artwork_input.setPlaceholderText("Select one or more PDF files")
+        source_button = QPushButton("Browse")
+        source_button.setObjectName("artworkBrowseButton")
+        source_button.clicked.connect(self._choose_artwork_input)
+        source_row.addWidget(source_label)
+        source_row.addWidget(self.artwork_input, 1)
+        source_row.addWidget(source_button)
+        panel_layout.addLayout(source_row)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(8)
+        output_label = QLabel("Output folder")
+        output_label.setObjectName("artworkFieldLabel")
+        self.artwork_output = QLineEdit()
+        self.artwork_output.setObjectName("artworkInput")
+        self.artwork_output.setPlaceholderText("Select an output folder")
+        output_button = QPushButton("Browse")
+        output_button.setObjectName("artworkBrowseButton")
+        output_button.clicked.connect(self._choose_artwork_output)
+        output_row.addWidget(output_label)
+        output_row.addWidget(self.artwork_output, 1)
+        output_row.addWidget(output_button)
+        panel_layout.addLayout(output_row)
+
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(10)
+        dpi_label = QLabel("Resolution")
+        dpi_label.setObjectName("artworkFieldLabel")
+        self.artwork_dpi = QLineEdit("300")
+        self.artwork_dpi.setObjectName("artworkSmallInput")
+        self.artwork_dpi.setFixedWidth(70)
+        dpi_unit = QLabel("DPI")
+        dpi_unit.setObjectName("artworkMutedLabel")
+        self.artwork_include_diecut = QCheckBox("Write die-cut copy")
+        self.artwork_include_diecut.setObjectName("artworkCheckBox")
+        self.artwork_include_diecut.setChecked(True)
+        settings_row.addWidget(dpi_label)
+        settings_row.addWidget(self.artwork_dpi)
+        settings_row.addWidget(dpi_unit)
+        settings_row.addSpacing(16)
+        settings_row.addWidget(self.artwork_include_diecut)
+        self.artwork_manual_cut_button = QPushButton("Manual Cut")
+        self.artwork_manual_cut_button.setObjectName("artworkSecondaryButton")
+        self.artwork_manual_cut_button.clicked.connect(self._open_manual_cut)
+        settings_row.addWidget(self.artwork_manual_cut_button)
+        settings_row.addStretch(1)
+        panel_layout.addLayout(settings_row)
+
+        self.artwork_process_button = QPushButton("Process artwork")
+        self.artwork_process_button.setObjectName("artworkProcessButton")
+        self.artwork_process_button.setFixedHeight(40)
+        self.artwork_process_button.clicked.connect(self._process_artwork)
+        panel_layout.addWidget(self.artwork_process_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.artwork_log = QTextEdit()
+        self.artwork_log.setObjectName("artworkLog")
+        self.artwork_log.setReadOnly(True)
+        self.artwork_log.setPlaceholderText("Detection details and output paths will appear here.")
+        panel_layout.addWidget(self.artwork_log, 1)
+        outer_layout.addWidget(panel, 1)
+        return outer
+
+    def _choose_artwork_input(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose artwork PDFs", "", "PDF files (*.pdf)")
+        if paths:
+            self._artwork_paths = [Path(path) for path in paths]
+            self.artwork_input.setText(" | ".join(paths))
+            if not self.artwork_output.text().strip():
+                self.artwork_output.setText(str(Path(paths[0]).parent / "artwork_output"))
+
+    def _choose_artwork_output(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Choose artwork output folder")
+        if folder:
+            self.artwork_output.setText(folder)
+
+    def _process_artwork(self) -> None:
+        input_paths = [path for path in getattr(self, "_artwork_paths", []) if path.is_file()]
+        if not input_paths:
+            input_path = Path(self.artwork_input.text().strip())
+            if input_path.is_file() and input_path.suffix.lower() == ".pdf":
+                input_paths = [input_path]
+        if not input_paths:
+            QMessageBox.warning(self, "Missing artwork PDF", "Choose one or more existing PDF files first.")
+            return
+        try:
+            dpi = int(self.artwork_dpi.text().strip())
+            if dpi < 72:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Invalid resolution", "Resolution must be a whole number of at least 72 DPI.")
+            return
+
+        output_text = self.artwork_output.text().strip()
+        output_dir = Path(output_text) if output_text else input_paths[0].parent / "artwork_output"
+        self.artwork_process_button.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            options = ProcessOptions(dpi=dpi, output_format="tiff", include_diecut=self.artwork_include_diecut.isChecked())
+            lines: list[str] = []
+            for input_path in input_paths:
+                result = ArtworkProcessor(options).process_file(input_path, output_dir)
+                lines.extend([
+                    f"{input_path.name} | confidence {result.detection.confidence:.2f} | {result.detection.source}",
+                    f"Crop: {result.detection.bounds.width:.1f} x {result.detection.bounds.height:.1f} pt",
+                ])
+                if result.diecut_path:
+                    lines.append(f"Die-cut TIFF: {result.diecut_path}")
+                lines.append(f"Clean TIFF: {result.clean_path}")
+                lines.extend(f"Warning: {warning}" for warning in result.warnings)
+            self.artwork_log.setPlainText("\n".join(lines))
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            self.artwork_log.setPlainText(f"Processing failed: {error}")
+            QMessageBox.critical(self, "Artwork processing failed", str(error))
+        finally:
+            self.artwork_process_button.setEnabled(True)
+
+    def _open_manual_cut(self) -> None:
+        input_paths = [path for path in getattr(self, "_artwork_paths", []) if path.is_file()]
+        if not input_paths:
+            input_path = Path(self.artwork_input.text().strip())
+            if input_path.is_file() and input_path.suffix.lower() == ".pdf":
+                input_paths = [input_path]
+        if not input_paths:
+            QMessageBox.warning(self, "Missing artwork PDF", "Choose one or more PDF files before opening Manual Cut.")
+            return
+        try:
+            inspections = [inspect_artwork(path, dpi=72) for path in input_paths]
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            QMessageBox.critical(self, "Artwork preview failed", str(error))
+            return
+        dialog = ArtworkManualCutDialog(inspections, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_text = self.artwork_output.text().strip()
+        output_dir = Path(output_text) if output_text else input_paths[0].parent / "artwork_output"
+        try:
+            dpi = int(self.artwork_dpi.text().strip())
+            if dpi < 72:
+                raise ValueError
+            options = ProcessOptions(dpi=dpi, output_format="tiff", include_diecut=self.artwork_include_diecut.isChecked())
+            lines: list[str] = []
+            for input_path in input_paths:
+                choice = dialog.selections().get(input_path)
+                result = ArtworkProcessor(options).process_file(
+                    input_path, output_dir, choice
+                )
+                lines.append(f"{input_path.name} | {result.detection.source} | confidence {result.detection.confidence:.2f}")
+                if result.diecut_path:
+                    lines.append(f"  Die-cut TIFF: {result.diecut_path}")
+                lines.append(f"  Clean TIFF: {result.clean_path}")
+                lines.extend(f"  Warning: {warning}" for warning in result.warnings)
+            self.artwork_log.setPlainText("\n".join(lines))
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            self.artwork_log.setPlainText(f"Manual processing failed: {error}")
+            QMessageBox.critical(self, "Manual processing failed", str(error))
 
     def _update_home_image(self) -> None:
         """Scale home_page_text.png and the GIF to fit the card height."""
@@ -12871,6 +13517,221 @@ class NewUIWindow(QMainWindow):
             background-color: #FFFFFF;
             border: 1px solid #C0C0C0;
             border-radius: 18px;
+        }
+
+        #artworkPanel {
+            background-color: #FFFFFF;
+            border: 1px solid #C0C0C0;
+            border-radius: 18px;
+        }
+
+        #artworkTitle {
+            color: #8A244B;
+            font-family: "Segoe UI";
+            font-size: 26px;
+            font-weight: 800;
+        }
+
+        #artworkDescription, #artworkMutedLabel {
+            color: #5D6875;
+            font-family: "Segoe UI";
+            font-size: 13px;
+        }
+
+        #artworkFieldLabel {
+            min-width: 105px;
+            color: #111F35;
+            font-family: "Segoe UI";
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        #artworkInput, #artworkSmallInput {
+            background-color: #F2F2F2;
+            color: #111111;
+            border: 1px solid #C8C8C8;
+            border-radius: 7px;
+            min-height: 34px;
+            padding: 0 10px;
+            font-family: "Segoe UI";
+            font-size: 13px;
+        }
+
+        #artworkInput:focus, #artworkSmallInput:focus {
+            border: 1px solid #8A244B;
+            background-color: #FFFFFF;
+        }
+
+        #artworkBrowseButton {
+            background-color: #111F35;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 7px;
+            min-width: 82px;
+            min-height: 34px;
+            font-weight: 700;
+        }
+
+        #artworkBrowseButton:hover {
+            background-color: #273B5A;
+        }
+
+        #artworkProcessButton {
+            background-color: #D02752;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 8px;
+            padding: 0 20px;
+            font-weight: 800;
+        }
+
+        #artworkProcessButton:hover {
+            background-color: #B51F45;
+        }
+
+        #artworkCheckBox {
+            color: #111F35;
+            font-size: 13px;
+        }
+
+        #artworkLog {
+            background-color: #F7F7F7;
+            color: #222222;
+            border: 1px solid #D0D0D0;
+            border-radius: 8px;
+            padding: 8px;
+            font-family: "Consolas";
+            font-size: 12px;
+        }
+
+        #artworkSecondaryButton, #manualCutCancelButton {
+            background-color: #111F35;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 8px;
+            min-height: 34px;
+            padding: 0 16px;
+            font-weight: 700;
+        }
+
+        #artworkSecondaryButton:hover, #manualCutCancelButton:hover {
+            background-color: #273B5A;
+        }
+
+        ArtworkManualCutDialog {
+            background-color: #E5E5E5;
+        }
+
+        #manualCutTitle {
+            color: #8A244B;
+            font-size: 26px;
+            font-weight: 800;
+        }
+
+        #manualCutDescription, #manualCutWarning {
+            color: #5D6875;
+            font-size: 13px;
+        }
+
+        #manualCutScroll {
+            background-color: #E5E5E5;
+            border: none;
+        }
+
+        #manualCutCard {
+            background-color: transparent;
+            border: none;
+        }
+
+        #manualCutPreview {
+            background-color: #F2F2F2;
+            border: 1px solid #D0D0D0;
+            border-radius: 8px;
+        }
+
+        #cropControlPanel {
+            background-color: #FFFFFF;
+            border: 1px solid #C0C0C0;
+            border-radius: 10px;
+        }
+
+        #cropTabs::pane {
+            border: 1px solid #D0D0D0;
+            background-color: #FFFFFF;
+        }
+
+        #cropTabs QTabBar::tab {
+            background-color: #E5E5E5;
+            color: #111F35;
+            padding: 8px 10px;
+            border: 1px solid #D0D0D0;
+        }
+
+        #cropTabs QTabBar::tab:selected {
+            background-color: #8A244B;
+            color: #FFFFFF;
+        }
+
+        #cropOptionCheck {
+            color: #111F35;
+            padding: 4px 0;
+        }
+
+        #cropOptionCheck::indicator {
+            width: 16px;
+            height: 16px;
+            border: 1px solid #7D8694;
+            border-radius: 4px;
+            background-color: #FFFFFF;
+        }
+
+        #cropOptionCheck::indicator:checked {
+            background-color: #E3262E;
+            border-color: #A91920;
+        }
+
+        #manualCutZoomSlider::groove:horizontal {
+            height: 4px;
+            background-color: #C8C8C8;
+        }
+
+        #manualCutZoomSlider::handle:horizontal {
+            width: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
+            background-color: #8A244B;
+        }
+
+        #manualCutFileName {
+            color: #111F35;
+            font-size: 15px;
+            font-weight: 800;
+        }
+
+        #manualCutSectionLabel {
+            color: #8A244B;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        #manualCutRadio {
+            color: #111F35;
+            font-size: 13px;
+            spacing: 8px;
+            padding: 3px 0;
+        }
+
+        #manualCutRadio::indicator {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid #7D8694;
+            background-color: #FFFFFF;
+        }
+
+        #manualCutRadio::indicator:checked {
+            background-color: #B8F35A;
+            border-color: #7A9E2A;
         }
 
         #searchExpandCheckbox {
