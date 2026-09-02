@@ -5,6 +5,7 @@ from datetime import datetime
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 import pandas as pd
 from collections import defaultdict
@@ -68,6 +69,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QTabWidget,
+    QToolButton,
+    QMenu,
     QStackedWidget,
     QSpacerItem,
     QSizePolicy,
@@ -8971,6 +8974,10 @@ class ArtworkCropCanvas(QLabel):
         self._crop = initial_bounds
         self._drag_start: tuple[float, float] | None = None
         self._drag_current: tuple[float, float] | None = None
+        self._interaction: str | None = None
+        self._interaction_start: tuple[float, float] | None = None
+        self._interaction_bounds: object | None = None
+        self._manual_drawn = False
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
@@ -8988,12 +8995,16 @@ class ArtworkCropCanvas(QLabel):
         return self._image.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
     def set_zoom(self, value: int) -> None:
-        self._zoom = max(1.0, value / 100.0)
+        self._zoom = min(3.0, max(0.25, value / 100.0))
+        content_w = max(self.width(), int(self._image.width() * self._zoom))
+        content_h = max(self.height(), int(self._image.height() * self._zoom))
+        self.setMinimumSize(content_w, content_h)
         self._refresh()
 
     def wheelEvent(self, event) -> None:
-        step = 25 if event.angleDelta().y() > 0 else -25
-        self.set_zoom(round(self._zoom * 100) + step)
+        current = round(self._zoom * 100)
+        step = 10 if event.angleDelta().y() > 0 else -10
+        self.set_zoom(current + step)
         event.accept()
 
     def set_crop_style(self, color: str) -> None:
@@ -9009,6 +9020,103 @@ class ArtworkCropCanvas(QLabel):
         left = (self.width() - scaled.width()) / 2 + self._pan_x
         top = (self.height() - scaled.height()) / 2 + self._pan_y
         return left, top, scaled.width(), scaled.height()
+
+    def _rect_hit_test(self, x: float, y: float) -> str | None:
+        if self._crop is None:
+            return None
+        rect_x, rect_y, rect_w, rect_h = self._to_display_rect(self._crop)
+        pad = 10
+        if rect_w <= 0 or rect_h <= 0:
+            if rect_x <= x <= rect_x + rect_w and rect_y <= y <= rect_y + rect_h:
+                return "move"
+            return None
+        if x <= rect_x + pad and y <= rect_y + pad:
+            return "resize_tl"
+        if x >= rect_x + rect_w - pad and y <= rect_y + pad:
+            return "resize_tr"
+        if x <= rect_x + pad and y >= rect_y + rect_h - pad:
+            return "resize_bl"
+        if x >= rect_x + rect_w - pad and y >= rect_y + rect_h - pad:
+            return "resize_br"
+        if x <= rect_x + pad:
+            return "resize_left"
+        if x >= rect_x + rect_w - pad:
+            return "resize_right"
+        if y <= rect_y + pad:
+            return "resize_top"
+        if y >= rect_y + rect_h - pad:
+            return "resize_bottom"
+        if rect_x <= x <= rect_x + rect_w and rect_y <= y <= rect_y + rect_h:
+            return "move"
+        return None
+
+    def _clamp_page_point(self, x: float, y: float) -> tuple[float, float]:
+        return (
+            max(self._page_bounds.left, min(self._page_bounds.right, x)),
+            max(self._page_bounds.top, min(self._page_bounds.bottom, y)),
+        )
+
+    def _apply_interaction(self, end_point: tuple[float, float]) -> None:
+        if self._interaction is None or self._interaction_start is None or self._interaction_bounds is None:
+            return
+        start_x, start_y = self._interaction_start
+        end_x, end_y = end_point
+        base = self._interaction_bounds
+        dx = end_x - start_x
+        dy = end_y - start_y
+        if self._interaction == "move":
+            left = base.left + dx
+            top = base.top + dy
+            right = base.right + dx
+            bottom = base.bottom + dy
+            width = base.width
+            height = base.height
+            if left < self._page_bounds.left:
+                delta = self._page_bounds.left - left
+                left += delta
+                right += delta
+            if top < self._page_bounds.top:
+                delta = self._page_bounds.top - top
+                top += delta
+                bottom += delta
+            if right > self._page_bounds.right:
+                delta = right - self._page_bounds.right
+                left -= delta
+                right -= delta
+            if bottom > self._page_bounds.bottom:
+                delta = bottom - self._page_bounds.bottom
+                top -= delta
+                bottom -= delta
+            self._crop = Bounds(left, top, right, bottom)
+            return
+
+        if self._interaction in {"resize_left", "resize_tl", "resize_bl"}:
+            new_left = min(base.right - 1.0, max(self._page_bounds.left, base.left + dx))
+            base = Bounds(new_left, base.top, base.right, base.bottom)
+        if self._interaction in {"resize_right", "resize_tr", "resize_br"}:
+            new_right = max(base.left + 1.0, min(self._page_bounds.right, base.right + dx))
+            base = Bounds(base.left, base.top, new_right, base.bottom)
+        if self._interaction in {"resize_top", "resize_tl", "resize_tr"}:
+            new_top = min(base.bottom - 1.0, max(self._page_bounds.top, base.top + dy))
+            base = Bounds(base.left, new_top, base.right, base.bottom)
+        if self._interaction in {"resize_bottom", "resize_bl", "resize_br"}:
+            new_bottom = max(base.top + 1.0, min(self._page_bounds.bottom, base.bottom + dy))
+            base = Bounds(base.left, base.top, base.right, new_bottom)
+        self._crop = base
+
+    def _cursor_for_interaction(self, interaction: str | None) -> Qt.CursorShape:
+        mapping = {
+            "move": Qt.CursorShape.SizeAllCursor,
+            "resize_left": Qt.CursorShape.SizeHorCursor,
+            "resize_right": Qt.CursorShape.SizeHorCursor,
+            "resize_top": Qt.CursorShape.SizeVerCursor,
+            "resize_bottom": Qt.CursorShape.SizeVerCursor,
+            "resize_tl": Qt.CursorShape.SizeFDiagCursor,
+            "resize_tr": Qt.CursorShape.SizeBDiagCursor,
+            "resize_bl": Qt.CursorShape.SizeBDiagCursor,
+            "resize_br": Qt.CursorShape.SizeFDiagCursor,
+        }
+        return mapping.get(interaction, Qt.CursorShape.CrossCursor)
 
     def _to_page_point(self, x: float, y: float) -> tuple[float, float]:
         left, top, width, height = self._display_rect()
@@ -9045,6 +9153,7 @@ class ArtworkCropCanvas(QLabel):
             )
         painter.end()
         self.setPixmap(canvas)
+        self.adjustSize()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -9055,8 +9164,20 @@ class ArtworkCropCanvas(QLabel):
             self._pan_start = (event.position().x(), event.position().y())
             return
         point = self._to_page_point(event.position().x(), event.position().y())
+        hit = self._rect_hit_test(event.position().x(), event.position().y()) if self._crop is not None else None
+        if hit is not None:
+            self._interaction = hit
+            self._interaction_start = point
+            self._interaction_bounds = self._crop
+            self.setCursor(self._cursor_for_interaction(hit))
+            return
         self._drag_start = point
         self._drag_current = point
+        self._interaction = "draw"
+        self._manual_drawn = True
+        self._interaction_start = point
+        self._interaction_bounds = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
 
     def mouseMoveEvent(self, event) -> None:
         if self._pan_start is not None:
@@ -9065,25 +9186,47 @@ class ArtworkCropCanvas(QLabel):
             self._pan_start = (event.position().x(), event.position().y())
             self._refresh()
             return
-        if self._drag_start is None:
+        if self._interaction == "draw":
+            if self._drag_start is None:
+                return
+            self._drag_current = self._to_page_point(event.position().x(), event.position().y())
+            self._set_drag_crop()
             return
-        self._drag_current = self._to_page_point(event.position().x(), event.position().y())
-        self._set_drag_crop()
+        if self._interaction is not None and self._interaction_start is not None:
+            point = self._clamp_page_point(*self._to_page_point(event.position().x(), event.position().y()))
+            self._apply_interaction(point)
+            self._refresh()
+            self.cropChanged.emit(self._crop)
+            return
+        hit = self._rect_hit_test(event.position().x(), event.position().y()) if self._crop is not None else None
+        self.setCursor(self._cursor_for_interaction(hit))
 
     def mouseReleaseEvent(self, event) -> None:
         if self._pan_start is not None:
             self._pan_start = None
             return
-        if self._drag_start is not None:
-            self._drag_current = self._to_page_point(event.position().x(), event.position().y())
-            self._set_drag_crop()
-        self._drag_start = None
-        self._drag_current = None
+        if self._interaction == "draw":
+            if self._drag_start is not None:
+                self._drag_current = self._to_page_point(event.position().x(), event.position().y())
+                self._set_drag_crop()
+            self._drag_start = None
+            self._drag_current = None
+            self._interaction = None
+            self._interaction_start = None
+            self._interaction_bounds = None
+            self.unsetCursor()
+            return
+        if self._interaction is not None:
+            self._interaction = None
+            self._interaction_start = None
+            self._interaction_bounds = None
+            self._refresh()
+            self.cropChanged.emit(self._crop)
+            self.unsetCursor()
 
     def _set_drag_crop(self) -> None:
         if self._drag_start is None or self._drag_current is None:
             return
-        from artwork_processing import Bounds
         x1, y1 = self._drag_start
         x2, y2 = self._drag_current
         self._crop = Bounds(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
@@ -9097,7 +9240,7 @@ class ArtworkCropCanvas(QLabel):
 class ArtworkCropDialog(QDialog):
     """Large single-artwork crop editor."""
 
-    def __init__(self, inspection: ArtworkInspection, parent: QWidget | None = None, initial_bounds: object | None = None) -> None:
+    def __init__(self, inspection: ArtworkInspection, parent: QWidget | None = None, initial_bounds: object | None = None, saved_selection: CutSelection | None = None) -> None:
         super().__init__(parent)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.setWindowTitle(f"Manual Cut - {inspection.input_path.name}")
@@ -9111,6 +9254,7 @@ class ArtworkCropDialog(QDialog):
         self._action_combos: dict[tuple[str, str], QComboBox] = {}
         self._action_options: dict[tuple[str, str], CutOption] = {}
         self._initial_bounds = initial_bounds
+        self._saved_selection = saved_selection
         self._hover_option: CutOption | None = None
         self._hover_enabled = False
         self._build_ui()
@@ -9217,6 +9361,7 @@ class ArtworkCropDialog(QDialog):
             "{ background-color: #D02752; border: 1px solid #D02752; }"
         )
         self._hover_checkbox.toggled.connect(self._set_hover_enabled)
+        self._hover_checkbox.setChecked(True)
         crop_layout.addWidget(self._hover_checkbox)
         tabs = QTabWidget()
         tabs.setObjectName("cropTabs")
@@ -9243,11 +9388,18 @@ class ArtworkCropDialog(QDialog):
         crop_layout.addWidget(tabs, 1)
         body.addWidget(crop_panel)
         self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
-        body.addWidget(self.canvas, 1)
+        self.canvas.cropChanged.connect(self._on_canvas_crop_changed)
+        canvas_scroll = QScrollArea()
+        canvas_scroll.setWidgetResizable(True)
+        canvas_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        canvas_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        canvas_scroll.setWidget(self.canvas)
+        body.addWidget(canvas_scroll, 1)
         layout.addLayout(body, 1)
+        self._restore_selection_state()
 
         zoom_row = QHBoxLayout(); zoom_label = QLabel("Zoom"); zoom_label.setObjectName("manualCutDescription"); zoom_row.addWidget(zoom_label)
-        zoom_slider = QSlider(Qt.Orientation.Horizontal); zoom_slider.setObjectName("manualCutZoomSlider"); zoom_slider.setRange(100, 300); zoom_slider.setValue(100); zoom_slider.setTickInterval(25); zoom_slider.valueChanged.connect(self.canvas.set_zoom); zoom_row.addWidget(zoom_slider, 1)
+        zoom_slider = QSlider(Qt.Orientation.Horizontal); zoom_slider.setObjectName("manualCutZoomSlider"); zoom_slider.setRange(25, 300); zoom_slider.setValue(100); zoom_slider.setTickInterval(25); zoom_slider.valueChanged.connect(self.canvas.set_zoom); zoom_row.addWidget(zoom_slider, 1)
         self.zoom_value = QLabel("100%"); self.zoom_value.setObjectName("manualCutDescription"); zoom_slider.valueChanged.connect(lambda value: self.zoom_value.setText(f"{value}%")); zoom_row.addWidget(self.zoom_value)
         layout.addLayout(zoom_row)
 
@@ -9269,6 +9421,49 @@ class ArtworkCropDialog(QDialog):
         self._selected_source = None
         self._manual_hide_selection = None
         self.canvas.set_crop_style("#00FF66")
+        self.canvas._refresh()
+
+    def _on_canvas_crop_changed(self, bounds: object) -> None:
+        if getattr(self.canvas, "_manual_drawn", False) and not self._manual_crop_checkbox.isChecked():
+            self._manual_crop_checkbox.blockSignals(True)
+            self._manual_crop_checkbox.setChecked(True)
+            self._manual_crop_checkbox.blockSignals(False)
+        self.canvas._manual_drawn = False
+
+    def _restore_selection_state(self) -> None:
+        if self._saved_selection is None:
+            return
+        selection = self._saved_selection
+        if selection.manual_crop:
+            self._manual_crop_checkbox.blockSignals(True)
+            self._manual_crop_checkbox.setChecked(True)
+            self._manual_crop_checkbox.blockSignals(False)
+            self.canvas._crop = selection.bounds
+            self.canvas._refresh()
+            return
+        source_key = None
+        if selection.kind in {"layer", "spot_color"} and selection.name:
+            source_key = (selection.kind, selection.name)
+            action = "trim & hide" if any(item[:2] == source_key for item in selection.hide_items) else "trim"
+            self._selection_actions[source_key] = action
+            combo = self._action_combos.get(source_key)
+            if combo is not None:
+                combo.blockSignals(True)
+                combo.setCurrentText(action)
+                combo.blockSignals(False)
+                self._set_action_combo_color(combo, action)
+        for kind, name, _, _ in selection.hide_items:
+            key = (kind, name)
+            if key == source_key:
+                continue
+            self._selection_actions[key] = "hide"
+            combo = self._action_combos.get(key)
+            if combo is not None:
+                combo.blockSignals(True)
+                combo.setCurrentText("hide")
+                combo.blockSignals(False)
+                self._set_action_combo_color(combo, "hide")
+        self.canvas._crop = selection.bounds
         self.canvas._refresh()
 
     def _set_hover_enabled(self, enabled: bool) -> None:
@@ -9395,6 +9590,10 @@ class ArtworkManualCutDialog(QDialog):
         self._inspections = inspections
         self._selections: dict[Path, object | None] = {}
         self._preview_labels: dict[Path, QLabel] = {}
+        self._copied_crop: CutSelection | None = None
+        self._selected_paths: set[Path] = set()
+        self._selection_anchor: Path | None = None
+        self._last_thumb_click: tuple[Path, float] | None = None
         self._bulk_mode = True
         self._bulk_actions: dict[tuple[str, str], str] = {}
         self._bulk_combos: dict[tuple[str, str], QComboBox] = {}
@@ -9442,6 +9641,7 @@ class ArtworkManualCutDialog(QDialog):
             "{ background-color: #D02752; border: 1px solid #D02752; }"
         )
         self._global_hover_checkbox.toggled.connect(self._set_global_hover_enabled)
+        self._global_hover_checkbox.setChecked(True)
         self._bulk_layout.addWidget(self._global_hover_checkbox)
         self._bulk_tabs = QTabWidget()
         self._bulk_tabs.setObjectName("cropTabs")
@@ -9456,6 +9656,7 @@ class ArtworkManualCutDialog(QDialog):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setObjectName("manualCutScroll")
+        self._scroll.viewport().installEventFilter(self)
         self._cards = QWidget()
         self._cards_layout = QGridLayout(self._cards)
         self._cards_layout.setContentsMargins(2, 2, 2, 2)
@@ -9614,11 +9815,7 @@ class ArtworkManualCutDialog(QDialog):
         for inspection in self._inspections:
             local_selection = self._selections.get(inspection.input_path)
             if local_selection is not None:
-                local_bounds = (
-                    local_selection.bounds
-                    if local_selection.kind in {"layer", "spot_color"}
-                    else None
-                )
+                local_bounds = local_selection.bounds
                 self._update_preview(inspection, local_bounds)
                 continue
             bounds = None
@@ -9657,10 +9854,117 @@ class ArtworkManualCutDialog(QDialog):
         preview.installEventFilter(self)
         self._preview_labels[inspection.input_path] = preview
         self._card_widgets[inspection.input_path] = card
+        reset_btn = QPushButton()
+        reset_btn.setObjectName("manualCutResetBtn")
+        reset_btn.setToolTip("Reset crop")
+        reset_btn.setFixedSize(34, 30)
+        reset_btn.setStyleSheet(
+            "QPushButton#manualCutResetBtn { background: #F2F4F8; color: #444; border: 1px solid #C8CDD6; border-radius: 8px; font-size: 18px; font-weight: 700; }"
+            "QPushButton#manualCutResetBtn:hover { background: #E9EDF2; }"
+        )
+        reset_btn.setText("↺")
+        reset_btn.clicked.connect(lambda checked=False, path=inspection.input_path: self._clear_saved_selection(path))
+
+        menu_btn = QToolButton()
+        menu_btn.setObjectName("manualCutMenuBtn")
+        menu_btn.setToolTip("Crop actions")
+        menu_btn.setFixedSize(34, 30)
+        menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu_btn.setArrowType(Qt.ArrowType.NoArrow)
+        menu_btn.setStyleSheet(
+            "QToolButton#manualCutMenuBtn { background: #F2F4F8; color: #2D2D2D; border: 1px solid #C8CDD6; border-radius: 9px; font-size: 20px; font-weight: 800; padding: 0; }"
+            "QToolButton#manualCutMenuBtn:hover { background: #E9EDF2; border-color: #B9C1CC; }"
+            "QToolButton#manualCutMenuBtn:pressed { background: #E2E8F0; }"
+            "QToolButton#manualCutMenuBtn::menu-indicator { image: none; }"
+        )
+        menu_btn.setText("⋯")
+        menu = QMenu(menu_btn)
+        menu.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        menu.setStyleSheet(
+            "QMenu { background: rgba(255,255,255,0.97); border: 1px solid #D9DEE5; border-radius: 10px; padding: 6px; }"
+            "QMenu::item { padding: 8px 18px; color: #1F2937; font-size: 12px; border-radius: 6px; }"
+            "QMenu::item:selected { background: #EEF5FF; color: #111827; }"
+        )
+        copy_action = menu.addAction("Copy")
+        paste_action = menu.addAction("Paste")
+        menu_btn.setMenu(menu)
+        menu.triggered.connect(lambda action, path=inspection.input_path: self._handle_card_menu_action(path, action, copy_action, paste_action))
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addStretch(1)
+        top_row.addWidget(reset_btn)
+        top_row.addWidget(menu_btn)
+        card_layout.addLayout(top_row)
         card_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         self._selections[inspection.input_path] = None
         self._update_preview(inspection, None)
+        self._refresh_saved_tag(inspection.input_path)
         return card
+
+    def _handle_card_menu_action(self, path: Path, action, copy_action, paste_action) -> None:
+        if action == copy_action:
+            self._copied_crop = self._selections.get(path)
+            return
+        if action == paste_action:
+            source = self._copied_crop
+            if source is None:
+                return
+            for inspection in self._inspections:
+                if inspection.input_path == path:
+                    self._selections[path] = source
+                    self._refresh_saved_tag(path)
+                    preview_bounds = source.bounds if source.kind in {"layer", "spot_color"} or source.manual_crop else None
+                    self._update_preview(inspection, preview_bounds)
+                    break
+
+    def _clear_saved_selection(self, path: Path) -> None:
+        self._selections[path] = None
+        self._refresh_saved_tag(path)
+        inspection = next(item for item in self._inspections if item.input_path == path)
+        trim_choice = next(
+            ((kind, name) for (kind, name), action in self._bulk_actions.items()
+             if action in {"trim", "trim & hide"}),
+            None,
+        )
+        if trim_choice is not None:
+            trim_kind, trim_name = trim_choice
+            trim_option = next(
+                (option for option in inspection.options
+                 if option.kind == trim_kind and option.label == trim_name),
+                None,
+            )
+            if trim_option is not None:
+                self._update_preview(inspection, trim_option.bounds)
+                return
+        self._update_preview(inspection, None)
+
+    def _refresh_saved_tag(self, path: Path) -> None:
+        selection = self._selections.get(path)
+        preview = self._preview_labels.get(path)
+        has_saved = selection is not None
+        if preview is not None:
+            if path in self._selected_paths:
+                preview.setStyleSheet(
+                    "QLabel#manualCutPreview { background-color: rgba(124, 213, 199, 0.2); border: 2px solid #7CD5C7; border-radius: 8px; }"
+                )
+            else:
+                preview.setStyleSheet(
+                    "QLabel#manualCutPreview { border: 2px solid #D02752; border-radius: 8px; }"
+                    if has_saved else ""
+                )
+
+    def _apply_selection(self, selected: set[Path]) -> None:
+        self._selected_paths = selected
+        self._selection_anchor = next(iter(selected), None) if selected else None
+        for path, preview in self._preview_labels.items():
+            if path in selected:
+                preview.setStyleSheet("QLabel#manualCutPreview { background-color: rgba(124, 213, 199, 0.2); border: 2px solid #7CD5C7; border-radius: 8px; }")
+            elif self._selections.get(path) is not None:
+                preview.setStyleSheet("QLabel#manualCutPreview { border: 2px solid #D02752; border-radius: 8px; }")
+            else:
+                preview.setStyleSheet("")
 
     def eventFilter(self, obj, event) -> bool:
         if isinstance(obj, QLabel) and obj.property("global_crop_option") is not None:
@@ -9672,44 +9976,77 @@ class ArtworkManualCutDialog(QDialog):
             elif event.type() == QEvent.Type.Leave:
                 self._global_hover_option = None
                 self._refresh_bulk_previews()
-        if event.type() == QEvent.Type.MouseButtonPress and obj in self._preview_labels.values():
-            path = next(path for path, label in self._preview_labels.items() if label is obj)
-            inspection = next(item for item in self._inspections if item.input_path == path)
-            initial_bounds = None
-            if self._bulk_mode:
-                trim_choice = next(
-                    ((kind, name) for (kind, name), action in self._bulk_actions.items()
-                     if action in {"trim", "trim & hide"}),
-                    None,
-                )
-                if trim_choice is not None:
-                    trim_kind, trim_name = trim_choice
-                    trim_option = next(
-                        (option for option in inspection.options
-                         if option.kind == trim_kind and option.label == trim_name),
-                        None,
-                    )
-                    if trim_option is not None:
-                        initial_bounds = trim_option.bounds
-            editor = ArtworkCropDialog(inspection, self, initial_bounds)
-            if editor.exec() == QDialog.DialogCode.Accepted:
-                selection = editor.crop_selection()
-                self._selections[path] = selection
-                card = self._card_widgets.get(path)
-                if card is not None:
-                    card.setStyleSheet("")
-                preview = self._preview_labels.get(path)
-                if preview is not None:
-                    preview.setStyleSheet(
-                        "QLabel#manualCutPreview { border: 2px solid #D02752; border-radius: 8px; }"
-                    )
-                trim_bounds = (
-                    selection.bounds
-                    if selection.kind in {"layer", "spot_color"} or selection.manual_crop
-                    else None
-                )
-                self._update_preview(inspection, trim_bounds)
-            return True
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if obj in self._preview_labels.values():
+                path = next(path for path, label in self._preview_labels.items() if label is obj)
+                mod = QApplication.keyboardModifiers()
+                ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
+                shift = bool(mod & Qt.KeyboardModifier.ShiftModifier)
+                if ctrl:
+                    next_selection = set(self._selected_paths)
+                    if path in next_selection:
+                        next_selection.remove(path)
+                    else:
+                        next_selection.add(path)
+                    self._selection_anchor = path
+                    self._apply_selection(next_selection)
+                    return True
+                if shift:
+                    if self._selection_anchor is None:
+                        self._selection_anchor = path
+                    anchor_index = next((idx for idx, inspection in enumerate(self._inspections) if inspection.input_path == self._selection_anchor), None)
+                    current_index = next((idx for idx, inspection in enumerate(self._inspections) if inspection.input_path == path), None)
+                    if anchor_index is not None and current_index is not None:
+                        start, end = sorted((anchor_index, current_index))
+                        next_selection = {self._inspections[idx].input_path for idx in range(start, end + 1)}
+                        self._apply_selection(next_selection)
+                    return True
+                now = time.monotonic()
+                if self._last_thumb_click and self._last_thumb_click[0] == path and now - self._last_thumb_click[1] < 0.5:
+                    self._last_thumb_click = None
+                    inspection = next(item for item in self._inspections if item.input_path == path)
+                    local_selection = self._selections.get(path)
+                    initial_bounds = local_selection.bounds if local_selection is not None else None
+                    if self._bulk_mode and initial_bounds is None:
+                        trim_choice = next(
+                            ((kind, name) for (kind, name), action in self._bulk_actions.items()
+                             if action in {"trim", "trim & hide"}),
+                            None,
+                        )
+                        if trim_choice is not None:
+                            trim_kind, trim_name = trim_choice
+                            trim_option = next(
+                                (option for option in inspection.options
+                                 if option.kind == trim_kind and option.label == trim_name),
+                                None,
+                            )
+                            if trim_option is not None:
+                                initial_bounds = trim_option.bounds
+                    editor = ArtworkCropDialog(inspection, self, initial_bounds, local_selection)
+                    if editor.exec() == QDialog.DialogCode.Accepted:
+                        selection = editor.crop_selection()
+                        self._selections[path] = selection
+                        self._selected_paths = {path}
+                        self._selection_anchor = path
+                        self._apply_selection({path})
+                        trim_bounds = (
+                            selection.bounds
+                            if selection.kind in {"layer", "spot_color"} or selection.manual_crop
+                            else None
+                        )
+                        self._update_preview(inspection, trim_bounds)
+                    return True
+                self._selected_paths = {path}
+                self._selection_anchor = path
+                self._last_thumb_click = (path, now)
+                self._apply_selection({path})
+                return True
+
+            if self._selected_paths and obj not in self._preview_labels.values():
+                self._selected_paths.clear()
+                self._selection_anchor = None
+                self._last_thumb_click = None
+                self._apply_selection(set())
         return super().eventFilter(obj, event)
 
     def _update_preview(self, inspection: ArtworkInspection, bounds: object, hover_bounds: object = None) -> None:
