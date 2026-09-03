@@ -83,6 +83,10 @@ class CutSelection:
 	hide_xref: int | None = None
 	hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = ()
 	manual_crop: bool = False
+	stroke_shape: Literal["rectangle", "ellipse", "custom"] = "rectangle"
+	corners: Literal["sharp", "rounded", "beveled"] = "sharp"
+	corner_amount: float = 0.0
+	custom_path: tuple[tuple[str, tuple[float, ...]], ...] = ()
 
 
 @dataclass

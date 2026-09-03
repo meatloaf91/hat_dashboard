@@ -8967,7 +8967,7 @@ class ArtworkCropCanvas(QLabel):
 
     cropChanged = Signal(object)
 
-    def __init__(self, image: QImage, page_bounds: object, initial_bounds: object, parent: QWidget | None = None) -> None:
+    def __init__(self, image: QImage, page_bounds: object, initial_bounds: object, initial_path: tuple = (), parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._image = QPixmap.fromImage(image)
         self._page_bounds = page_bounds
@@ -8983,6 +8983,11 @@ class ArtworkCropCanvas(QLabel):
         self._pan_y = 0.0
         self._pan_start: tuple[float, float] | None = None
         self._hover_bounds = None
+        self._stroke_shape = "rectangle"
+        self._corners = "sharp"
+        self._corner_amount = 0.0
+        self._custom_path = list(initial_path)
+        self._custom_segment: dict[str, tuple[float, float]] | None = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(700, 460)
         self.setMouseTracking(True)
@@ -9014,6 +9019,59 @@ class ArtworkCropCanvas(QLabel):
     def set_hover_bounds(self, bounds: object | None) -> None:
         self._hover_bounds = bounds
         self._refresh()
+
+    def set_shape_settings(self, stroke_shape: str, corners: str, corner_amount: float) -> None:
+        self._stroke_shape = stroke_shape
+        self._corners = corners
+        self._corner_amount = max(0.0, min(1.0, corner_amount))
+        self._refresh()
+
+    def set_custom_path(self, commands: tuple = ()) -> None:
+        self._custom_path = list(commands)
+        self._refresh()
+
+    def _custom_path_bounds(self) -> object | None:
+        points = [point for _, values in self._custom_path for point in zip(values[::2], values[1::2])]
+        if not points:
+            return None
+        xs, ys = zip(*points)
+        return Bounds(min(xs), min(ys), max(xs), max(ys))
+
+    def _custom_qpath(self, preview: dict | None = None) -> QPainterPath:
+        path = QPainterPath()
+        def display_point(point: tuple[float, float]) -> tuple[float, float]:
+            left, top, width, height = self._display_rect()
+            return (
+                left + (point[0] - self._page_bounds.left) / max(self._page_bounds.width, 1) * width,
+                top + (point[1] - self._page_bounds.top) / max(self._page_bounds.height, 1) * height,
+            )
+        for command, values in self._custom_path:
+            if command == "M":
+                path.moveTo(*display_point((values[0], values[1])))
+            elif command == "L":
+                path.lineTo(*display_point((values[0], values[1])))
+            elif command == "Q":
+                control = display_point((values[0], values[1]))
+                end = display_point((values[2], values[3]))
+                path.quadTo(control[0], control[1], end[0], end[1])
+            elif command == "Z":
+                path.closeSubpath()
+        if preview is not None:
+            start = preview["start"]
+            end = preview["end"]
+            control = preview["control"]
+            display_control = display_point(control)
+            display_end = display_point(end)
+            path.quadTo(display_control[0], display_control[1], display_end[0], display_end[1])
+        return path
+
+    def _custom_point(self, point: tuple[float, float], modifiers: Qt.KeyboardModifier) -> tuple[float, float]:
+        if not self._custom_path or not modifiers & Qt.KeyboardModifier.ShiftModifier:
+            return point
+        last_values = self._custom_path[-1][1]
+        last = (last_values[-2], last_values[-1])
+        dx, dy = point[0] - last[0], point[1] - last[1]
+        return (last[0] + dx, last[1]) if abs(dx) >= abs(dy) else (last[0], last[1] + dy)
 
     def _display_rect(self):
         scaled = self._image_rect()
@@ -9143,7 +9201,33 @@ class ArtworkCropCanvas(QLabel):
         painter.drawPixmap((self.width() - pixmap.width()) // 2, (self.height() - pixmap.height()) // 2, pixmap)
         x, y, width, height = self._to_display_rect(self._crop)
         painter.setPen(QPen(QColor(getattr(self, "_crop_color", "#B8F35A")), 4))
-        painter.drawRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
+        rect = QRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
+        if self._stroke_shape == "custom" and self._custom_path:
+            painter.drawPath(self._custom_qpath({
+                "start": self._custom_segment["start"],
+                "end": self._custom_segment["end"],
+                "control": self._custom_segment["control"],
+            }) if self._custom_segment else self._custom_qpath())
+        elif self._stroke_shape == "ellipse":
+            painter.drawEllipse(rect)
+        elif self._corners == "rounded":
+            radius = min(width, height) * (0.5 * self._corner_amount)
+            painter.drawRoundedRect(rect, radius, radius)
+        elif self._corners == "beveled" or self._stroke_shape == "custom":
+            path = QPainterPath()
+            bevel = min(width, height) * (0.25 * self._corner_amount)
+            path.moveTo(x + bevel, y)
+            path.lineTo(x + width - bevel, y)
+            path.lineTo(x + width, y + bevel)
+            path.lineTo(x + width, y + height - bevel)
+            path.lineTo(x + width - bevel, y + height)
+            path.lineTo(x + bevel, y + height)
+            path.lineTo(x, y + height - bevel)
+            path.lineTo(x, y + bevel)
+            path.closeSubpath()
+            painter.drawPath(path)
+        else:
+            painter.drawRect(rect)
         if self._hover_bounds is not None:
             hover_x, hover_y, hover_width, hover_height = self._to_display_rect(self._hover_bounds)
             painter.setPen(QPen(QColor("#FFFF00"), 3, Qt.PenStyle.DashLine))
@@ -9164,6 +9248,19 @@ class ArtworkCropCanvas(QLabel):
             self._pan_start = (event.position().x(), event.position().y())
             return
         point = self._to_page_point(event.position().x(), event.position().y())
+        if self._stroke_shape == "custom":
+            point = self._custom_point(point, event.modifiers())
+            if not self._custom_path:
+                self._custom_path.append(("M", point))
+                self._custom_segment = None
+            else:
+                last_values = self._custom_path[-1][1]
+                self._custom_segment = {"start": (last_values[-2], last_values[-1]), "end": point, "control": point}
+            self._manual_drawn = True
+            self._interaction = "custom"
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._refresh()
+            return
         hit = self._rect_hit_test(event.position().x(), event.position().y()) if self._crop is not None else None
         if hit is not None:
             self._interaction = hit
@@ -9187,6 +9284,14 @@ class ArtworkCropCanvas(QLabel):
             self._pan_start = (event.position().x(), event.position().y())
             self._refresh()
             return
+        if self._interaction == "custom" and self._custom_segment is not None:
+            point = self._to_page_point(event.position().x(), event.position().y())
+            point = self._custom_point(point, event.modifiers())
+            self._custom_segment["end"] = point
+            self._custom_segment["control"] = self._to_page_point(event.position().x(), event.position().y())
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            return
         if self._interaction == "draw":
             if self._drag_start is None:
                 return
@@ -9205,6 +9310,20 @@ class ArtworkCropCanvas(QLabel):
     def mouseReleaseEvent(self, event) -> None:
         if self._pan_start is not None:
             self._pan_start = None
+            return
+        if self._interaction == "custom" and self._custom_segment is not None:
+            segment = self._custom_segment
+            control = segment["control"]
+            end = segment["end"]
+            if abs(control[0] - segment["start"][0]) + abs(control[1] - segment["start"][1]) < 2:
+                self._custom_path.append(("L", end))
+            else:
+                self._custom_path.append(("Q", (control[0], control[1], end[0], end[1])))
+            self._custom_segment = None
+            self._interaction = None
+            self.unsetCursor()
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
             return
         if self._interaction == "draw":
             if self._drag_start is not None:
@@ -9235,7 +9354,10 @@ class ArtworkCropCanvas(QLabel):
         self.cropChanged.emit(self._crop)
 
     def crop(self) -> object:
-        return self._crop
+        return self._custom_path_bounds() if self._stroke_shape == "custom" and self._custom_path else self._crop
+
+    def custom_path(self) -> tuple:
+        return tuple(self._custom_path)
 
 
 class ArtworkCropDialog(QDialog):
@@ -9325,7 +9447,7 @@ class ArtworkCropDialog(QDialog):
             "trim & hide": "#BD5579",
         }
         combo.setStyleSheet(
-            f"QComboBox {{ background-color: {colors.get(action, '#FFFFFF')}; }}"
+            f"QComboBox {{ background-color: {colors.get(action, '#FFFFFF')}; padding: 3px 8px; }}"
         )
 
     def _build_ui(self) -> None:
@@ -9387,6 +9509,49 @@ class ArtworkCropDialog(QDialog):
         separations_scroll.setWidget(separations_tab)
         tabs.addTab(layers_scroll, "By Layer")
         tabs.addTab(separations_scroll, "By Spot Color")
+        shape_tab = QWidget()
+        shape_layout = QVBoxLayout(shape_tab)
+        shape_layout.setSpacing(8)
+        stroke_shape_row = QHBoxLayout()
+        stroke_shape_row.setSpacing(8)
+        stroke_shape_label = QLabel("stroke shape")
+        stroke_shape_label.setObjectName("cropOptionCheck")
+        stroke_shape_row.addWidget(stroke_shape_label)
+        stroke_shape_row.addStretch(1)
+        self._stroke_shape_combo = QComboBox()
+        self._stroke_shape_combo.addItems(["rectangle", "ellipse", "custom"])
+        self._stroke_shape_combo.setCurrentText("rectangle")
+        self._stroke_shape_combo.setObjectName("cropOptionCheck")
+        self._stroke_shape_combo.setFixedWidth(115)
+        self._set_action_combo_color(self._stroke_shape_combo, "hide")
+        self._stroke_shape_combo.currentTextChanged.connect(self._shape_settings_changed)
+        stroke_shape_row.addWidget(self._stroke_shape_combo)
+        shape_layout.addLayout(stroke_shape_row)
+        corners_row = QHBoxLayout()
+        corners_row.setSpacing(8)
+        self._corners_label = QLabel("corners")
+        self._corners_label.setObjectName("cropOptionCheck")
+        corners_row.addWidget(self._corners_label)
+        corners_row.addStretch(1)
+        self._corners_combo = QComboBox()
+        self._corners_combo.addItems(["sharp", "rounded", "beveled"])
+        self._corners_combo.setCurrentText("sharp")
+        self._corners_combo.setObjectName("cropOptionCheck")
+        self._corners_combo.setFixedWidth(115)
+        self._set_action_combo_color(self._corners_combo, "hide")
+        self._corners_combo.currentTextChanged.connect(self._shape_settings_changed)
+        corners_row.addWidget(self._corners_combo)
+        shape_layout.addLayout(corners_row)
+        self._corner_slider_label = QLabel("0.00")
+        shape_layout.addWidget(self._corner_slider_label)
+        self._corner_slider = QSlider(Qt.Orientation.Horizontal)
+        self._corner_slider.setRange(0, 100)
+        self._corner_slider.setValue(0)
+        self._corner_slider.valueChanged.connect(self._shape_settings_changed)
+        shape_layout.addWidget(self._corner_slider)
+        shape_layout.addStretch(1)
+        tabs.addTab(shape_tab, "Shape Settings")
+        self._update_corner_controls()
         crop_layout.addWidget(tabs, 1)
         body.addWidget(crop_panel)
         self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
@@ -9441,6 +9606,14 @@ class ArtworkCropDialog(QDialog):
         if self._saved_selection is None:
             return
         selection = self._saved_selection
+        self._stroke_shape = selection.stroke_shape
+        self._corners = selection.corners
+        self._corner_amount = selection.corner_amount
+        self._stroke_shape_combo.setCurrentText(self._stroke_shape)
+        self._corners_combo.setCurrentText(self._corners)
+        self._corner_slider.setValue(round(self._corner_amount * 100))
+        self._shape_settings_changed()
+        self.canvas.set_custom_path(selection.custom_path)
         if selection.manual_crop:
             self._manual_crop_checkbox.blockSignals(True)
             self._manual_crop_checkbox.setChecked(True)
@@ -9480,6 +9653,21 @@ class ArtworkCropDialog(QDialog):
         if not enabled:
             self._hover_option = None
         self.canvas.set_hover_bounds(self._hover_option.bounds if self._hover_option else None)
+
+    def _update_corner_controls(self) -> None:
+        visible = self._stroke_shape_combo.currentText() == "rectangle" and self._corners_combo.currentText() in {"rounded", "beveled"}
+        self._corners_label.setVisible(self._stroke_shape_combo.currentText() == "rectangle")
+        self._corners_combo.setVisible(self._stroke_shape_combo.currentText() == "rectangle")
+        self._corner_slider_label.setVisible(visible)
+        self._corner_slider.setVisible(visible)
+
+    def _shape_settings_changed(self, _value: object = None) -> None:
+        self._stroke_shape = self._stroke_shape_combo.currentText()
+        self._corners = self._corners_combo.currentText()
+        self._corner_amount = self._corner_slider.value() / 100.0
+        self._corner_slider_label.setText(f"{self._corner_amount:.2f}")
+        self._update_corner_controls()
+        self.canvas.set_shape_settings(self._stroke_shape, self._corners, self._corner_amount)
 
     def _set_source_crop(self, option: object, checked: bool, mode: str) -> None:
         if not checked:
@@ -9540,6 +9728,12 @@ class ArtworkCropDialog(QDialog):
         return self.canvas.crop()
 
     def crop_selection(self) -> CutSelection:
+        shape_settings = {
+            "stroke_shape": self._stroke_shape,
+            "corners": self._corners,
+            "corner_amount": self._corner_amount,
+            "custom_path": self.canvas.custom_path(),
+        }
         hide_items = tuple(
             (option.kind, option.label, option.color_rgb, option.xref)
             for key, option in self._action_options.items()
@@ -9552,6 +9746,7 @@ class ArtworkCropDialog(QDialog):
                 "manual",
                 hide_items=hide_items,
                 manual_crop=True,
+                **shape_settings,
             )
         trim_option = next(
             (self._action_options[key] for key, action in self._selection_actions.items()
@@ -9566,15 +9761,17 @@ class ArtworkCropDialog(QDialog):
                 trim_option.color_rgb,
                 trim_option.xref,
                 hide_items=hide_items,
+                **shape_settings,
             )
         if hide_items:
-            return CutSelection(self.canvas.crop(), "manual", hide_items=hide_items)
+            return CutSelection(self.canvas.crop(), "manual", hide_items=hide_items, **shape_settings)
         if self._manual_hide_selection is not None:
             hide = self._manual_hide_selection
             return CutSelection(
                 self.canvas.crop(), "manual", "", None, None,
                 hide.kind, hide.name, hide.color_rgb, hide.xref,
                 hide_items=((hide.kind, hide.name, hide.color_rgb, hide.xref),),
+                **shape_settings,
             )
         if self._selected_source is not None:
             return CutSelection(
@@ -9584,8 +9781,9 @@ class ArtworkCropDialog(QDialog):
                 self._selected_source.color_rgb,
                 self._selected_source.xref,
                 hide_items=(),
+                **shape_settings,
             )
-        return CutSelection(self._inspection.page_bounds, "manual")
+        return CutSelection(self._inspection.page_bounds, "manual", **shape_settings)
 
 
 class ArtworkManualCutDialog(QDialog):
@@ -9825,7 +10023,7 @@ class ArtworkManualCutDialog(QDialog):
             local_selection = self._selections.get(inspection.input_path)
             if local_selection is not None:
                 local_bounds = local_selection.bounds
-                self._update_preview(inspection, local_bounds)
+                self._update_preview(inspection, local_bounds, selection=local_selection)
                 continue
             bounds = None
             hover_bounds = None
@@ -9925,7 +10123,7 @@ class ArtworkManualCutDialog(QDialog):
                     self._selections[path] = source
                     self._refresh_saved_tag(path)
                     preview_bounds = source.bounds if source.kind in {"layer", "spot_color"} or source.manual_crop else None
-                    self._update_preview(inspection, preview_bounds)
+                    self._update_preview(inspection, preview_bounds, selection=source)
                     break
 
     def _clear_saved_selection(self, path: Path) -> None:
@@ -10018,7 +10216,7 @@ class ArtworkManualCutDialog(QDialog):
                         if selection.kind in {"layer", "spot_color"} or selection.manual_crop
                         else None
                     )
-                    self._update_preview(inspection, trim_bounds)
+                    self._update_preview(inspection, trim_bounds, selection=selection)
                 return False
 
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -10057,7 +10255,13 @@ class ArtworkManualCutDialog(QDialog):
                 self._apply_selection(set())
         return super().eventFilter(obj, event)
 
-    def _update_preview(self, inspection: ArtworkInspection, bounds: object, hover_bounds: object = None) -> None:
+    def _update_preview(
+        self,
+        inspection: ArtworkInspection,
+        bounds: object,
+        hover_bounds: object = None,
+        selection: CutSelection | None = None,
+    ) -> None:
         raw = inspection.preview
         image = QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(image)
@@ -10071,10 +10275,49 @@ class ArtworkManualCutDialog(QDialog):
         if bounds is not None:
             pen = QPen(QColor("#00FF66"), 4)
             painter.setPen(pen)
-            painter.drawRect(
-                round(bounds.left * scale_x), round(bounds.top * scale_y),
-                max(1, round(bounds.width * scale_x)), max(1, round(bounds.height * scale_y)),
-            )
+            x = bounds.left * scale_x
+            y = bounds.top * scale_y
+            width = max(1, bounds.width * scale_x)
+            height = max(1, bounds.height * scale_y)
+            rect = QRect(round(x), round(y), round(width), round(height))
+            stroke_shape = selection.stroke_shape if selection is not None else "rectangle"
+            corners = selection.corners if selection is not None else "sharp"
+            corner_amount = selection.corner_amount if selection is not None else 0.0
+            if stroke_shape == "custom" and selection is not None and selection.custom_path:
+                custom_path = QPainterPath()
+                for command, values in selection.custom_path:
+                    if command == "M":
+                        custom_path.moveTo(values[0] * scale_x, values[1] * scale_y)
+                    elif command == "L":
+                        custom_path.lineTo(values[0] * scale_x, values[1] * scale_y)
+                    elif command == "Q":
+                        custom_path.quadTo(
+                            values[0] * scale_x, values[1] * scale_y,
+                            values[2] * scale_x, values[3] * scale_y,
+                        )
+                    elif command == "Z":
+                        custom_path.closeSubpath()
+                painter.drawPath(custom_path)
+            elif stroke_shape == "ellipse":
+                painter.drawEllipse(rect)
+            elif corners == "rounded":
+                radius = min(width, height) * (0.5 * corner_amount)
+                painter.drawRoundedRect(rect, radius, radius)
+            elif corners == "beveled" or stroke_shape == "custom":
+                path = QPainterPath()
+                bevel = min(width, height) * (0.25 * corner_amount)
+                path.moveTo(x + bevel, y)
+                path.lineTo(x + width - bevel, y)
+                path.lineTo(x + width, y + bevel)
+                path.lineTo(x + width, y + height - bevel)
+                path.lineTo(x + width - bevel, y + height)
+                path.lineTo(x + bevel, y + height)
+                path.lineTo(x, y + height - bevel)
+                path.lineTo(x, y + bevel)
+                path.closeSubpath()
+                painter.drawPath(path)
+            else:
+                painter.drawRect(rect)
         if hover_bounds is not None:
             painter.setPen(QPen(QColor("#FFFF00"), 3, Qt.PenStyle.DashLine))
             painter.drawRect(
