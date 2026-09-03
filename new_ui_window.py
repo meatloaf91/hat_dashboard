@@ -9169,6 +9169,7 @@ class ArtworkCropCanvas(QLabel):
             self._interaction = hit
             self._interaction_start = point
             self._interaction_bounds = self._crop
+            self._manual_drawn = True
             self.setCursor(self._cursor_for_interaction(hit))
             return
         self._drag_start = point
@@ -9257,6 +9258,7 @@ class ArtworkCropDialog(QDialog):
         self._saved_selection = saved_selection
         self._hover_option: CutOption | None = None
         self._hover_enabled = False
+        self._preserved_hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = ()
         self._build_ui()
 
     def _add_action_row(self, layout: QVBoxLayout, option: CutOption, mode: str) -> None:
@@ -9425,9 +9427,14 @@ class ArtworkCropDialog(QDialog):
 
     def _on_canvas_crop_changed(self, bounds: object) -> None:
         if getattr(self.canvas, "_manual_drawn", False) and not self._manual_crop_checkbox.isChecked():
-            self._manual_crop_checkbox.blockSignals(True)
+            preserved = list(getattr(self._saved_selection, "hide_items", ()) or ())
+            for key, option in self._action_options.items():
+                if self._selection_actions.get(key) in {"hide", "trim & hide"}:
+                    item = (option.kind, option.label, option.color_rgb, option.xref)
+                    if item not in preserved:
+                        preserved.append(item)
+            self._preserved_hide_items = tuple(preserved)
             self._manual_crop_checkbox.setChecked(True)
-            self._manual_crop_checkbox.blockSignals(False)
         self.canvas._manual_drawn = False
 
     def _restore_selection_state(self) -> None:
@@ -9468,6 +9475,8 @@ class ArtworkCropDialog(QDialog):
 
     def _set_hover_enabled(self, enabled: bool) -> None:
         self._hover_enabled = enabled
+        if not hasattr(self, "canvas"):
+            return
         if not enabled:
             self._hover_option = None
         self.canvas.set_hover_bounds(self._hover_option.bounds if self._hover_option else None)
@@ -9536,6 +9545,7 @@ class ArtworkCropDialog(QDialog):
             for key, option in self._action_options.items()
             if self._selection_actions.get(key) in {"hide", "trim & hide"}
         )
+        hide_items = tuple(dict.fromkeys(hide_items + self._preserved_hide_items))
         if self._manual_crop_checkbox.isChecked():
             return CutSelection(
                 self.canvas.crop(),
@@ -9593,7 +9603,6 @@ class ArtworkManualCutDialog(QDialog):
         self._copied_crop: CutSelection | None = None
         self._selected_paths: set[Path] = set()
         self._selection_anchor: Path | None = None
-        self._last_thumb_click: tuple[Path, float] | None = None
         self._bulk_mode = True
         self._bulk_actions: dict[tuple[str, str], str] = {}
         self._bulk_combos: dict[tuple[str, str], QComboBox] = {}
@@ -9976,6 +9985,42 @@ class ArtworkManualCutDialog(QDialog):
             elif event.type() == QEvent.Type.Leave:
                 self._global_hover_option = None
                 self._refresh_bulk_previews()
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            if obj in self._preview_labels.values():
+                path = next(path for path, label in self._preview_labels.items() if label is obj)
+                inspection = next(item for item in self._inspections if item.input_path == path)
+                local_selection = self._selections.get(path)
+                initial_bounds = local_selection.bounds if local_selection is not None else None
+                if self._bulk_mode and initial_bounds is None:
+                    trim_choice = next(
+                        ((kind, name) for (kind, name), action in self._bulk_actions.items()
+                         if action in {"trim", "trim & hide"}),
+                        None,
+                    )
+                    if trim_choice is not None:
+                        trim_kind, trim_name = trim_choice
+                        trim_option = next(
+                            (option for option in inspection.options
+                             if option.kind == trim_kind and option.label == trim_name),
+                            None,
+                        )
+                        if trim_option is not None:
+                            initial_bounds = trim_option.bounds
+                editor = ArtworkCropDialog(inspection, self, initial_bounds, local_selection)
+                if editor.exec() == QDialog.DialogCode.Accepted:
+                    selection = editor.crop_selection()
+                    self._selections[path] = selection
+                    self._selected_paths = {path}
+                    self._selection_anchor = path
+                    self._apply_selection({path})
+                    trim_bounds = (
+                        selection.bounds
+                        if selection.kind in {"layer", "spot_color"} or selection.manual_crop
+                        else None
+                    )
+                    self._update_preview(inspection, trim_bounds)
+                return False
+
         if event.type() == QEvent.Type.MouseButtonPress:
             if obj in self._preview_labels.values():
                 path = next(path for path, label in self._preview_labels.items() if label is obj)
@@ -9990,7 +10035,7 @@ class ArtworkManualCutDialog(QDialog):
                         next_selection.add(path)
                     self._selection_anchor = path
                     self._apply_selection(next_selection)
-                    return True
+                    return False
                 if shift:
                     if self._selection_anchor is None:
                         self._selection_anchor = path
@@ -10000,52 +10045,15 @@ class ArtworkManualCutDialog(QDialog):
                         start, end = sorted((anchor_index, current_index))
                         next_selection = {self._inspections[idx].input_path for idx in range(start, end + 1)}
                         self._apply_selection(next_selection)
-                    return True
-                now = time.monotonic()
-                if self._last_thumb_click and self._last_thumb_click[0] == path and now - self._last_thumb_click[1] < 0.5:
-                    self._last_thumb_click = None
-                    inspection = next(item for item in self._inspections if item.input_path == path)
-                    local_selection = self._selections.get(path)
-                    initial_bounds = local_selection.bounds if local_selection is not None else None
-                    if self._bulk_mode and initial_bounds is None:
-                        trim_choice = next(
-                            ((kind, name) for (kind, name), action in self._bulk_actions.items()
-                             if action in {"trim", "trim & hide"}),
-                            None,
-                        )
-                        if trim_choice is not None:
-                            trim_kind, trim_name = trim_choice
-                            trim_option = next(
-                                (option for option in inspection.options
-                                 if option.kind == trim_kind and option.label == trim_name),
-                                None,
-                            )
-                            if trim_option is not None:
-                                initial_bounds = trim_option.bounds
-                    editor = ArtworkCropDialog(inspection, self, initial_bounds, local_selection)
-                    if editor.exec() == QDialog.DialogCode.Accepted:
-                        selection = editor.crop_selection()
-                        self._selections[path] = selection
-                        self._selected_paths = {path}
-                        self._selection_anchor = path
-                        self._apply_selection({path})
-                        trim_bounds = (
-                            selection.bounds
-                            if selection.kind in {"layer", "spot_color"} or selection.manual_crop
-                            else None
-                        )
-                        self._update_preview(inspection, trim_bounds)
-                    return True
+                    return False
                 self._selected_paths = {path}
                 self._selection_anchor = path
-                self._last_thumb_click = (path, now)
                 self._apply_selection({path})
-                return True
+                return False
 
             if self._selected_paths and obj not in self._preview_labels.values():
                 self._selected_paths.clear()
                 self._selection_anchor = None
-                self._last_thumb_click = None
                 self._apply_selection(set())
         return super().eventFilter(obj, event)
 
