@@ -8990,12 +8990,15 @@ class ArtworkCropCanvas(QLabel):
         self._stroke_color = "#B8F35A"
         self._custom_path = list(initial_path)
         self._custom_segment: dict[str, tuple[float, float]] | None = None
+        self._custom_closed = bool(self._custom_path and self._custom_path[-1][0] == "Z")
+        self._custom_hover_point: tuple[float, float] | None = None
         self._base_canvas_width = 700
         self._base_canvas_height = 460
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(self._base_canvas_width, self._base_canvas_height)
         self.resize(self._base_canvas_width, self._base_canvas_height)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._refresh()
 
     def _image_rect(self):
@@ -9038,6 +9041,8 @@ class ArtworkCropCanvas(QLabel):
 
     def set_custom_path(self, commands: tuple = ()) -> None:
         self._custom_path = list(commands)
+        self._custom_closed = bool(self._custom_path and self._custom_path[-1][0] == "Z")
+        self._custom_segment = None
         self._refresh()
 
     def _custom_path_bounds(self) -> object | None:
@@ -9074,6 +9079,55 @@ class ArtworkCropCanvas(QLabel):
             display_end = display_point(end)
             path.quadTo(display_control[0], display_control[1], display_end[0], display_end[1])
         return path
+
+    def _custom_anchors(self) -> list[tuple[float, float]]:
+        anchors: list[tuple[float, float]] = []
+        for command, values in self._custom_path:
+            if command in {"M", "L"}:
+                anchors.append((values[0], values[1]))
+            elif command == "Q":
+                anchors.append((values[2], values[3]))
+        return anchors
+
+    def _to_display_point(self, point: tuple[float, float]) -> tuple[float, float]:
+        left, top, width, height = self._display_rect()
+        return (
+            left + (point[0] - self._page_bounds.left) / max(self._page_bounds.width, 1) * width,
+            top + (point[1] - self._page_bounds.top) / max(self._page_bounds.height, 1) * height,
+        )
+
+    def _custom_first_anchor_hit(self, x: float, y: float) -> bool:
+        anchors = self._custom_anchors()
+        if len(anchors) < 3:
+            return False
+        first_x, first_y = self._to_display_point(anchors[0])
+        return (x - first_x) ** 2 + (y - first_y) ** 2 <= 12 ** 2
+
+    def _finish_custom_path(self, close: bool = False) -> None:
+        if self._custom_segment is not None:
+            return
+        if close and len(self._custom_anchors()) >= 3 and not self._custom_closed:
+            self._custom_path.append(("Z", ()))
+            self._custom_closed = True
+        self._interaction = None
+        self._custom_hover_point = None
+        self.unsetCursor()
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
+
+    def _undo_custom(self) -> None:
+        if self._custom_segment is not None:
+            self._custom_segment = None
+        elif self._custom_path:
+            if self._custom_path[-1][0] == "Z":
+                self._custom_path.pop()
+                self._custom_closed = False
+            elif len(self._custom_path) > 1:
+                self._custom_path.pop()
+            else:
+                self._custom_path.clear()
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
 
     def _custom_point(self, point: tuple[float, float], modifiers: Qt.KeyboardModifier) -> tuple[float, float]:
         if not self._custom_path or not modifiers & Qt.KeyboardModifier.ShiftModifier:
@@ -9221,6 +9275,23 @@ class ArtworkCropCanvas(QLabel):
                 "end": self._custom_segment["end"],
                 "control": self._custom_segment["control"],
             }) if self._custom_segment else self._custom_qpath())
+            if self._custom_segment is not None:
+                start_x, start_y = self._to_display_point(self._custom_segment["start"])
+                control_x, control_y = self._to_display_point(self._custom_segment["control"])
+                painter.setPen(QPen(QColor("#FFB000"), 2, Qt.PenStyle.DashLine))
+                painter.drawLine(round(start_x), round(start_y), round(control_x), round(control_y))
+                painter.setBrush(QColor("#FFFFFF"))
+                painter.setPen(QPen(QColor("#FFB000"), 2))
+                painter.drawEllipse(round(control_x - 5), round(control_y - 5), 10, 10)
+            for index, anchor in enumerate(self._custom_anchors()):
+                ax, ay = self._to_display_point(anchor)
+                size = 8 if index == 0 else 6
+                painter.setBrush(QColor("#FFFFFF"))
+                painter.setPen(QPen(QColor(stroke_color), 2))
+                if index == 0:
+                    painter.drawRect(round(ax - size / 2), round(ay - size / 2), size, size)
+                else:
+                    painter.drawEllipse(round(ax - size / 2), round(ay - size / 2), size, size)
         elif self._stroke_shape == "ellipse":
             painter.drawEllipse(rect)
         elif self._corners == "rounded":
@@ -9256,18 +9327,28 @@ class ArtworkCropCanvas(QLabel):
         self._refresh()
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus()
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_start = (event.position().x(), event.position().y())
             return
         point = self._to_page_point(event.position().x(), event.position().y())
         if self._stroke_shape == "custom":
             point = self._custom_point(point, event.modifiers())
+            if self._custom_first_anchor_hit(event.position().x(), event.position().y()):
+                self._finish_custom_path(close=True)
+                return
             if not self._custom_path:
                 self._custom_path.append(("M", point))
                 self._custom_segment = None
             else:
                 last_values = self._custom_path[-1][1]
-                self._custom_segment = {"start": (last_values[-2], last_values[-1]), "end": point, "control": point}
+                # The click fixes the next anchor. Dragging moves its tangent
+                # handle, matching the pen-tool interaction used by Illustrator.
+                self._custom_segment = {
+                    "start": (last_values[-2], last_values[-1]),
+                    "end": point,
+                    "control": point,
+                }
             self._manual_drawn = True
             self._interaction = "custom"
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -9297,13 +9378,15 @@ class ArtworkCropCanvas(QLabel):
             self._refresh()
             return
         if self._interaction == "custom" and self._custom_segment is not None:
-            point = self._to_page_point(event.position().x(), event.position().y())
-            point = self._custom_point(point, event.modifiers())
-            self._custom_segment["end"] = point
-            self._custom_segment["control"] = self._to_page_point(event.position().x(), event.position().y())
+            control = self._to_page_point(event.position().x(), event.position().y())
+            control = self._custom_point(control, event.modifiers())
+            self._custom_segment["control"] = control
             self._refresh()
             self.cropChanged.emit(self._custom_path_bounds())
             return
+        if self._stroke_shape == "custom" and self._custom_path and self._custom_segment is None:
+            self._custom_hover_point = self._to_page_point(event.position().x(), event.position().y())
+            self._refresh()
         if self._interaction == "draw":
             if self._drag_start is None:
                 return
@@ -9370,6 +9453,22 @@ class ArtworkCropCanvas(QLabel):
 
     def custom_path(self) -> tuple:
         return tuple(self._custom_path)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._stroke_shape == "custom" and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_custom_path(close=False)
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if self._stroke_shape == "custom":
+            if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._undo_custom()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self._finish_custom_path(close=False)
+                return
+        super().keyPressEvent(event)
 
 
 class ArtworkCropDialog(QDialog):
@@ -9541,6 +9640,12 @@ class ArtworkCropDialog(QDialog):
         self._stroke_shape_combo.currentTextChanged.connect(self._shape_settings_changed)
         stroke_shape_row.addWidget(self._stroke_shape_combo)
         shape_layout.addLayout(stroke_shape_row)
+        self._custom_help_label = QLabel(
+            "Custom: click anchors, click-drag for curves, click the first anchor to close."
+        )
+        self._custom_help_label.setObjectName("manualCutDescription")
+        self._custom_help_label.setWordWrap(True)
+        shape_layout.addWidget(self._custom_help_label)
         stroke_weight_row = QHBoxLayout()
         stroke_weight_row.setSpacing(8)
         stroke_weight_label = QLabel("stroke weight")
@@ -9706,6 +9811,7 @@ class ArtworkCropDialog(QDialog):
         self._corners_combo.setVisible(self._stroke_shape_combo.currentText() == "rectangle")
         self._corner_slider_label.setVisible(visible)
         self._corner_slider.setVisible(visible)
+        self._custom_help_label.setVisible(self._stroke_shape_combo.currentText() == "custom")
 
     def _shape_settings_changed(self, _value: object = None) -> None:
         self._stroke_shape = self._stroke_shape_combo.currentText()
