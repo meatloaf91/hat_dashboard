@@ -87,6 +87,8 @@ class CutSelection:
 	corners: Literal["sharp", "rounded", "beveled"] = "sharp"
 	corner_amount: float = 0.0
 	custom_path: tuple[tuple[str, tuple[float, ...]], ...] = ()
+	stroke_weight: float = 1.0
+	stroke_color: str = "#B8F35A"
 
 
 @dataclass

@@ -8986,24 +8986,28 @@ class ArtworkCropCanvas(QLabel):
         self._stroke_shape = "rectangle"
         self._corners = "sharp"
         self._corner_amount = 0.0
+        self._stroke_weight = 1.0
+        self._stroke_color = "#B8F35A"
         self._custom_path = list(initial_path)
         self._custom_segment: dict[str, tuple[float, float]] | None = None
+        self._base_canvas_width = 700
+        self._base_canvas_height = 460
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(700, 460)
+        self.setMinimumSize(self._base_canvas_width, self._base_canvas_height)
+        self.resize(self._base_canvas_width, self._base_canvas_height)
         self.setMouseTracking(True)
         self._refresh()
 
     def _image_rect(self):
         target = self.size()
-        target.setWidth(max(1, round(target.width() * self._zoom)))
-        target.setHeight(max(1, round(target.height() * self._zoom)))
         return self._image.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
     def set_zoom(self, value: int) -> None:
         self._zoom = min(3.0, max(0.25, value / 100.0))
-        content_w = max(self.width(), int(self._image.width() * self._zoom))
-        content_h = max(self.height(), int(self._image.height() * self._zoom))
+        content_w = max(self._base_canvas_width, round(self._base_canvas_width * self._zoom))
+        content_h = max(self._base_canvas_height, round(self._base_canvas_height * self._zoom))
         self.setMinimumSize(content_w, content_h)
+        self.resize(content_w, content_h)
         self._refresh()
 
     def wheelEvent(self, event) -> None:
@@ -9013,6 +9017,12 @@ class ArtworkCropCanvas(QLabel):
         event.accept()
 
     def set_crop_style(self, color: str) -> None:
+        self._crop_color = color
+        self._refresh()
+
+    def set_stroke_style(self, weight: float, color: str) -> None:
+        self._stroke_weight = max(0.1, min(1.0, weight))
+        self._stroke_color = color
         self._crop_color = color
         self._refresh()
 
@@ -9200,7 +9210,10 @@ class ArtworkCropCanvas(QLabel):
         painter = QPainter(canvas)
         painter.drawPixmap((self.width() - pixmap.width()) // 2, (self.height() - pixmap.height()) // 2, pixmap)
         x, y, width, height = self._to_display_rect(self._crop)
-        painter.setPen(QPen(QColor(getattr(self, "_crop_color", "#B8F35A")), 4))
+        stroke_color = getattr(self, "_crop_color", self._stroke_color)
+        stroke_pen = QPen(QColor(stroke_color))
+        stroke_pen.setWidthF(4.0 * self._stroke_weight)
+        painter.setPen(stroke_pen)
         rect = QRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
         if self._stroke_shape == "custom" and self._custom_path:
             painter.drawPath(self._custom_qpath({
@@ -9237,7 +9250,6 @@ class ArtworkCropCanvas(QLabel):
             )
         painter.end()
         self.setPixmap(canvas)
-        self.adjustSize()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -9380,6 +9392,8 @@ class ArtworkCropDialog(QDialog):
         self._saved_selection = saved_selection
         self._hover_option: CutOption | None = None
         self._hover_enabled = False
+        self._stroke_weight = 1.0
+        self._stroke_color = "#B8F35A"
         self._preserved_hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = ()
         self._build_ui()
 
@@ -9527,6 +9541,34 @@ class ArtworkCropDialog(QDialog):
         self._stroke_shape_combo.currentTextChanged.connect(self._shape_settings_changed)
         stroke_shape_row.addWidget(self._stroke_shape_combo)
         shape_layout.addLayout(stroke_shape_row)
+        stroke_weight_row = QHBoxLayout()
+        stroke_weight_row.setSpacing(8)
+        stroke_weight_label = QLabel("stroke weight")
+        stroke_weight_label.setObjectName("cropOptionCheck")
+        stroke_weight_row.addWidget(stroke_weight_label)
+        stroke_weight_row.addStretch(1)
+        self._stroke_weight_value = QLabel("1.00")
+        self._stroke_weight_value.setObjectName("cropOptionCheck")
+        stroke_weight_row.addWidget(self._stroke_weight_value)
+        shape_layout.addLayout(stroke_weight_row)
+        self._stroke_weight_slider = QSlider(Qt.Orientation.Horizontal)
+        self._stroke_weight_slider.setRange(1, 10)
+        self._stroke_weight_slider.setValue(10)
+        self._stroke_weight_slider.valueChanged.connect(self._shape_settings_changed)
+        shape_layout.addWidget(self._stroke_weight_slider)
+        stroke_color_row = QHBoxLayout()
+        stroke_color_row.setSpacing(8)
+        stroke_color_label = QLabel("stroke color")
+        stroke_color_label.setObjectName("cropOptionCheck")
+        stroke_color_row.addWidget(stroke_color_label)
+        stroke_color_row.addStretch(1)
+        self._stroke_color_button = QPushButton()
+        self._stroke_color_button.setFixedSize(115, 28)
+        self._stroke_color_button.setToolTip("Choose stroke color")
+        self._stroke_color_button.clicked.connect(self._choose_stroke_color)
+        stroke_color_row.addWidget(self._stroke_color_button)
+        shape_layout.addLayout(stroke_color_row)
+        self._set_stroke_color_button()
         corners_row = QHBoxLayout()
         corners_row.setSpacing(8)
         self._corners_label = QLabel("corners")
@@ -9609,9 +9651,13 @@ class ArtworkCropDialog(QDialog):
         self._stroke_shape = selection.stroke_shape
         self._corners = selection.corners
         self._corner_amount = selection.corner_amount
+        self._stroke_weight = selection.stroke_weight
+        self._stroke_color = selection.stroke_color
         self._stroke_shape_combo.setCurrentText(self._stroke_shape)
         self._corners_combo.setCurrentText(self._corners)
         self._corner_slider.setValue(round(self._corner_amount * 100))
+        self._stroke_weight_slider.setValue(round(self._stroke_weight * 10))
+        self._set_stroke_color_button()
         self._shape_settings_changed()
         self.canvas.set_custom_path(selection.custom_path)
         if selection.manual_crop:
@@ -9665,9 +9711,27 @@ class ArtworkCropDialog(QDialog):
         self._stroke_shape = self._stroke_shape_combo.currentText()
         self._corners = self._corners_combo.currentText()
         self._corner_amount = self._corner_slider.value() / 100.0
+        self._stroke_weight = self._stroke_weight_slider.value() / 10.0
         self._corner_slider_label.setText(f"{self._corner_amount:.2f}")
+        self._stroke_weight_value.setText(f"{self._stroke_weight:.2f}")
         self._update_corner_controls()
         self.canvas.set_shape_settings(self._stroke_shape, self._corners, self._corner_amount)
+        self.canvas.set_stroke_style(self._stroke_weight, self._stroke_color)
+
+    def _set_stroke_color_button(self) -> None:
+        self._stroke_color_button.setStyleSheet(
+            f"QPushButton {{ background-color: {self._stroke_color}; "
+            "border: 1px solid #A8A8A8; border-radius: 4px; }}"
+            "QPushButton:hover { border: 2px solid #555555; }"
+        )
+
+    def _choose_stroke_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._stroke_color), self, "Choose stroke color")
+        if not color.isValid():
+            return
+        self._stroke_color = color.name().upper()
+        self._set_stroke_color_button()
+        self.canvas.set_stroke_style(self._stroke_weight, self._stroke_color)
 
     def _set_source_crop(self, option: object, checked: bool, mode: str) -> None:
         if not checked:
@@ -9733,6 +9797,8 @@ class ArtworkCropDialog(QDialog):
             "corners": self._corners,
             "corner_amount": self._corner_amount,
             "custom_path": self.canvas.custom_path(),
+            "stroke_weight": self._stroke_weight,
+            "stroke_color": self._stroke_color,
         }
         hide_items = tuple(
             (option.kind, option.label, option.color_rgb, option.xref)
@@ -10273,7 +10339,10 @@ class ArtworkManualCutDialog(QDialog):
             scale_x = pixmap.width() / max(inspection.page_bounds.width, 1)
             scale_y = pixmap.height() / max(inspection.page_bounds.height, 1)
         if bounds is not None:
-            pen = QPen(QColor("#00FF66"), 4)
+            stroke_color = selection.stroke_color if selection is not None else "#00FF66"
+            stroke_weight = selection.stroke_weight if selection is not None else 1.0
+            pen = QPen(QColor(stroke_color))
+            pen.setWidthF(4.0 * stroke_weight)
             painter.setPen(pen)
             x = bounds.left * scale_x
             y = bounds.top * scale_y
