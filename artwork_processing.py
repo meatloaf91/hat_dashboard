@@ -87,7 +87,7 @@ class CutSelection:
 	corners: Literal["sharp", "rounded", "beveled"] = "sharp"
 	corner_amount: float = 0.0
 	custom_path: tuple[tuple[str, tuple[float, ...]], ...] = ()
-	stroke_weight: float = 1.0
+	stroke_weight: float = 0.5
 	stroke_color: str = "#B8F35A"
 
 
@@ -323,6 +323,119 @@ def _normalize_white(image: Any, tolerance: int) -> Any:
 	return image
 
 
+def _apply_cut_shape_mask(pixmap: Any, selection: CutSelection | None, bounds: Bounds) -> Any:
+	"""Make pixels outside a selected crop shape transparent."""
+	if selection is None:
+		return pixmap
+	uses_nonrectangular_shape = (
+		selection.stroke_shape == "ellipse"
+		or (selection.stroke_shape == "custom" and bool(selection.custom_path))
+		or selection.corners in {"rounded", "beveled"}
+	)
+	if not uses_nonrectangular_shape or bounds.width <= 0 or bounds.height <= 0:
+		return pixmap
+
+	from PIL import Image, ImageChops, ImageDraw
+
+	if hasattr(pixmap, "samples"):
+		mode = "RGBA" if pixmap.alpha else "RGB"
+		image = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
+	else:
+		image = pixmap.copy()
+	image = image.convert("RGBA")
+	width, height = image.size
+	scale_x = width / bounds.width
+	scale_y = height / bounds.height
+	mask = Image.new("L", image.size, 0)
+	draw = ImageDraw.Draw(mask)
+
+	if selection.stroke_shape == "ellipse":
+		draw.ellipse((0, 0, width - 1, height - 1), fill=255)
+	elif selection.stroke_shape == "custom" and selection.custom_path:
+		paths: list[list[tuple[float, float]]] = []
+		current_path: list[tuple[float, float]] = []
+		current_point: tuple[float, float] | None = None
+		path_start: tuple[float, float] | None = None
+
+		def to_pixel(point: tuple[float, float]) -> tuple[float, float]:
+			return (
+				(point[0] - bounds.left) * scale_x,
+				(point[1] - bounds.top) * scale_y,
+			)
+
+		for command, values in selection.custom_path:
+			if command == "M":
+				if len(current_path) >= 3:
+					paths.append(current_path)
+				current_point = (values[0], values[1])
+				path_start = current_point
+				current_path = [to_pixel(current_point)]
+			elif command == "L" and current_point is not None:
+				current_point = (values[0], values[1])
+				current_path.append(to_pixel(current_point))
+			elif command == "Q" and current_point is not None:
+				control = (values[0], values[1])
+				end = (values[2], values[3])
+				start = current_point
+				for step in range(1, 25):
+					t = step / 24
+					one_minus_t = 1 - t
+					point = (
+						one_minus_t * one_minus_t * start[0] + 2 * one_minus_t * t * control[0] + t * t * end[0],
+						one_minus_t * one_minus_t * start[1] + 2 * one_minus_t * t * control[1] + t * t * end[1],
+					)
+					current_path.append(to_pixel(point))
+				current_point = end
+			elif command == "C" and current_point is not None:
+				control1 = (values[0], values[1])
+				control2 = (values[2], values[3])
+				end = (values[4], values[5])
+				start = current_point
+				for step in range(1, 33):
+					t = step / 32
+					one_minus_t = 1 - t
+					point = (
+						one_minus_t ** 3 * start[0]
+						+ 3 * one_minus_t ** 2 * t * control1[0]
+						+ 3 * one_minus_t * t ** 2 * control2[0]
+						+ t ** 3 * end[0],
+						one_minus_t ** 3 * start[1]
+						+ 3 * one_minus_t ** 2 * t * control1[1]
+						+ 3 * one_minus_t * t ** 2 * control2[1]
+						+ t ** 3 * end[1],
+					)
+					current_path.append(to_pixel(point))
+				current_point = end
+			elif command == "Z" and current_path:
+				if path_start is not None and current_point != path_start:
+					current_path.append(to_pixel(path_start))
+				current_point = path_start
+		if len(current_path) >= 3:
+			paths.append(current_path)
+		for points in paths:
+			draw.polygon(points, fill=255)
+	else:
+		if selection.corners == "rounded":
+			radius = min(width, height) * 0.5 * max(0.0, min(1.0, selection.corner_amount))
+			draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
+		elif selection.corners == "beveled":
+			bevel = min(width, height) * 0.25 * max(0.0, min(1.0, selection.corner_amount))
+			draw.polygon(
+				[
+					(bevel, 0), (width - 1 - bevel, 0), (width - 1, bevel),
+					(width - 1, height - 1 - bevel), (width - 1 - bevel, height - 1),
+					(bevel, height - 1), (0, height - 1 - bevel), (0, bevel),
+				],
+				fill=255,
+			)
+		else:
+			draw.rectangle((0, 0, width - 1, height - 1), fill=255)
+
+	alpha = ImageChops.multiply(image.getchannel("A"), mask)
+	image.putalpha(alpha)
+	return image
+
+
 def _save_pixmap(pixmap: Any, target: Path, output_format: OutputFormat, white_tolerance: int) -> None:
 	_, Image = _require_dependencies()
 	if hasattr(pixmap, "samples"):
@@ -334,6 +447,10 @@ def _save_pixmap(pixmap: Any, target: Path, output_format: OutputFormat, white_t
 		image = _normalize_white(image, white_tolerance)
 	target.parent.mkdir(parents=True, exist_ok=True)
 	if output_format == "jpeg":
+		if image.mode == "RGBA":
+			background = Image.new("RGB", image.size, (0, 0, 0))
+			background.paste(image, mask=image.getchannel("A"))
+			image = background
 		image.save(target, format="JPEG", quality=95, dpi=(300, 300))
 	elif output_format == "png":
 		image.save(target, format="PNG", dpi=(300, 300))
@@ -403,7 +520,9 @@ class ArtworkProcessor:
 			diecut_path = output_dir / f"{stem}_with_diecut.{extension}" if self.options.include_diecut else None
 			clean_path = output_dir / f"{stem}_clean.{extension}"
 			if diecut_path:
-				_save_pixmap(_crop_pixmap(page, detection.bounds, self.options.dpi), diecut_path, extension, self.options.white_tolerance)
+				diecut_pixmap = _crop_pixmap(page, detection.bounds, self.options.dpi)
+				diecut_pixmap = _apply_cut_shape_mask(diecut_pixmap, selection, detection.bounds)
+				_save_pixmap(diecut_pixmap, diecut_path, extension, self.options.white_tolerance)
 			clean_pixmap, clean_warning = self._render_clean(document, page, detection, selection)
 			warnings = list(detection.warnings)
 			if clean_warning:
@@ -469,6 +588,7 @@ class ArtworkProcessor:
 			warning = None
 		if selection and hide_kind == "spot_color" and not hide_color_rgb:
 			warning = "The selected spot color could not be masked because its color metadata was not available."
+		pixmap = _apply_cut_shape_mask(pixmap, selection, detection.bounds)
 		return pixmap, warning
 
 	def process_batch(self, input_dir: Path, output_dir: Path) -> list[ProcessResult]:

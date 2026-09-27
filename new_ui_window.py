@@ -39,8 +39,8 @@ _patch_matplotlib_path_deepcopy()
 
 _BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, QRect, Signal, QTimer
-from PySide6.QtGui import QColor, QCursor, QImage, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont
+from PySide6.QtCore import Qt, Property, QPropertyAnimation, QEasingCurve, QEvent, QRect, QSize, Signal, QTimer
+from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QMovie, QPainter, QPainterPath, QPixmap, QLinearGradient, QBrush, QPen, QFont, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -8986,16 +8986,30 @@ class ArtworkCropCanvas(QLabel):
         self._stroke_shape = "rectangle"
         self._corners = "sharp"
         self._corner_amount = 0.0
-        self._stroke_weight = 1.0
+        self._stroke_weight = 0.5
         self._stroke_color = "#B8F35A"
         self._custom_path = list(initial_path)
-        self._custom_segment: dict[str, tuple[float, float]] | None = None
+        self._custom_segment: dict[str, object] | None = None
+        self._custom_out_handle: tuple[float, float] | None = None
+        self._path_history: list[tuple[tuple, tuple[float, float] | None]] = []
+        self._path_history_index = 0
+        self._active_path_before: tuple[tuple, tuple[float, float] | None] | None = None
+        self._selected_anchor_index: int | None = None
+        self._selected_anchor_indices: set[int] = set()
+        self._selected_handle: tuple[str, int, int] | tuple[str] | None = None
+        self._edit_tool = "pen"
+        self._selection_start: tuple[float, float] | None = None
+        self._selection_current: tuple[float, float] | None = None
+        self._selection_base: set[int] = set()
         self._base_canvas_width = 700
         self._base_canvas_height = 460
+        self._pen_cursor = self._create_pen_cursor()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(self._base_canvas_width, self._base_canvas_height)
         self.resize(self._base_canvas_width, self._base_canvas_height)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self._path_history = [self._path_snapshot()]
         self._refresh()
 
     def _image_rect(self):
@@ -9034,11 +9048,81 @@ class ArtworkCropCanvas(QLabel):
         self._stroke_shape = stroke_shape
         self._corners = corners
         self._corner_amount = max(0.0, min(1.0, corner_amount))
+        if stroke_shape != "custom":
+            self.unsetCursor()
+        else:
+            self._update_custom_cursor()
         self._refresh()
+
+    def set_edit_tool(self, tool: str) -> None:
+        self._edit_tool = tool
+        if self._stroke_shape == "custom":
+            self._update_custom_cursor()
+        self._refresh()
+
+    def _update_custom_cursor(self) -> None:
+        self.setCursor(
+            self._pen_cursor if self._edit_tool == "pen" else Qt.CursorShape.ArrowCursor
+        )
+
+    @staticmethod
+    def _create_pen_cursor() -> QCursor:
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        outline = QPainterPath()
+        outline.moveTo(2, 22)
+        outline.lineTo(6, 20)
+        outline.lineTo(20, 6)
+        outline.lineTo(17, 3)
+        outline.lineTo(3, 17)
+        outline.closeSubpath()
+        painter.setPen(QPen(
+            QColor("#1F2937"), 1.5, Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin,
+        ))
+        painter.setBrush(QColor("#F8FAFC"))
+        painter.drawPath(outline)
+        painter.setPen(QPen(QColor("#1F2937"), 1))
+        painter.drawLine(5, 19, 7, 21)
+        painter.end()
+        return QCursor(pixmap, 2, 22)
 
     def set_custom_path(self, commands: tuple = ()) -> None:
         self._custom_path = list(commands)
+        self._path_history = [self._path_snapshot()]
+        self._path_history_index = 0
+        self._active_path_before = None
         self._refresh()
+
+    def _path_snapshot(self) -> tuple[tuple, tuple[float, float] | None]:
+        return (tuple(self._custom_path), self._custom_out_handle)
+
+    def _commit_path_change(self, before: tuple[tuple, tuple[float, float] | None] | None = None) -> None:
+        previous = before if before is not None else self._path_snapshot()
+        current = self._path_snapshot()
+        if current == previous:
+            return
+        self._path_history = self._path_history[: self._path_history_index + 1]
+        self._path_history.append(current)
+        self._path_history_index = len(self._path_history) - 1
+
+    def _undo_path_change(self) -> None:
+        if self._path_history_index <= 0:
+            return
+        self._path_history_index -= 1
+        path, outgoing_handle = self._path_history[self._path_history_index]
+        self._custom_path = list(path)
+        self._custom_out_handle = outgoing_handle
+        self._custom_segment = None
+        self._interaction = None
+        self._selected_anchor_indices.clear()
+        self._selected_anchor_index = None
+        self._selected_handle = None
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
+        self._update_custom_cursor()
 
     def _custom_path_bounds(self) -> object | None:
         points = [point for _, values in self._custom_path for point in zip(values[::2], values[1::2])]
@@ -9046,6 +9130,533 @@ class ArtworkCropCanvas(QLabel):
             return None
         xs, ys = zip(*points)
         return Bounds(min(xs), min(ys), max(xs), max(ys))
+
+    def _custom_anchor_points(self) -> list[tuple[float, float]]:
+        points: list[tuple[float, float]] = []
+        for command, values in self._custom_path:
+            if command in {"M", "L"}:
+                points.append((values[0], values[1]))
+            elif command == "Q":
+                points.append((values[2], values[3]))
+            elif command == "C":
+                points.append((values[4], values[5]))
+        if self._custom_segment is not None and not self._custom_segment["first"]:
+            point = self._custom_segment["end"]
+            if not points or points[-1] != point:
+                points.append(point)
+        return points
+
+    def _first_anchor_hit(self, x: float, y: float, tolerance: float = 12.0) -> bool:
+        if not self._custom_path or self._custom_path[0][0] != "M":
+            return False
+        first_anchor = self._custom_path[0][1]
+        display_x, display_y, _, _ = self._to_display_rect(
+            Bounds(first_anchor[0], first_anchor[1], first_anchor[0], first_anchor[1])
+        )
+        return (x - display_x) ** 2 + (y - display_y) ** 2 <= tolerance ** 2
+
+    def _page_to_display(self, point: tuple[float, float]) -> tuple[float, float]:
+        left, top, width, height = self._display_rect()
+        return (
+            left + (point[0] - self._page_bounds.left) / max(self._page_bounds.width, 1) * width,
+            top + (point[1] - self._page_bounds.top) / max(self._page_bounds.height, 1) * height,
+        )
+
+    def _custom_anchor_hit(self, x: float, y: float, tolerance: float = 10.0) -> int | None:
+        nearest: tuple[float, int] | None = None
+        for index, point in enumerate(self._custom_anchor_points()):
+            display_x, display_y = self._page_to_display(point)
+            distance = (x - display_x) ** 2 + (y - display_y) ** 2
+            if distance <= tolerance ** 2 and (nearest is None or distance < nearest[0]):
+                nearest = (distance, index)
+        return nearest[1] if nearest is not None else None
+
+    @staticmethod
+    def _lerp_point(
+        first: tuple[float, float], second: tuple[float, float], amount: float
+    ) -> tuple[float, float]:
+        return (
+            first[0] + (second[0] - first[0]) * amount,
+            first[1] + (second[1] - first[1]) * amount,
+        )
+
+    def _segment_point(self, segment_index: int, amount: float) -> tuple[float, float]:
+        command, values = self._custom_path[segment_index]
+        anchors = self._custom_anchor_points()
+        start = anchors[segment_index - 1]
+        if command == "Z":
+            end = anchors[0]
+            return self._lerp_point(start, end, amount)
+        if command == "L":
+            end = (values[0], values[1])
+            return self._lerp_point(start, end, amount)
+        if command == "Q":
+            control = (values[0], values[1])
+            end = (values[2], values[3])
+            first_leg = self._lerp_point(start, control, amount)
+            second_leg = self._lerp_point(control, end, amount)
+            return self._lerp_point(first_leg, second_leg, amount)
+        if command == "C":
+            control1 = (values[0], values[1])
+            control2 = (values[2], values[3])
+            end = (values[4], values[5])
+            first = self._lerp_point(start, control1, amount)
+            second = self._lerp_point(control1, control2, amount)
+            third = self._lerp_point(control2, end, amount)
+            first_mid = self._lerp_point(first, second, amount)
+            second_mid = self._lerp_point(second, third, amount)
+            return self._lerp_point(first_mid, second_mid, amount)
+        return start
+
+    def _custom_segment_hit(self, x: float, y: float, tolerance: float = 9.0):
+        if len(self._custom_path) < 2:
+            return None
+        nearest: tuple[float, int, float] | None = None
+        for segment_index, (command, _) in enumerate(self._custom_path):
+            if segment_index == 0 or command not in {"L", "Q", "C", "Z"}:
+                continue
+            previous = self._custom_path[segment_index - 1][0]
+            if previous == "Z":
+                continue
+            sample_count = 48 if command in {"Q", "C"} else 1
+            sample_t = 0.0
+            sample_x, sample_y = self._page_to_display(self._segment_point(segment_index, 0.0))
+            for sample_index in range(1, sample_count + 1):
+                current_t = sample_index / sample_count
+                current_x, current_y = self._page_to_display(
+                    self._segment_point(segment_index, current_t)
+                )
+                dx, dy = current_x - sample_x, current_y - sample_y
+                length_squared = dx * dx + dy * dy
+                along = 0.0 if length_squared == 0 else max(
+                    0.0, min(1.0, ((x - sample_x) * dx + (y - sample_y) * dy) / length_squared)
+                )
+                hit_x, hit_y = sample_x + along * dx, sample_y + along * dy
+                distance_squared = (x - hit_x) ** 2 + (y - hit_y) ** 2
+                if nearest is None or distance_squared < nearest[0]:
+                    segment_t = sample_t + (current_t - sample_t) * along
+                    nearest = (distance_squared, segment_index, segment_t)
+                sample_t, sample_x, sample_y = current_t, current_x, current_y
+        if nearest is None or nearest[0] > tolerance * tolerance:
+            return None
+        _, segment_index, amount = nearest
+        command = self._custom_path[segment_index][0]
+        if command in {"Q", "C"}:
+            step = 1.0 / 48
+            low = max(0.0, amount - step)
+            high = min(1.0, amount + step)
+
+            def distance_squared(parameter: float) -> float:
+                display_x, display_y = self._page_to_display(
+                    self._segment_point(segment_index, parameter)
+                )
+                return (x - display_x) ** 2 + (y - display_y) ** 2
+
+            for _ in range(48):
+                first = low + (high - low) / 3
+                second = high - (high - low) / 3
+                if distance_squared(first) <= distance_squared(second):
+                    high = second
+                else:
+                    low = first
+            amount = (low + high) / 2
+        return segment_index, amount
+
+    def _insert_custom_anchor(self, segment_index: int, amount: float) -> int:
+        before = self._path_snapshot()
+        command, values = self._custom_path[segment_index]
+        anchors = self._custom_anchor_points()
+        start = anchors[segment_index - 1]
+        new_anchor_index = segment_index
+        if command == "Z":
+            point = self._segment_point(segment_index, amount)
+            self._custom_path[segment_index] = ("L", point)
+            self._custom_path.append(("Z", ()))
+        elif command == "L":
+            end = (values[0], values[1])
+            point = self._lerp_point(start, end, amount)
+            self._custom_path[segment_index] = ("L", point)
+            self._custom_path.insert(segment_index + 1, ("L", end))
+        elif command == "Q":
+            control = (values[0], values[1])
+            end = (values[2], values[3])
+            first_control = self._lerp_point(start, control, amount)
+            second_control = self._lerp_point(control, end, amount)
+            point = self._lerp_point(first_control, second_control, amount)
+            self._custom_path[segment_index] = ("Q", (*first_control, *point))
+            self._custom_path.insert(segment_index + 1, ("Q", (*second_control, *end)))
+        elif command == "C":
+            control1 = (values[0], values[1])
+            control2 = (values[2], values[3])
+            end = (values[4], values[5])
+            first = self._lerp_point(start, control1, amount)
+            second = self._lerp_point(control1, control2, amount)
+            third = self._lerp_point(control2, end, amount)
+            first_mid = self._lerp_point(first, second, amount)
+            second_mid = self._lerp_point(second, third, amount)
+            point = self._lerp_point(first_mid, second_mid, amount)
+            self._custom_path[segment_index] = (
+                "C", (*first, *first_mid, *point)
+            )
+            self._custom_path.insert(
+                segment_index + 1, ("C", (*second_mid, *third, *end))
+            )
+        else:
+            return -1
+        self._selected_anchor_index = new_anchor_index
+        self._selected_anchor_indices = {new_anchor_index}
+        self._selected_handle = None
+        self._manual_drawn = True
+        self._commit_path_change(before)
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
+        return new_anchor_index
+
+    def _anchors_in_display_rect(self, rect: QRect) -> set[int]:
+        normalized = rect.normalized()
+        return {
+            index
+            for index, point in enumerate(self._custom_anchor_points())
+            if normalized.contains(round(self._page_to_display(point)[0]), round(self._page_to_display(point)[1]))
+        }
+
+    def _custom_handle_points(self, anchor_index: int) -> list[tuple[tuple[str, int, int] | tuple[str], tuple[float, float]]]:
+        handles: list[tuple[tuple[str, int, int] | tuple[str], tuple[float, float]]] = []
+        if anchor_index > 0 and anchor_index < len(self._custom_path):
+            command, values = self._custom_path[anchor_index]
+            if command == "C":
+                handles.append((("path", anchor_index, 1), (values[2], values[3])))
+            elif command == "Q":
+                handles.append((("path", anchor_index, 0), (values[0], values[1])))
+        outgoing_index = anchor_index + 1
+        if outgoing_index < len(self._custom_path):
+            command, values = self._custom_path[outgoing_index]
+            if command == "C":
+                handles.append((("path", outgoing_index, 0), (values[0], values[1])))
+            elif command == "Q":
+                handles.append((("path", outgoing_index, 0), (values[0], values[1])))
+        if (
+            anchor_index == len(self._custom_anchor_points()) - 1
+            and self._custom_out_handle is not None
+            and not (self._custom_path and self._custom_path[-1][0] == "Z")
+        ):
+            handles.append((("pending",), self._custom_out_handle))
+        return handles
+
+    def _custom_handle_hit(self, x: float, y: float, anchor_index: int, tolerance: float = 9.0):
+        nearest = None
+        for descriptor, point in self._custom_handle_points(anchor_index):
+            display_x, display_y = self._page_to_display(point)
+            distance = (x - display_x) ** 2 + (y - display_y) ** 2
+            if distance <= tolerance ** 2 and (nearest is None or distance < nearest[0]):
+                nearest = (distance, descriptor)
+        return nearest[1] if nearest is not None else None
+
+    def _move_custom_anchors(self, anchor_indices: set[int], dx: float, dy: float) -> None:
+        for command_index, (command, values) in enumerate(self._custom_path):
+            updated = list(values)
+            if command_index in anchor_indices:
+                if command == "M" or command == "L":
+                    updated[0] += dx
+                    updated[1] += dy
+                elif command == "Q":
+                    updated[2] += dx
+                    updated[3] += dy
+                elif command == "C":
+                    updated[2] += dx
+                    updated[3] += dy
+                    updated[4] += dx
+                    updated[5] += dy
+            if command == "Q" and (command_index in anchor_indices or command_index - 1 in anchor_indices):
+                updated[0] += dx
+                updated[1] += dy
+            elif command == "C" and command_index - 1 in anchor_indices:
+                updated[0] += dx
+                updated[1] += dy
+            if updated != list(values):
+                self._custom_path[command_index] = (command, tuple(updated))
+        if anchor_indices and max(anchor_indices) == len(self._custom_anchor_points()) - 1 and self._custom_out_handle is not None:
+            self._custom_out_handle = (self._custom_out_handle[0] + dx, self._custom_out_handle[1] + dy)
+
+    def _move_custom_anchor(self, anchor_index: int, dx: float, dy: float) -> None:
+        self._move_custom_anchors({anchor_index}, dx, dy)
+
+    def _move_custom_handle(self, descriptor: tuple, point: tuple[float, float]) -> None:
+        if descriptor[0] == "pending":
+            self._custom_out_handle = point
+            return
+        _, command_index, control_index = descriptor
+        command, values = self._custom_path[command_index]
+        updated = list(values)
+        point_offset = control_index * 2
+        updated[point_offset] = point[0]
+        updated[point_offset + 1] = point[1]
+        self._custom_path[command_index] = (command, tuple(updated))
+
+    def _begin_custom_anchor_edit(self, anchor_index: int, x: float, y: float) -> None:
+        self._selected_anchor_index = anchor_index
+        self._selected_handle = self._custom_handle_hit(x, y, anchor_index)
+        self._interaction_start = self._to_page_point(x, y)
+        self._manual_drawn = False
+        if self._selected_handle is None:
+            self._interaction = "move_custom_anchor"
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self._interaction = "move_custom_handle"
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        self._refresh()
+
+    def _anchor_segment_indices(self, anchor_index: int) -> tuple[int | None, int | None]:
+        incoming = anchor_index if anchor_index > 0 and anchor_index < len(self._custom_path) else None
+        outgoing_index = anchor_index + 1
+        outgoing = (
+            outgoing_index
+            if outgoing_index < len(self._custom_path) and self._custom_path[outgoing_index][0] != "Z"
+            else None
+        )
+        return incoming, outgoing
+
+    def _segment_controls(self, segment_index: int) -> tuple[tuple[float, float], tuple[float, float]]:
+        command, values = self._custom_path[segment_index]
+        anchors = self._custom_anchor_points()
+        start, end = anchors[segment_index - 1], anchors[segment_index]
+        if command == "C":
+            return (values[0], values[1]), (values[2], values[3])
+        if command == "Q":
+            control = (values[0], values[1])
+            return (
+                (start[0] + 2 * (control[0] - start[0]) / 3, start[1] + 2 * (control[1] - start[1]) / 3),
+                (end[0] + 2 * (control[0] - end[0]) / 3, end[1] + 2 * (control[1] - end[1]) / 3),
+            )
+        return (
+            (start[0] + (end[0] - start[0]) / 3, start[1] + (end[1] - start[1]) / 3),
+            (start[0] + 2 * (end[0] - start[0]) / 3, start[1] + 2 * (end[1] - start[1]) / 3),
+        )
+
+    def _set_segment_controls(
+        self,
+        segment_index: int,
+        control1: tuple[float, float],
+        control2: tuple[float, float],
+    ) -> None:
+        _, values = self._custom_path[segment_index]
+        endpoint = (values[4], values[5]) if len(values) >= 6 else self._custom_anchor_points()[segment_index]
+        self._custom_path[segment_index] = (
+            "C",
+            (control1[0], control1[1], control2[0], control2[1], endpoint[0], endpoint[1]),
+        )
+
+    def _set_anchor_curve_mode(self, anchor_index: int, mode: str) -> None:
+        before = self._path_snapshot()
+        anchors = self._custom_anchor_points()
+        incoming_index, outgoing_index = self._anchor_segment_indices(anchor_index)
+        anchor = anchors[anchor_index]
+        incoming = None
+        outgoing = None
+        if incoming_index is not None:
+            incoming = list(self._segment_controls(incoming_index))
+        if outgoing_index is not None:
+            outgoing = list(self._segment_controls(outgoing_index))
+
+        incoming_command = self._custom_path[incoming_index][0] if incoming_index is not None else ""
+        outgoing_command = self._custom_path[outgoing_index][0] if outgoing_index is not None else ""
+        incoming_active = incoming is not None and incoming_command in {"C", "Q"} and incoming[1] != anchor
+        outgoing_active = outgoing is not None and outgoing_command in {"C", "Q"} and outgoing[0] != anchor
+
+        if mode == "corner":
+            if incoming_index is not None:
+                values = self._custom_path[incoming_index][1]
+                endpoint = (values[-2], values[-1])
+                self._custom_path[incoming_index] = ("L", endpoint)
+            if outgoing_index is not None:
+                values = self._custom_path[outgoing_index][1]
+                endpoint = (values[-2], values[-1])
+                self._custom_path[outgoing_index] = ("L", endpoint)
+            self._selected_anchor_index = anchor_index
+            self._selected_anchor_indices = {anchor_index}
+            self._selected_handle = None
+            self._manual_drawn = True
+            self._commit_path_change(before)
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            return
+        elif mode == "curve":
+            if incoming is None and outgoing is None:
+                return
+            use_incoming = incoming_active or (not outgoing_active and outgoing is None)
+            if use_incoming:
+                incoming[1] = incoming[1] if incoming_active else self._segment_controls(incoming_index)[1]
+                if outgoing is not None:
+                    outgoing[0] = anchor
+            else:
+                outgoing[0] = outgoing[0] if outgoing_active else self._segment_controls(outgoing_index)[0]
+                if incoming is not None:
+                    incoming[1] = anchor
+        elif mode == "curve_mirror":
+            if incoming is None and outgoing is None:
+                return
+            if not incoming_active and not outgoing_active:
+                if incoming is not None and outgoing is not None:
+                    source = self._segment_controls(outgoing_index)[0]
+                    reflected = (2 * anchor[0] - source[0], 2 * anchor[1] - source[1])
+                    outgoing[0] = anchor
+                    incoming[1] = reflected
+                elif outgoing is not None:
+                    outgoing[0] = self._segment_controls(outgoing_index)[0]
+                else:
+                    incoming[1] = self._segment_controls(incoming_index)[1]
+            elif outgoing_active:
+                if incoming is not None:
+                    source = outgoing[0]
+                    incoming[1] = (2 * anchor[0] - source[0], 2 * anchor[1] - source[1])
+                    outgoing[0] = anchor
+            elif incoming_active and outgoing is not None:
+                source = incoming[1]
+                outgoing[0] = (2 * anchor[0] - source[0], 2 * anchor[1] - source[1])
+                incoming[1] = anchor
+        elif mode == "curve_two_handles":
+            if incoming is None and outgoing is None:
+                return
+            if incoming is not None and not incoming_active:
+                incoming[1] = self._segment_controls(incoming_index)[1]
+            if outgoing is not None and not outgoing_active:
+                outgoing[0] = self._segment_controls(outgoing_index)[0]
+
+        if incoming_index is not None:
+            self._set_segment_controls(incoming_index, incoming[0], incoming[1])
+        if outgoing_index is not None:
+            self._set_segment_controls(outgoing_index, outgoing[0], outgoing[1])
+        self._selected_anchor_index = anchor_index
+        self._selected_anchor_indices = {anchor_index}
+        self._selected_handle = None
+        self._manual_drawn = True
+        self._commit_path_change(before)
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
+
+    def _set_anchor_corner_curve(self, anchor_index: int, anchor_type: str) -> None:
+        self._set_anchor_curve_mode(anchor_index, "corner" if anchor_type == "corner" else "curve")
+
+    def _anchor_local_direction(self, anchor_index: int) -> tuple[float, float] | None:
+        anchors = self._custom_anchor_points()
+        if anchor_index < 0 or anchor_index >= len(anchors) or len(anchors) < 2:
+            return None
+        if anchor_index == 0:
+            start, end = anchors[0], anchors[1]
+        elif anchor_index == len(anchors) - 1:
+            start, end = anchors[-2], anchors[-1]
+        else:
+            start, end = anchors[anchor_index - 1], anchors[anchor_index + 1]
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1e-9:
+            return None
+        return dx / length, dy / length
+
+    def _can_straighten_selected_anchors(self, parallel_tolerance: float = 0.05) -> bool:
+        if len(self._selected_anchor_indices) != 2:
+            return False
+        first, second = sorted(self._selected_anchor_indices)
+        first_direction = self._anchor_local_direction(first)
+        second_direction = self._anchor_local_direction(second)
+        if first_direction is None or second_direction is None:
+            return False
+        dot = first_direction[0] * second_direction[0] + first_direction[1] * second_direction[1]
+        return dot < 0.5 or abs(dot) >= 1.0 - parallel_tolerance
+
+    def _straighten_selected_anchors(self) -> None:
+        if not self._can_straighten_selected_anchors():
+            return
+        before = self._path_snapshot()
+        first, last = sorted(self._selected_anchor_indices)
+        anchors = self._custom_anchor_points()
+        selected_points = [anchors[first], anchors[last]]
+        center = (
+            sum(point[0] for point in selected_points) / 2,
+            sum(point[1] for point in selected_points) / 2,
+        )
+        align_horizontally = abs(selected_points[1][0] - selected_points[0][0]) >= abs(
+            selected_points[1][1] - selected_points[0][1]
+        )
+        for index in (first, last):
+            point = anchors[index]
+            target = (point[0], center[1]) if align_horizontally else (center[0], point[1])
+            self._move_custom_anchors({index}, target[0] - point[0], target[1] - point[1])
+        self._commit_path_change(before)
+        self._manual_drawn = True
+        self._refresh()
+        self.cropChanged.emit(self._custom_path_bounds())
+
+    def _build_anchor_menu(self, anchor_index: int) -> QMenu:
+        menu = QMenu(self)
+        curve_action = menu.addAction("Curve")
+        mirror_action = menu.addAction("Curve (mirror handle)")
+        two_handles_action = menu.addAction("Curve (2 handles)")
+        menu.addSeparator()
+        corner_action = menu.addAction("Corner")
+        curve_action.triggered.connect(
+            lambda checked=False: self._set_anchor_curve_mode(anchor_index, "curve")
+        )
+        mirror_action.triggered.connect(
+            lambda checked=False: self._set_anchor_curve_mode(anchor_index, "curve_mirror")
+        )
+        two_handles_action.triggered.connect(
+            lambda checked=False: self._set_anchor_curve_mode(anchor_index, "curve_two_handles")
+        )
+        corner_action.triggered.connect(
+            lambda checked=False: self._set_anchor_curve_mode(anchor_index, "corner")
+        )
+        if self._can_straighten_selected_anchors():
+            menu.addSeparator()
+            straighten_action = menu.addAction("Straighten line")
+            straighten_action.triggered.connect(
+                lambda checked=False: self._straighten_selected_anchors()
+            )
+        return menu
+
+    def _show_anchor_menu(self, anchor_index: int, global_position) -> None:
+        self._build_anchor_menu(anchor_index).exec(global_position)
+
+    def undo_custom_anchor(self) -> None:
+        if self._stroke_shape != "custom":
+            return
+        if self._custom_segment is not None:
+            if self._active_path_before is not None:
+                path, outgoing_handle = self._active_path_before
+                self._custom_path = list(path)
+                self._custom_out_handle = outgoing_handle
+            self._custom_segment = None
+            self._interaction = None
+            self._active_path_before = None
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            self._update_custom_cursor()
+            return
+        if self._active_path_before is not None:
+            path, outgoing_handle = self._active_path_before
+            self._custom_path = list(path)
+            self._custom_out_handle = outgoing_handle
+            self._active_path_before = None
+            self._interaction = None
+            self._interaction_start = None
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            self._update_custom_cursor()
+            return
+        self._undo_path_change()
+
+    def keyPressEvent(self, event) -> None:
+        undo_shortcut = (
+            event.key() == Qt.Key.Key_Z
+            and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        )
+        if self._stroke_shape == "custom" and (
+            event.key() in {Qt.Key.Key_Backspace, Qt.Key.Key_Delete} or undo_shortcut
+        ):
+            self.undo_custom_anchor()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _custom_qpath(self, preview: dict | None = None) -> QPainterPath:
         path = QPainterPath()
@@ -9064,15 +9675,22 @@ class ArtworkCropCanvas(QLabel):
                 control = display_point((values[0], values[1]))
                 end = display_point((values[2], values[3]))
                 path.quadTo(control[0], control[1], end[0], end[1])
+            elif command == "C":
+                control1 = display_point((values[0], values[1]))
+                control2 = display_point((values[2], values[3]))
+                end = display_point((values[4], values[5]))
+                path.cubicTo(
+                    control1[0], control1[1], control2[0], control2[1], end[0], end[1]
+                )
             elif command == "Z":
                 path.closeSubpath()
-        if preview is not None:
-            start = preview["start"]
-            end = preview["end"]
-            control = preview["control"]
-            display_control = display_point(control)
-            display_end = display_point(end)
-            path.quadTo(display_control[0], display_control[1], display_end[0], display_end[1])
+        if preview is not None and not preview["first"]:
+            control1 = display_point(preview["control1"])
+            control2 = display_point(preview["control2"])
+            end = display_point(preview["end"])
+            path.cubicTo(
+                control1[0], control1[1], control2[0], control2[1], end[0], end[1]
+            )
         return path
 
     def _custom_point(self, point: tuple[float, float], modifiers: Qt.KeyboardModifier) -> tuple[float, float]:
@@ -9216,11 +9834,38 @@ class ArtworkCropCanvas(QLabel):
         painter.setPen(stroke_pen)
         rect = QRect(round(x), round(y), max(1, round(width)), max(1, round(height)))
         if self._stroke_shape == "custom" and self._custom_path:
-            painter.drawPath(self._custom_qpath({
-                "start": self._custom_segment["start"],
-                "end": self._custom_segment["end"],
-                "control": self._custom_segment["control"],
-            }) if self._custom_segment else self._custom_qpath())
+            painter.drawPath(
+                self._custom_qpath(self._custom_segment)
+                if self._custom_segment else self._custom_qpath()
+            )
+            anchors = self._custom_anchor_points()
+            if len(self._selected_anchor_indices) == 1 and self._selected_anchor_index is not None and self._selected_anchor_index < len(anchors):
+                selected_anchor = anchors[self._selected_anchor_index]
+                selected_x, selected_y = self._page_to_display(selected_anchor)
+                painter.setPen(QPen(QColor("#697586"), 1, Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                for descriptor, handle in self._custom_handle_points(self._selected_anchor_index):
+                    handle_x, handle_y = self._page_to_display(handle)
+                    painter.drawLine(round(selected_x), round(selected_y), round(handle_x), round(handle_y))
+                    painter.setPen(QPen(QColor("#1F2937"), 1))
+                    painter.setBrush(QColor("#FFFFFF"))
+                    painter.drawEllipse(round(handle_x - 4), round(handle_y - 4), 8, 8)
+                    painter.setPen(QPen(QColor("#697586"), 1, Qt.PenStyle.DashLine))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+            for index, anchor in enumerate(anchors):
+                anchor_x, anchor_y = self._page_to_display(anchor)
+                painter.setPen(QPen(QColor("#1F2937"), 1))
+                painter.setBrush(QColor("#7CD5C7") if index in self._selected_anchor_indices else QColor("#FFFFFF"))
+                painter.drawRect(round(anchor_x - 3), round(anchor_y - 3), 7, 7)
+            if self._selection_start is not None and self._selection_current is not None:
+                selection_rect = QRect(
+                    round(self._selection_start[0]), round(self._selection_start[1]),
+                    round(self._selection_current[0] - self._selection_start[0]),
+                    round(self._selection_current[1] - self._selection_start[1]),
+                ).normalized()
+                painter.setPen(QPen(QColor("#D02752"), 1, Qt.PenStyle.DashLine))
+                painter.setBrush(QColor(208, 39, 82, 35))
+                painter.drawRect(selection_rect)
         elif self._stroke_shape == "ellipse":
             painter.drawEllipse(rect)
         elif self._corners == "rounded":
@@ -9261,16 +9906,149 @@ class ArtworkCropCanvas(QLabel):
             return
         point = self._to_page_point(event.position().x(), event.position().y())
         if self._stroke_shape == "custom":
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            if event.button() == Qt.MouseButton.RightButton:
+                anchor_index = self._custom_anchor_hit(event.position().x(), event.position().y())
+                if anchor_index is not None:
+                    if anchor_index not in self._selected_anchor_indices:
+                        self._selected_anchor_indices = {anchor_index}
+                    self._selected_anchor_index = anchor_index
+                    self._refresh()
+                    self._show_anchor_menu(anchor_index, event.globalPosition().toPoint())
+                event.accept()
+                return
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+            if self._edit_tool == "select":
+                if len(self._selected_anchor_indices) == 1 and self._selected_anchor_index is not None:
+                    selected_handle = self._custom_handle_hit(
+                        event.position().x(), event.position().y(), self._selected_anchor_index
+                    )
+                    if selected_handle is not None:
+                        self._selected_handle = selected_handle
+                        self._interaction_start = point
+                        self._active_path_before = self._path_snapshot()
+                        self._interaction = "move_custom_handle"
+                        self._manual_drawn = False
+                        self.setCursor(Qt.CursorShape.CrossCursor)
+                        self._refresh()
+                        event.accept()
+                        return
+                anchor_index = self._custom_anchor_hit(event.position().x(), event.position().y())
+                if anchor_index is not None:
+                    if anchor_index not in self._selected_anchor_indices:
+                        self._selected_anchor_indices = {anchor_index}
+                    self._selected_anchor_index = anchor_index
+                    handle = (
+                        self._custom_handle_hit(event.position().x(), event.position().y(), anchor_index)
+                        if len(self._selected_anchor_indices) == 1 else None
+                    )
+                    self._selected_handle = handle
+                    self._interaction_start = point
+                    self._active_path_before = self._path_snapshot()
+                    self._interaction = "move_custom_handle" if handle is not None else "move_custom_anchors"
+                    self._manual_drawn = False
+                    self.setCursor(Qt.CursorShape.CrossCursor if handle is not None else Qt.CursorShape.SizeAllCursor)
+                else:
+                    segment_hit = self._custom_segment_hit(
+                        event.position().x(), event.position().y()
+                    )
+                    if segment_hit is not None:
+                        self._insert_custom_anchor(*segment_hit)
+                    else:
+                        self._selection_start = (event.position().x(), event.position().y())
+                        self._selection_current = self._selection_start
+                        self._selection_base = (
+                            set(self._selected_anchor_indices)
+                            if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+                            else set()
+                        )
+                        self._interaction = "select_anchors"
+                        self.setCursor(Qt.CursorShape.CrossCursor)
+                self._refresh()
+                event.accept()
+                return
+            if self._selected_anchor_index is not None:
+                handle = self._custom_handle_hit(
+                    event.position().x(), event.position().y(), self._selected_anchor_index
+                )
+                if handle is not None:
+                    self._selected_handle = handle
+                    self._interaction_start = point
+                    self._active_path_before = self._path_snapshot()
+                    self._interaction = "move_custom_handle"
+                    self._manual_drawn = False
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                    self._refresh()
+                    event.accept()
+                    return
+            if (
+                len(self._custom_anchor_points()) >= 3
+                and self._first_anchor_hit(event.position().x(), event.position().y())
+            ):
+                before = self._path_snapshot()
+                self._custom_path.append(("Z", ()))
+                self._custom_out_handle = None
+                self._custom_segment = None
+                self._interaction = None
+                self._commit_path_change(before)
+                self._refresh()
+                self.cropChanged.emit(self._custom_path_bounds())
+                self._update_custom_cursor()
+                event.accept()
+                return
+            anchor_index = self._custom_anchor_hit(event.position().x(), event.position().y())
+            if anchor_index is not None:
+                self._selected_anchor_indices = {anchor_index}
+                self._selected_anchor_index = anchor_index
+                self._selected_handle = None
+                self._active_path_before = self._path_snapshot()
+                self._interaction_start = point
+                self._interaction = "move_custom_anchors"
+                self._manual_drawn = False
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                self._refresh()
+                event.accept()
+                return
+            segment_hit = self._custom_segment_hit(
+                event.position().x(), event.position().y()
+            )
+            if segment_hit is not None:
+                self._insert_custom_anchor(*segment_hit)
+                event.accept()
+                return
+            if self._custom_path and self._custom_path[-1][0] == "Z":
+                event.accept()
+                return
             point = self._custom_point(point, event.modifiers())
+            new_anchor_index = len(self._custom_anchor_points()) if self._custom_path else 0
+            self._active_path_before = self._path_snapshot()
             if not self._custom_path:
                 self._custom_path.append(("M", point))
-                self._custom_segment = None
+                self._custom_segment = {
+                    "start": point,
+                    "end": point,
+                    "handle": point,
+                    "first": True,
+                }
             else:
                 last_values = self._custom_path[-1][1]
-                self._custom_segment = {"start": (last_values[-2], last_values[-1]), "end": point, "control": point}
+                start = (last_values[-2], last_values[-1])
+                self._custom_segment = {
+                    "start": start,
+                    "end": point,
+                    "handle": point,
+                    "control1": self._custom_out_handle or start,
+                    "control2": point,
+                    "first": False,
+                    "force_line": bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                }
+            self._selected_anchor_index = new_anchor_index
+            self._selected_anchor_indices = {new_anchor_index}
+            self._selected_handle = None
             self._manual_drawn = True
             self._interaction = "custom"
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._update_custom_cursor()
             self._refresh()
             return
         hit = self._rect_hit_test(event.position().x(), event.position().y()) if self._crop is not None else None
@@ -9296,11 +10074,51 @@ class ArtworkCropCanvas(QLabel):
             self._pan_start = (event.position().x(), event.position().y())
             self._refresh()
             return
+        if self._interaction == "select_anchors" and self._selection_start is not None:
+            self._selection_current = (event.position().x(), event.position().y())
+            selection_rect = QRect(
+                round(self._selection_start[0]), round(self._selection_start[1]),
+                round(self._selection_current[0] - self._selection_start[0]),
+                round(self._selection_current[1] - self._selection_start[1]),
+            )
+            self._selected_anchor_indices = self._selection_base | self._anchors_in_display_rect(selection_rect)
+            self._selected_anchor_index = next(iter(self._selected_anchor_indices), None)
+            self._refresh()
+            return
+        if self._interaction in {"move_custom_anchor", "move_custom_anchors"} and self._interaction_start is not None:
+            point = self._clamp_page_point(*self._to_page_point(event.position().x(), event.position().y()))
+            dx = point[0] - self._interaction_start[0]
+            dy = point[1] - self._interaction_start[1]
+            selected = self._selected_anchor_indices or {self._selected_anchor_index}
+            self._move_custom_anchors(selected, dx, dy)
+            self._interaction_start = point
+            self._manual_drawn = True
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            return
+        if self._interaction == "move_custom_handle" and self._selected_handle is not None:
+            point = self._clamp_page_point(*self._to_page_point(event.position().x(), event.position().y()))
+            self._move_custom_handle(self._selected_handle, point)
+            self._manual_drawn = True
+            self._refresh()
+            self.cropChanged.emit(self._custom_path_bounds())
+            return
         if self._interaction == "custom" and self._custom_segment is not None:
             point = self._to_page_point(event.position().x(), event.position().y())
-            point = self._custom_point(point, event.modifiers())
-            self._custom_segment["end"] = point
-            self._custom_segment["control"] = self._to_page_point(event.position().x(), event.position().y())
+            anchor = self._custom_segment["end"]
+            if self._custom_segment["first"]:
+                self._custom_segment["handle"] = point
+            else:
+                dx = point[0] - anchor[0]
+                dy = point[1] - anchor[1]
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    if abs(dx) >= abs(dy):
+                        dy = 0.0
+                    else:
+                        dx = 0.0
+                handle = (anchor[0] + dx, anchor[1] + dy)
+                self._custom_segment["handle"] = handle
+                self._custom_segment["control2"] = (anchor[0] - dx, anchor[1] - dy)
             self._refresh()
             self.cropChanged.emit(self._custom_path_bounds())
             return
@@ -9317,25 +10135,74 @@ class ArtworkCropCanvas(QLabel):
             self.cropChanged.emit(self._crop)
             return
         hit = self._rect_hit_test(event.position().x(), event.position().y()) if self._crop is not None else None
-        self.setCursor(self._cursor_for_interaction(hit))
+        if self._stroke_shape == "custom":
+            self._update_custom_cursor()
+        else:
+            self.setCursor(self._cursor_for_interaction(hit))
 
     def mouseReleaseEvent(self, event) -> None:
         if self._pan_start is not None:
             self._pan_start = None
             return
+        if self._interaction == "select_anchors":
+            if self._selection_start is not None and self._selection_current is not None:
+                rect = QRect(
+                    round(self._selection_start[0]), round(self._selection_start[1]),
+                    round(self._selection_current[0] - self._selection_start[0]),
+                    round(self._selection_current[1] - self._selection_start[1]),
+                )
+                self._selected_anchor_indices = self._selection_base | self._anchors_in_display_rect(rect)
+                self._selected_anchor_index = next(iter(self._selected_anchor_indices), None)
+            self._selection_start = None
+            self._selection_current = None
+            self._interaction = None
+            self._update_custom_cursor()
+            self._refresh()
+            return
+        if self._interaction in {"move_custom_anchor", "move_custom_anchors", "move_custom_handle"}:
+            self._interaction = None
+            self._interaction_start = None
+            self._commit_path_change(self._active_path_before)
+            self._active_path_before = None
+            self._update_custom_cursor()
+            self._refresh()
+            return
         if self._interaction == "custom" and self._custom_segment is not None:
             segment = self._custom_segment
-            control = segment["control"]
-            end = segment["end"]
-            if abs(control[0] - segment["start"][0]) + abs(control[1] - segment["start"][1]) < 2:
-                self._custom_path.append(("L", end))
+            if segment["first"]:
+                anchor = segment["end"]
+                handle = segment["handle"]
+                self._custom_out_handle = (
+                    handle
+                    if abs(handle[0] - anchor[0]) + abs(handle[1] - anchor[1]) >= 2
+                    else None
+                )
             else:
-                self._custom_path.append(("Q", (control[0], control[1], end[0], end[1])))
+                end = segment["end"]
+                handle = segment["handle"]
+                dragged = abs(handle[0] - end[0]) + abs(handle[1] - end[1]) >= 2
+                if not segment["force_line"] and (self._custom_out_handle is not None or dragged):
+                    control1 = segment["control1"]
+                    control2 = segment["control2"] if dragged else end
+                    self._custom_path.append(("C", (
+                        control1[0], control1[1], control2[0], control2[1], end[0], end[1]
+                    )))
+                else:
+                    self._custom_path.append(("L", end))
+                self._custom_out_handle = handle if dragged and not segment["force_line"] else None
             self._custom_segment = None
             self._interaction = None
-            self.unsetCursor()
+            self._commit_path_change(self._active_path_before)
+            self._active_path_before = None
+            self._update_custom_cursor()
             self._refresh()
             self.cropChanged.emit(self._custom_path_bounds())
+            return
+        if self._interaction == "custom":
+            self._interaction = None
+            self._commit_path_change(self._active_path_before)
+            self._active_path_before = None
+            self._update_custom_cursor()
             return
         if self._interaction == "draw":
             if self._drag_start is not None:
@@ -9392,7 +10259,11 @@ class ArtworkCropDialog(QDialog):
         self._saved_selection = saved_selection
         self._hover_option: CutOption | None = None
         self._hover_enabled = False
-        self._stroke_weight = 1.0
+        self._manual_crop_active = False
+        self._stroke_shape = "rectangle"
+        self._corners = "sharp"
+        self._corner_amount = 0.0
+        self._stroke_weight = 0.5
         self._stroke_color = "#B8F35A"
         self._preserved_hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = ()
         self._build_ui()
@@ -9428,8 +10299,7 @@ class ArtworkCropDialog(QDialog):
                 self.canvas._refresh()
                 return
             if action in {"trim", "trim & hide"}:
-                if self._manual_crop_checkbox.isChecked():
-                    self._manual_crop_checkbox.setChecked(False)
+                self._manual_crop_active = False
                 self.canvas.set_crop_style("#00FF66")
                 self.canvas._crop = option.bounds
                 self._selected_source = CutSelection(option.bounds, mode, option.label, option.color_rgb, option.xref)
@@ -9464,6 +10334,53 @@ class ArtworkCropDialog(QDialog):
             f"QComboBox {{ background-color: {colors.get(action, '#FFFFFF')}; padding: 3px 8px; }}"
         )
 
+    @staticmethod
+    def _edit_tool_icon(tool: str, color: str) -> QIcon:
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        if tool == "pen":
+            path = QPainterPath()
+            path.moveTo(4, 19)
+            path.lineTo(6, 14)
+            path.lineTo(16, 4)
+            path.lineTo(20, 8)
+            path.lineTo(10, 18)
+            path.closeSubpath()
+            painter.setBrush(QColor(color))
+            painter.drawPath(path)
+            painter.drawLine(6, 14, 10, 18)
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(color), 1.8, Qt.PenStyle.DashLine))
+            painter.drawRect(4, 4, 16, 16)
+            painter.setPen(QPen(QColor(color), 2))
+            painter.setBrush(QColor(color))
+            for x, y in ((4, 4), (20, 4), (4, 20), (20, 20)):
+                painter.drawRect(x - 1, y - 1, 3, 3)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _refresh_edit_tool_buttons(self) -> None:
+        for tool, button in self._edit_tool_buttons.items():
+            active = tool == self._active_edit_tool
+            color = "#D02752" if active else "#111F35"
+            button.setIcon(self._edit_tool_icon(tool, color))
+            button.setStyleSheet(
+                "QToolButton { background: #F5F7FA; border: 1px solid #C8CDD6; border-radius: 5px; }"
+                f"QToolButton:hover {{ background: #E9EDF2; border: 1px solid {color}; }}"
+                f"QToolButton:checked {{ background: #FCECEF; border: 2px solid #D02752; }}"
+            )
+
+    def _set_edit_tool(self, tool: str) -> None:
+        self._active_edit_tool = tool
+        if hasattr(self, "canvas"):
+            self.canvas.set_edit_tool(tool)
+        self._refresh_edit_tool_buttons()
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -9484,14 +10401,6 @@ class ArtworkCropDialog(QDialog):
         crop_title = QLabel("Local Crop Setup")
         crop_title.setObjectName("manualCutSectionLabel")
         crop_layout.addWidget(crop_title)
-        self._manual_crop_checkbox = QCheckBox("manual crop")
-        self._manual_crop_checkbox.setObjectName("cropOptionCheck")
-        self._manual_crop_checkbox.setStyleSheet(
-            "QCheckBox#cropOptionCheck::indicator:checked "
-            "{ background-color: #D02752; border: 1px solid #D02752; }"
-        )
-        self._manual_crop_checkbox.toggled.connect(self._manual_crop_changed)
-        crop_layout.addWidget(self._manual_crop_checkbox)
         self._hover_checkbox = QCheckBox("show crop border on hover")
         self._hover_checkbox.setObjectName("cropOptionCheck")
         self._hover_checkbox.setStyleSheet(
@@ -9547,13 +10456,13 @@ class ArtworkCropDialog(QDialog):
         stroke_weight_label.setObjectName("cropOptionCheck")
         stroke_weight_row.addWidget(stroke_weight_label)
         stroke_weight_row.addStretch(1)
-        self._stroke_weight_value = QLabel("1.00")
+        self._stroke_weight_value = QLabel("0.50")
         self._stroke_weight_value.setObjectName("cropOptionCheck")
         stroke_weight_row.addWidget(self._stroke_weight_value)
         shape_layout.addLayout(stroke_weight_row)
         self._stroke_weight_slider = QSlider(Qt.Orientation.Horizontal)
         self._stroke_weight_slider.setRange(1, 10)
-        self._stroke_weight_slider.setValue(10)
+        self._stroke_weight_slider.setValue(5)
         self._stroke_weight_slider.valueChanged.connect(self._shape_settings_changed)
         shape_layout.addWidget(self._stroke_weight_slider)
         stroke_color_row = QHBoxLayout()
@@ -9596,8 +10505,38 @@ class ArtworkCropDialog(QDialog):
         self._update_corner_controls()
         crop_layout.addWidget(tabs, 1)
         body.addWidget(crop_panel)
+        self._active_edit_tool = "pen"
+        self._edit_tool_buttons: dict[str, QToolButton] = {}
+        tool_panel = QFrame()
+        tool_panel.setObjectName("cropToolPanel")
+        tool_panel.setFixedWidth(46)
+        tool_layout = QVBoxLayout(tool_panel)
+        tool_layout.setContentsMargins(4, 8, 4, 4)
+        tool_layout.setSpacing(7)
+        tool_group = QButtonGroup(self)
+        tool_group.setExclusive(True)
+        for tool, tooltip in (("pen", "Pen tool: draw crop path"), ("select", "Anchor select: drag to select and move anchors")):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setFixedSize(36, 36)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setIconSize(QSize(24, 24))
+            button.setToolTip(tooltip)
+            tool_group.addButton(button)
+            self._edit_tool_buttons[tool] = button
+            button.clicked.connect(lambda checked=False, name=tool: self._set_edit_tool(name))
+            tool_layout.addWidget(button)
+        tool_layout.addStretch(1)
+        self._edit_tool_buttons["pen"].setChecked(True)
+        self._refresh_edit_tool_buttons()
+        tool_panel.setVisible(self._stroke_shape == "custom")
+        body.addWidget(tool_panel, 0, Qt.AlignmentFlag.AlignTop)
         self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
+        self.canvas.set_edit_tool(self._active_edit_tool)
         self.canvas.cropChanged.connect(self._on_canvas_crop_changed)
+        self._undo_custom_path_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
+        self._undo_custom_path_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._undo_custom_path_shortcut.activated.connect(self.canvas.undo_custom_anchor)
         canvas_scroll = QScrollArea()
         canvas_scroll.setWidgetResizable(True)
         canvas_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -9615,33 +10554,28 @@ class ArtworkCropDialog(QDialog):
         footer = QHBoxLayout(); footer.addStretch(1)
         accept = QPushButton("Use this crop"); accept.setObjectName("collectorRunBtn"); accept.setFixedHeight(50); accept.setMinimumWidth(180); accept.clicked.connect(self.accept); footer.addWidget(accept); layout.addLayout(footer)
 
-    def _manual_crop_changed(self, checked: bool) -> None:
-        if not checked:
-            return
-        for key, action in list(self._selection_actions.items()):
-            if action in {"trim", "trim & hide"}:
-                self._selection_actions[key] = "show"
-                combo = self._action_combos.get(key)
-                if combo is not None:
-                    combo.blockSignals(True)
-                    combo.setCurrentText("show")
-                    combo.blockSignals(False)
-                    self._set_action_combo_color(combo, "show")
-        self._selected_source = None
-        self._manual_hide_selection = None
-        self.canvas.set_crop_style("#00FF66")
-        self.canvas._refresh()
-
     def _on_canvas_crop_changed(self, bounds: object) -> None:
-        if getattr(self.canvas, "_manual_drawn", False) and not self._manual_crop_checkbox.isChecked():
+        if getattr(self.canvas, "_manual_drawn", False):
             preserved = list(getattr(self._saved_selection, "hide_items", ()) or ())
             for key, option in self._action_options.items():
-                if self._selection_actions.get(key) in {"hide", "trim & hide"}:
+                action = self._selection_actions.get(key)
+                if action in {"hide", "trim & hide"}:
                     item = (option.kind, option.label, option.color_rgb, option.xref)
                     if item not in preserved:
                         preserved.append(item)
+                if action in {"trim", "trim & hide"}:
+                    self._selection_actions[key] = "show"
+                    combo = self._action_combos.get(key)
+                    if combo is not None:
+                        combo.blockSignals(True)
+                        combo.setCurrentText("show")
+                        combo.blockSignals(False)
+                        self._set_action_combo_color(combo, "show")
             self._preserved_hide_items = tuple(preserved)
-            self._manual_crop_checkbox.setChecked(True)
+            self._manual_crop_active = True
+            self._selected_source = None
+            self._manual_hide_selection = None
+            self.canvas.set_crop_style("#00FF66")
         self.canvas._manual_drawn = False
 
     def _restore_selection_state(self) -> None:
@@ -9661,9 +10595,7 @@ class ArtworkCropDialog(QDialog):
         self._shape_settings_changed()
         self.canvas.set_custom_path(selection.custom_path)
         if selection.manual_crop:
-            self._manual_crop_checkbox.blockSignals(True)
-            self._manual_crop_checkbox.setChecked(True)
-            self._manual_crop_checkbox.blockSignals(False)
+            self._manual_crop_active = True
             self.canvas._crop = selection.bounds
             self.canvas._refresh()
             return
@@ -9715,6 +10647,7 @@ class ArtworkCropDialog(QDialog):
         self._corner_slider_label.setText(f"{self._corner_amount:.2f}")
         self._stroke_weight_value.setText(f"{self._stroke_weight:.2f}")
         self._update_corner_controls()
+        self._edit_tool_buttons["pen"].parentWidget().setVisible(self._stroke_shape == "custom")
         self.canvas.set_shape_settings(self._stroke_shape, self._corners, self._corner_amount)
         self.canvas.set_stroke_style(self._stroke_weight, self._stroke_color)
 
@@ -9806,7 +10739,7 @@ class ArtworkCropDialog(QDialog):
             if self._selection_actions.get(key) in {"hide", "trim & hide"}
         )
         hide_items = tuple(dict.fromkeys(hide_items + self._preserved_hide_items))
-        if self._manual_crop_checkbox.isChecked():
+        if self._manual_crop_active:
             return CutSelection(
                 self.canvas.crop(),
                 "manual",
@@ -10363,6 +11296,12 @@ class ArtworkManualCutDialog(QDialog):
                         custom_path.quadTo(
                             values[0] * scale_x, values[1] * scale_y,
                             values[2] * scale_x, values[3] * scale_y,
+                        )
+                    elif command == "C":
+                        custom_path.cubicTo(
+                            values[0] * scale_x, values[1] * scale_y,
+                            values[2] * scale_x, values[3] * scale_y,
+                            values[4] * scale_x, values[5] * scale_y,
                         )
                     elif command == "Z":
                         custom_path.closeSubpath()
