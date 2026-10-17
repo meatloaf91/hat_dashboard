@@ -125,11 +125,13 @@ def _bounds_from_rect(rect: Any) -> Bounds:
 
 def _document_layers(document: Any) -> list[dict[str, Any]]:
 	"""Return PDF optional-content layers across PyMuPDF layer APIs."""
+	ocgs = document.get_ocgs() or {}
+	if ocgs:
+		return [{"xref": xref, **dict(info)} for xref, info in ocgs.items()]
 	layers = document.get_layers() or []
 	if layers:
 		return list(layers)
-	ocgs = document.get_ocgs() or {}
-	return [{"xref": xref, **dict(info)} for xref, info in ocgs.items()]
+	return []
 
 
 def _color_label(color: Any) -> str | None:
@@ -215,8 +217,13 @@ def inspect_artwork(input_path: Path, dpi: int = 72, preview_width: int = 720) -
 					color = drawing.get("color") or drawing.get("fill")
 					if isinstance(color, (tuple, list)) and len(color) >= 3:
 						rgb = tuple(round(float(value) * 255) for value in color[:3])
-						matching.append((_distance(spot_rgb, rgb), drawing))
-				best = [drawing for distance, drawing in sorted(matching, key=lambda item: item[0])[:8] if distance < 9000]
+						matching.append((_distance(spot_rgb, rgb), drawing, rgb))
+				best_matches = [
+					match for match in sorted(matching, key=lambda item: item[0])[:8]
+					if match[0] < 9000
+				]
+				best = [drawing for _, drawing, _ in best_matches]
+				render_rgb = best_matches[0][2] if best_matches else spot_rgb
 				if best:
 					bounds = Bounds(
 						min(float(d["rect"].x0) for d in best), min(float(d["rect"].y0) for d in best),
@@ -224,7 +231,7 @@ def inspect_artwork(input_path: Path, dpi: int = 72, preview_width: int = 720) -
 					)
 				else:
 					bounds = page_bounds
-				options.append(CutOption(name, "spot_color", bounds, "PDF spot color", spot_rgb))
+				options.append(CutOption(name, "spot_color", bounds, "PDF spot color", render_rgb))
 
 		for drawing in drawings:
 			rect = drawing.get("rect")
@@ -248,6 +255,65 @@ def inspect_artwork(input_path: Path, dpi: int = 72, preview_width: int = 720) -
 		if not options:
 			warnings.append("No named die-cut layer or vector color was found; page bounds are the only cut area.")
 		return ArtworkInspection(input_path, preview, page_bounds, detected_bounds, options, warnings)
+	finally:
+		document.close()
+
+
+def render_artwork_preview(
+	input_path: Path,
+	dpi: int = 300,
+	hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = (),
+) -> Any:
+	"""Render the first page at the requested resolution for detailed editing."""
+	fitz, _ = _require_dependencies()
+	if dpi < 72:
+		raise ValueError("Preview resolution must be at least 72 DPI.")
+	document = fitz.open(input_path)
+	try:
+		if document.page_count == 0:
+			raise ValueError(f"PDF has no pages: {input_path.name}")
+		layers = _document_layers(document)
+		layer_targets = [
+			layer.get("xref") for layer in layers
+			if layer.get("xref") and any(
+				kind == "layer" and (xref == layer.get("xref") or name == str(layer.get("name", "")))
+				for kind, name, _, xref in hide_items
+			)
+		]
+		if layer_targets:
+			document.set_layer(-1, basestate="ON", off=layer_targets)
+			with tempfile.TemporaryDirectory(prefix="hat_artwork_preview_") as temp_dir:
+				temp_path = Path(temp_dir) / "preview.pdf"
+				document.save(temp_path)
+				preview_document = fitz.open(temp_path)
+				try:
+					page = preview_document[0]
+					scale = dpi / 72.0
+					pixmap = page.get_pixmap(
+						matrix=fitz.Matrix(scale, scale),
+						alpha=False,
+						colorspace=fitz.csRGB,
+					)
+				finally:
+					preview_document.close()
+		else:
+			page = document[0]
+			scale = dpi / 72.0
+			pixmap = page.get_pixmap(
+				matrix=fitz.Matrix(scale, scale),
+				alpha=False,
+				colorspace=fitz.csRGB,
+			)
+		hidden_spot_colors = [
+			color_rgb for kind, _, color_rgb, _ in hide_items
+			if kind == "spot_color" and color_rgb is not None
+		]
+		if hidden_spot_colors:
+			image = pixmap
+			for color_rgb in hidden_spot_colors:
+				image = _remove_color_from_pixmap(image, color_rgb)
+			pixmap = image
+		return pixmap
 	finally:
 		document.close()
 

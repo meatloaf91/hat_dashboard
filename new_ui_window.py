@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 import pandas as pd
 from collections import defaultdict
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -90,8 +91,16 @@ from general_functions import clear_other_panel_inputs
 from hat_config import HatConfig
 from body_mapper import CompareParams, run_comparison, run_set_comparison
 from reference_collector import RefCollectorParams, run_reference_collector
-from artwork_processing import ArtworkInspection, ArtworkProcessor, ProcessOptions, inspect_artwork
-from artwork_processing import ArtworkInspection, ArtworkProcessor, Bounds, CutSelection, ProcessOptions, inspect_artwork
+from artwork_processing import (
+    CutOption,
+    ArtworkInspection,
+    ArtworkProcessor,
+    Bounds,
+    CutSelection,
+    ProcessOptions,
+    inspect_artwork,
+    render_artwork_preview,
+)
 import review_project
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -8962,6 +8971,25 @@ class _SearchResultWindow(QDialog):
             QMessageBox.critical(self, "Export Failed", str(exc))
 
 
+def _artwork_preview_qimage(preview: Any) -> QImage:
+    if hasattr(preview, "samples"):
+        return QImage(
+            preview.samples,
+            preview.width,
+            preview.height,
+            preview.stride,
+            QImage.Format.Format_RGB888,
+        ).copy()
+    image = preview.convert("RGB")
+    return QImage(
+        image.tobytes(),
+        image.width,
+        image.height,
+        image.width * 3,
+        QImage.Format.Format_RGB888,
+    ).copy()
+
+
 class ArtworkCropCanvas(QLabel):
     """Preview canvas with a draggable crop rectangle in PDF-point space."""
 
@@ -8979,6 +9007,7 @@ class ArtworkCropCanvas(QLabel):
         self._interaction_bounds: object | None = None
         self._manual_drawn = False
         self._zoom = 1.0
+        self._show_crop_border = True
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._pan_start: tuple[float, float] | None = None
@@ -9015,6 +9044,14 @@ class ArtworkCropCanvas(QLabel):
     def _image_rect(self):
         target = self.size()
         return self._image.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+    def set_artwork_image(self, image: QImage) -> None:
+        self._image = QPixmap.fromImage(image)
+        self._refresh()
+
+    def set_crop_border_visible(self, visible: bool) -> None:
+        self._show_crop_border = visible
+        self._refresh()
 
     def set_zoom(self, value: int) -> None:
         self._zoom = min(3.0, max(0.25, value / 100.0))
@@ -9827,6 +9864,7 @@ class ArtworkCropCanvas(QLabel):
         canvas.fill(QColor("#F2F2F2"))
         painter = QPainter(canvas)
         painter.drawPixmap((self.width() - pixmap.width()) // 2, (self.height() - pixmap.height()) // 2, pixmap)
+        painter.setOpacity(1.0 if self._show_crop_border else 0.0)
         x, y, width, height = self._to_display_rect(self._crop)
         stroke_color = getattr(self, "_crop_color", self._stroke_color)
         stroke_pen = QPen(QColor(stroke_color))
@@ -9893,6 +9931,7 @@ class ArtworkCropCanvas(QLabel):
                 round(hover_x), round(hover_y),
                 max(1, round(hover_width)), max(1, round(hover_height)),
             )
+        painter.setOpacity(1.0)
         painter.end()
         self.setPixmap(canvas)
 
@@ -10258,7 +10297,6 @@ class ArtworkCropDialog(QDialog):
         self._initial_bounds = initial_bounds
         self._saved_selection = saved_selection
         self._hover_option: CutOption | None = None
-        self._hover_enabled = False
         self._manual_crop_active = False
         self._stroke_shape = "rectangle"
         self._corners = "sharp"
@@ -10296,7 +10334,7 @@ class ArtworkCropDialog(QDialog):
                 self.canvas.set_crop_style("#B8F35A")
                 self._selected_source = None
                 self._manual_hide_selection = None
-                self.canvas._refresh()
+                self._refresh_artwork_preview()
                 return
             if action in {"trim", "trim & hide"}:
                 self._manual_crop_active = False
@@ -10317,7 +10355,7 @@ class ArtworkCropDialog(QDialog):
                 self.canvas.set_crop_style("#00FF66")
                 self._selected_source = None
                 self._manual_hide_selection = CutSelection(self.canvas.crop(), mode, option.label, option.color_rgb, option.xref)
-            self.canvas._refresh()
+            self._refresh_artwork_preview()
 
         combo.currentTextChanged.connect(handle_change)
         layout.addLayout(row)
@@ -10401,13 +10439,12 @@ class ArtworkCropDialog(QDialog):
         crop_title = QLabel("Local Crop Setup")
         crop_title.setObjectName("manualCutSectionLabel")
         crop_layout.addWidget(crop_title)
-        self._hover_checkbox = QCheckBox("show crop border on hover")
+        self._hover_checkbox = QCheckBox("show crop border")
         self._hover_checkbox.setObjectName("cropOptionCheck")
         self._hover_checkbox.setStyleSheet(
             "QCheckBox#cropOptionCheck::indicator:checked "
             "{ background-color: #D02752; border: 1px solid #D02752; }"
         )
-        self._hover_checkbox.toggled.connect(self._set_hover_enabled)
         self._hover_checkbox.setChecked(True)
         crop_layout.addWidget(self._hover_checkbox)
         tabs = QTabWidget()
@@ -10532,6 +10569,7 @@ class ArtworkCropDialog(QDialog):
         tool_panel.setVisible(self._stroke_shape == "custom")
         body.addWidget(tool_panel, 0, Qt.AlignmentFlag.AlignTop)
         self.canvas = ArtworkCropCanvas(self._inspection_image(), self._inspection.page_bounds, initial)
+        self._hover_checkbox.toggled.connect(self.canvas.set_crop_border_visible)
         self.canvas.set_edit_tool(self._active_edit_tool)
         self.canvas.cropChanged.connect(self._on_canvas_crop_changed)
         self._undo_custom_path_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
@@ -10597,6 +10635,7 @@ class ArtworkCropDialog(QDialog):
         if selection.manual_crop:
             self._manual_crop_active = True
             self.canvas._crop = selection.bounds
+            self._refresh_artwork_preview()
             self.canvas._refresh()
             return
         source_key = None
@@ -10622,15 +10661,8 @@ class ArtworkCropDialog(QDialog):
                 combo.blockSignals(False)
                 self._set_action_combo_color(combo, "hide")
         self.canvas._crop = selection.bounds
+        self._refresh_artwork_preview()
         self.canvas._refresh()
-
-    def _set_hover_enabled(self, enabled: bool) -> None:
-        self._hover_enabled = enabled
-        if not hasattr(self, "canvas"):
-            return
-        if not enabled:
-            self._hover_option = None
-        self.canvas.set_hover_bounds(self._hover_option.bounds if self._hover_option else None)
 
     def _update_corner_controls(self) -> None:
         visible = self._stroke_shape_combo.currentText() == "rectangle" and self._corners_combo.currentText() in {"rounded", "beveled"}
@@ -10703,16 +10735,34 @@ class ArtworkCropDialog(QDialog):
             option = obj.property("crop_option")
             if event.type() == QEvent.Type.Enter:
                 self._hover_option = option
-                if self._hover_enabled:
-                    self.canvas.set_hover_bounds(option.bounds)
+                self.canvas.set_hover_bounds(option.bounds)
             elif event.type() == QEvent.Type.Leave:
                 self._hover_option = None
                 self.canvas.set_hover_bounds(None)
         return super().eventFilter(obj, event)
 
     def _inspection_image(self) -> QImage:
-        raw = self._inspection.preview
-        return QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
+        raw = render_artwork_preview(self._inspection.input_path, dpi=300)
+        return _artwork_preview_qimage(raw)
+
+    def _refresh_artwork_preview(self) -> None:
+        hide_items = list(self._preserved_hide_items)
+        hide_items.extend(
+            (option.kind, option.label, option.color_rgb, option.xref)
+            for key, option in self._action_options.items()
+            if self._selection_actions.get(key) in {"hide", "trim & hide"}
+        )
+        hide_items = tuple(dict.fromkeys(hide_items))
+        try:
+            raw = render_artwork_preview(
+                self._inspection.input_path,
+                dpi=300,
+                hide_items=hide_items,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self, "Preview update failed", str(exc))
+            return
+        self.canvas.set_artwork_image(_artwork_preview_qimage(raw))
 
     def _set_bounds(self, bounds: object) -> None:
         self.canvas._crop = bounds
@@ -10805,7 +10855,7 @@ class ArtworkManualCutDialog(QDialog):
         self._bulk_combos: dict[tuple[str, str], QComboBox] = {}
         self._bulk_rows: dict[tuple[str, str], dict[str, object]] = {}
         self._card_widgets: dict[Path, QFrame] = {}
-        self._global_hover_enabled = False
+        self._show_crop_border = True
         self._global_hover_option: tuple[str, str] | None = None
         self.output_folder: Path | None = None
         self._build_ui()
@@ -10840,14 +10890,14 @@ class ArtworkManualCutDialog(QDialog):
         crop_title = QLabel("Global Crop Setup")
         crop_title.setObjectName("manualCutSectionLabel")
         self._bulk_layout.addWidget(crop_title)
-        self._global_hover_checkbox = QCheckBox("show crop border on hover")
+        self._global_hover_checkbox = QCheckBox("show crop border")
         self._global_hover_checkbox.setObjectName("cropOptionCheck")
         self._global_hover_checkbox.setStyleSheet(
             "QCheckBox#cropOptionCheck::indicator:checked "
             "{ background-color: #D02752; border: 1px solid #D02752; }"
         )
-        self._global_hover_checkbox.toggled.connect(self._set_global_hover_enabled)
         self._global_hover_checkbox.setChecked(True)
+        self._global_hover_checkbox.toggled.connect(self._set_crop_border_visible)
         self._bulk_layout.addWidget(self._global_hover_checkbox)
         self._bulk_tabs = QTabWidget()
         self._bulk_tabs.setObjectName("cropTabs")
@@ -11002,15 +11052,23 @@ class ArtworkManualCutDialog(QDialog):
                         self._set_action_combo_color(other_combo, "show")
         self._refresh_bulk_previews()
 
-    def _set_global_hover_enabled(self, enabled: bool) -> None:
-        self._global_hover_enabled = enabled
-        if not enabled:
-            self._global_hover_option = None
+    def _set_crop_border_visible(self, visible: bool) -> None:
+        self._show_crop_border = visible
         self._refresh_bulk_previews()
 
     def _set_global_hover_option(self, option: tuple[str, str] | None) -> None:
-        self._global_hover_option = option if self._global_hover_enabled else None
+        self._global_hover_option = option
         self._refresh_bulk_previews()
+
+    def _global_hide_items_for(
+        self,
+        inspection: ArtworkInspection,
+    ) -> tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...]:
+        return tuple(
+            (option.kind, option.label, option.color_rgb, option.xref)
+            for option in inspection.options
+            if self._bulk_actions.get((option.kind, option.label)) in {"hide", "trim & hide"}
+        )
 
     def _refresh_bulk_previews(self) -> None:
         trim_choice = next(
@@ -11022,10 +11080,19 @@ class ArtworkManualCutDialog(QDialog):
             local_selection = self._selections.get(inspection.input_path)
             if local_selection is not None:
                 local_bounds = local_selection.bounds
-                self._update_preview(inspection, local_bounds, selection=local_selection)
+                hide_items = tuple(dict.fromkeys(
+                    (*local_selection.hide_items, *self._global_hide_items_for(inspection))
+                ))
+                self._update_preview(
+                    inspection,
+                    local_bounds,
+                    selection=local_selection,
+                    hide_items=hide_items,
+                )
                 continue
             bounds = None
             hover_bounds = None
+            hide_items = self._global_hide_items_for(inspection)
             if trim_choice is not None:
                 trim_kind, trim_name = trim_choice
                 option = next(
@@ -11044,7 +11111,7 @@ class ArtworkManualCutDialog(QDialog):
                 )
                 if hover_option is not None:
                     hover_bounds = hover_option.bounds
-            self._update_preview(inspection, bounds, hover_bounds)
+            self._update_preview(inspection, bounds, hover_bounds, hide_items=hide_items)
 
     def _build_card(self, inspection: ArtworkInspection) -> QFrame:
         card = QFrame()
@@ -11122,29 +11189,18 @@ class ArtworkManualCutDialog(QDialog):
                     self._selections[path] = source
                     self._refresh_saved_tag(path)
                     preview_bounds = source.bounds if source.kind in {"layer", "spot_color"} or source.manual_crop else None
-                    self._update_preview(inspection, preview_bounds, selection=source)
+                    self._update_preview(
+                        inspection,
+                        preview_bounds,
+                        selection=source,
+                        hide_items=source.hide_items,
+                    )
                     break
 
     def _clear_saved_selection(self, path: Path) -> None:
         self._selections[path] = None
         self._refresh_saved_tag(path)
-        inspection = next(item for item in self._inspections if item.input_path == path)
-        trim_choice = next(
-            ((kind, name) for (kind, name), action in self._bulk_actions.items()
-             if action in {"trim", "trim & hide"}),
-            None,
-        )
-        if trim_choice is not None:
-            trim_kind, trim_name = trim_choice
-            trim_option = next(
-                (option for option in inspection.options
-                 if option.kind == trim_kind and option.label == trim_name),
-                None,
-            )
-            if trim_option is not None:
-                self._update_preview(inspection, trim_option.bounds)
-                return
-        self._update_preview(inspection, None)
+        self._refresh_bulk_previews()
 
     def _refresh_saved_tag(self, path: Path) -> None:
         selection = self._selections.get(path)
@@ -11177,8 +11233,7 @@ class ArtworkManualCutDialog(QDialog):
             option = obj.property("global_crop_option")
             if event.type() == QEvent.Type.Enter:
                 self._global_hover_option = option
-                if self._global_hover_enabled:
-                    self._refresh_bulk_previews()
+                self._refresh_bulk_previews()
             elif event.type() == QEvent.Type.Leave:
                 self._global_hover_option = None
                 self._refresh_bulk_previews()
@@ -11215,7 +11270,12 @@ class ArtworkManualCutDialog(QDialog):
                         if selection.kind in {"layer", "spot_color"} or selection.manual_crop
                         else None
                     )
-                    self._update_preview(inspection, trim_bounds, selection=selection)
+                    self._update_preview(
+                        inspection,
+                        trim_bounds,
+                        selection=selection,
+                        hide_items=selection.hide_items,
+                    )
                 return False
 
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -11260,9 +11320,23 @@ class ArtworkManualCutDialog(QDialog):
         bounds: object,
         hover_bounds: object = None,
         selection: CutSelection | None = None,
+        hide_items: tuple[tuple[str, str, tuple[int, int, int] | None, int | None], ...] = (),
     ) -> None:
+        if not self._show_crop_border:
+            bounds = None
+            hover_bounds = None
         raw = inspection.preview
-        image = QImage(raw.samples, raw.width, raw.height, raw.stride, QImage.Format.Format_RGB888).copy()
+        if hide_items:
+            try:
+                raw = render_artwork_preview(
+                    inspection.input_path,
+                    dpi=72,
+                    hide_items=hide_items,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                QMessageBox.warning(self, "Preview update failed", str(exc))
+                return
+        image = _artwork_preview_qimage(raw)
         pixmap = QPixmap.fromImage(image)
         pixmap = pixmap.scaled(286, 196, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         painter = None
